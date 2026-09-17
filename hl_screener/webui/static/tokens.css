@@ -1,0 +1,82 @@
+/* Design tokens for the hl-niche-screener web UI.
+   Derived from design/DESIGN.md — the Linear-inspired system from the awesome-claude-design /
+   awesome-design-md collection (VoltAgent). The DESIGN.md front matter is the source of truth;
+   this file is its CSS projection. Anything marked "extension" is not in the DESIGN.md and is
+   explained in design/README.md. */
+
+:root {
+  color-scheme: dark; /* DESIGN.md: "Don't ship a light-mode" */
+
+  /* ---- colors (DESIGN.md `colors:`) ---------------------------------------- */
+  --color-primary: #5e6ad2;          /* brand mark, primary CTA, focus ring, link emphasis — used scarcely */
+  --color-on-primary: #ffffff;
+  --color-primary-hover: #828fff;
+  --color-primary-focus: #5e69d1;
+  --color-ink: #f7f8f8;
+  --color-ink-muted: #d0d6e0;
+  --color-ink-subtle: #8a8f98;
+  --color-ink-tertiary: #62666d;
+  --color-canvas: #010102;           /* near-black with a faint blue tint; never #000 */
+  --color-surface-1: #0f1011;        /* cards, panels */
+  --color-surface-2: #141516;        /* featured / hovered / selected */
+  --color-surface-3: #18191a;        /* menus, tooltips */
+  --color-surface-4: #191a1b;
+  --color-hairline: #23252a;
+  --color-hairline-strong: #34343a;
+  --color-hairline-tertiary: #3e3e44;
+  --color-inverse-canvas: #ffffff;
+  --color-inverse-surface-1: #f5f6f6;
+  --color-inverse-surface-2: #f6f7f7;
+  --color-inverse-ink: #000000;
+  --color-brand-secure: #7a7fad;
+  --color-semantic-success: #27a644;
+  --color-semantic-overlay: #000000;
+
+  /* extension: a screener has to show losses and failed checks. DESIGN.md's "Known Gaps"
+     says the in-product palette carries red/orange/yellow for priorities; these two are
+     that product-side red and amber, used only with a sign or an icon, never as fills. */
+  --color-semantic-danger: #e5484d;
+  --color-semantic-warning: #d4a72c;
+  --color-focus-ring: rgba(94, 105, 209, 0.5);   /* "2px primary-focus outline at 50% opacity" */
+
+  /* ---- typography (DESIGN.md `typography:`; substitutes per its font note:
+          Inter for Linear Display/Text, JetBrains Mono for Linear Mono) ------------- */
+  --font-display: "Inter", "SF Pro Display", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-text: "Inter", "SF Pro Text", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --type-display-md: 600 40px/1.15 var(--font-display);  --track-display-md: -1px;
+  --type-headline:   600 28px/1.2  var(--font-display);  --track-headline:   -0.6px;
+  --type-card-title: 500 22px/1.25 var(--font-display);  --track-card-title: -0.4px;
+  --type-subhead:    400 20px/1.4  var(--font-display);  --track-subhead:    -0.2px;
+  --type-body-lg:    400 18px/1.5  var(--font-text);     --track-body-lg:    -0.1px;
+  --type-body:       400 16px/1.5  var(--font-text);     --track-body:       -0.05px;
+  --type-body-sm:    400 14px/1.5  var(--font-text);
+  --type-caption:    400 12px/1.4  var(--font-text);
+  --type-button:     500 14px/1.2  var(--font-text);
+  --type-eyebrow:    500 13px/1.3  var(--font-text);     --track-eyebrow:     0.4px;
+  --type-mono:       400 13px/1.5  var(--font-mono);
+
+  /* ---- rounded (DESIGN.md `rounded:`) --------------------------------------- */
+  --rounded-xs: 4px;     /* chips, status badges */
+  --rounded-sm: 6px;     /* inline tags */
+  --rounded-md: 8px;     /* all buttons, inputs — never pill CTAs */
+  --rounded-lg: 12px;    /* cards */
+  --rounded-xl: 16px;    /* product / console panels */
+  --rounded-xxl: 24px;
+  --rounded-pill: 9999px; /* tab toggles, status pills only */
+
+  /* ---- spacing (DESIGN.md `spacing:`, 4px base) ----------------------------- */
+  --space-xxs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-xxl: 48px;
+  --space-section: 96px;
+
+  /* ---- layout (DESIGN.md Layout / Components) ------------------------------- */
+  --content-max: 1280px;
+  --topnav-height: 56px;
+}

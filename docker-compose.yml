@@ -1,0 +1,26 @@
+# Coolify: add this repository as a "Docker Compose" resource. Expose the `ui` service (port 8765)
+# on your domain and set HL_UI_PASSWORD in the environment. Both services share the data volume:
+# the paper trader writes data/paper/paper.db, the page reads it.
+services:
+  ui:
+    build: .
+    restart: unless-stopped
+    environment:
+      HL_UI_PASSWORD: ${HL_UI_PASSWORD:-}      # required on the internet; blank = no password (localhost only)
+    ports:
+      - "8765:8765"
+    volumes:
+      - hl-data:/app/data
+      - hl-out:/app/out
+
+  paper:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "hl_screener", "paper", "--leaders", "${HL_PAPER_LEADERS:-paper/leaders.csv}"]
+    volumes:
+      - hl-data:/app/data
+      - hl-out:/app/out
+
+volumes:
+  hl-data:
+  hl-out:

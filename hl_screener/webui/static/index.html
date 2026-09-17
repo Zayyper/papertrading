@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HL niche screener</title>
+<meta name="description" content="Local page for the Hyperliquid niche-trader screener: run the screen, watch progress, browse results, edit the config.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Crect width='18' height='18' rx='5' fill='%235e6ad2'/%3E%3Crect x='4' y='4' width='10' height='2' rx='1' fill='%23fff'/%3E%3Crect x='4' y='8' width='10' height='2' rx='1' fill='%23fff'/%3E%3Crect x='4' y='12' width='10' height='2' rx='1' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">HL niche screener</span></div>
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab" role="tab" data-view="run">Run</button>
+    <button class="tab" role="tab" data-view="results">Results</button>
+    <button class="tab" role="tab" data-view="paper">Paper</button>
+    <button class="tab" role="tab" data-view="config">Config</button>
+    <button class="tab" role="tab" data-view="design">Design</button>
+  </nav>
+  <div class="topnav-right"><span id="job-pill" class="badge">idle</span></div>
+</header>
+
+<main>
+
+  <!-- ============================ RUN ============================ -->
+  <section class="view" id="view-run">
+    <div class="page-head">
+      <p class="eyebrow">Run</p>
+      <h1 class="headline">Screen small Hyperliquid perp traders for copyability</h1>
+      <p class="lede">Each button runs the command-line tool as a subprocess from the project folder and streams its output below. Everything comes from Hyperliquid's public API; responses are cached under <code>data/cache/</code>, so re-running the same day is free.</p>
+    </div>
+
+    <div class="grid grid-4">
+      <form class="card action" id="form-demo" data-cmd="demo">
+        <div class="card-title">Demo</div>
+        <p class="card-body">The full pipeline on synthetic traders. No network, a few seconds. Writes to <code>out/demo/</code> so you can see what a report looks like.</p>
+        <div class="card-foot"><button class="btn btn-secondary" type="submit">Run demo</button></div>
+      </form>
+
+      <form class="card action" id="form-pool" data-cmd="pool">
+        <div class="card-title">Pool preview</div>
+        <p class="card-body">Who would be screened: one leaderboard request, then the equity band, volume floor and random sample from <code>config.toml</code>.</p>
+        <div class="card-foot"><button class="btn btn-secondary" type="submit">Show pool</button></div>
+      </form>
+
+      <form class="card action featured" id="form-run" data-cmd="run">
+        <div class="card-title">Full screen</div>
+        <p class="card-body">Walk-forward screen on real accounts. About 15–25 min for 60 accounts, roughly an hour for the full 300.</p>
+        <label class="field"><span>Pool size (blank = config)</span><input name="pool" type="number" min="1" max="10000" step="1" placeholder="e.g. 60 for a first look"></label>
+        <label class="field"><span>Run date, UTC (blank = today)</span><input name="end" type="date"></label>
+        <label class="check"><input name="cached_only" type="checkbox"><span>Only accounts already downloaded (no new downloads; set the run date of the interrupted run)</span></label>
+        <label class="check"><input name="no_split" type="checkbox"><span>No out-of-sample split (screen only)</span></label>
+        <div class="card-foot"><button class="btn btn-primary" type="submit">Run screen</button></div>
+      </form>
+
+      <form class="card action" id="form-inspect" data-cmd="inspect">
+        <div class="card-title">Inspect one trader</div>
+        <p class="card-body">Every metric plus the last round trips for a single address, over the same lookback window.</p>
+        <label class="field"><span>Address</span><input name="address" type="text" placeholder="0x…" pattern="0x[0-9a-fA-F]{40}" required spellcheck="false" autocomplete="off"></label>
+        <label class="field"><span>Run date, UTC (blank = today)</span><input name="end" type="date"></label>
+        <div class="card-foot"><button class="btn btn-secondary" type="submit">Inspect</button></div>
+      </form>
+    </div>
+
+    <section class="panel" id="console-panel" aria-live="polite">
+      <div class="panel-head">
+        <div class="panel-title"><span>Console</span><span id="console-cmd" class="mono"></span><span id="console-status" class="badge">idle</span></div>
+        <div class="panel-actions">
+          <span id="console-elapsed" class="caption mono"></span>
+          <button id="btn-results" class="btn btn-primary btn-sm" hidden>View results</button>
+          <button id="btn-stop" class="btn btn-secondary btn-sm" hidden>Stop</button>
+          <button id="btn-clear" class="btn btn-tertiary btn-sm">Clear</button>
+        </div>
+      </div>
+      <pre id="console-out" class="console"></pre>
+    </section>
+
+    <section class="panel" id="pool-panel" hidden>
+      <div class="panel-head"><div class="panel-title">Pool</div><div class="panel-actions"><span id="pool-count" class="caption"></span></div></div>
+      <div class="table-wrap" id="pool-table" style="max-height: 480px"></div>
+    </section>
+
+    <section class="panel" id="inspect-panel" hidden>
+      <div class="panel-head"><div class="panel-title">Trader detail</div><div class="panel-actions"><span id="inspect-addr" class="caption mono"></span></div></div>
+      <div class="panel-body grid grid-2">
+        <div><p class="eyebrow">Metrics (leader, full window)</p><div id="inspect-metrics"></div></div>
+        <div><p class="eyebrow">Follower simulation (no funding)</p><div id="inspect-follower"></div></div>
+      </div>
+      <div class="panel-head" style="border-top: 1px solid var(--color-hairline)"><div class="panel-title">Last round trips</div></div>
+      <pre id="inspect-trips" class="console" style="min-height: 0"></pre>
+    </section>
+  </section>
+
+  <!-- ============================ RESULTS ============================ -->
+  <section class="view" id="view-results">
+    <div class="page-head">
+      <p class="eyebrow">Results</p>
+      <h1 class="headline">What the screen found</h1>
+      <p class="lede">Every run the tool wrote to <code>out/</code>. The verdict is decided before anyone is attached to a result: proceed to a forward paper test only if the shortlist beats both benchmarks out-of-sample, is positive, has enough leaders and a drawdown you would sit through.</p>
+    </div>
+    <div class="results">
+      <aside class="runs-list" id="runs-list"></aside>
+      <div id="run-detail"></div>
+    </div>
+  </section>
+
+  <!-- ============================ PAPER ============================ -->
+  <section class="view" id="view-paper">
+    <div class="page-head">
+      <p class="eyebrow">Paper</p>
+      <h1 class="headline">Follow the shortlist live, with no money</h1>
+      <p class="lede">One virtual account per leader. Every trade the leader makes arrives over Hyperliquid's public feed; the follower's order is priced by walking the real order book at that moment, pays taker fees and hourly funding. Nothing is sent to the exchange. Measured slippage and latency sit next to what the screen's model assumed, which is the point: it tells you whether the screen's numbers were true.</p>
+    </div>
+    <div class="grid grid-2">
+      <form class="card" id="form-paper">
+        <div class="card-title">Service</div>
+        <label class="field"><span>Leaders</span><select name="leaders" id="paper-leaders-file"></select></label>
+        <label class="field"><span>Virtual equity per leader, USD</span><input name="equity" type="number" min="10" step="10" placeholder="config"></label>
+        <p class="card-body">Started from here it stops when this page's server stops. For a test that must survive reboots, run it in its own window: <code>python -m hl_screener paper</code>. Either way it resumes from its database.</p>
+        <div class="card-foot">
+          <button class="btn btn-primary" type="submit" id="btn-paper-start">Start</button>
+          <button class="btn btn-secondary" type="button" id="btn-paper-stop" hidden>Stop</button>
+          <span id="paper-service-badge" class="badge">idle</span>
+          <span id="paper-heartbeat" class="caption"></span>
+        </div>
+      </form>
+      <div class="card">
+        <div class="card-title">Right now</div>
+        <div class="tiles" id="paper-tiles" style="grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 4px"></div>
+      </div>
+    </div>
+    <h3 class="section-title">Accounts <span class="caption">one per leader, marked at live mid prices</span></h3>
+    <div class="panel tight"><div class="table-wrap" id="paper-leaders"></div></div>
+    <h3 class="section-title">Equity <span class="caption">follower account in lavender; the leader's own account, scaled to the same start, in grey</span></h3>
+    <div class="grid grid-3" id="paper-charts"></div>
+    <h3 class="section-title">Open positions</h3>
+    <div class="panel tight"><div class="table-wrap" id="paper-positions"></div></div>
+    <h3 class="section-title">Recent fills <span class="caption">slippage is the follower's price against the leader's, positive = worse</span></h3>
+    <div class="panel tight"><div class="table-wrap" id="paper-fills" style="max-height: 480px"></div></div>
+    <div class="grid grid-2" style="margin-top: var(--space-lg)">
+      <div class="panel tight"><div class="panel-head"><div class="panel-title">Events</div></div><pre id="paper-events" class="console" style="min-height: 120px; max-height: 300px"></pre></div>
+      <div class="panel tight"><div class="panel-head"><div class="panel-title">Service output</div></div><pre id="paper-log" class="console" style="min-height: 120px; max-height: 300px"></pre></div>
+    </div>
+  </section>
+
+  <!-- ============================ CONFIG ============================ -->
+  <section class="view" id="view-config">
+    <div class="page-head">
+      <p class="eyebrow">Config</p>
+      <h1 class="headline">Every number is a decision</h1>
+      <p class="lede">This edits <code id="config-path">config.toml</code> in place. A save is validated by loading it exactly as the tool would; an unknown key or a syntax error is rejected with the reason. Note why you changed a threshold in the comment next to it.</p>
+    </div>
+    <div class="config">
+      <div>
+        <textarea id="config-text" class="editor" spellcheck="false" aria-label="config.toml"></textarea>
+        <div class="card-foot" style="padding-top: 12px">
+          <button id="btn-config-save" class="btn btn-primary">Save config</button>
+          <button id="btn-config-reload" class="btn btn-tertiary">Reload from disk</button>
+          <span id="config-status" class="status-line"></span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">What moves results most</div>
+        <p class="card-body">Values as the tool currently reads them.</p>
+        <dl class="kv" id="config-kv"></dl>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ DESIGN ============================ -->
+  <section class="view" id="view-design">
+    <div class="page-head">
+      <p class="eyebrow">Design</p>
+      <h1 class="headline">Built from a DESIGN.md</h1>
+      <p class="lede">This page is styled from <code>design/DESIGN.md</code>, the Linear-inspired system in the <a href="https://github.com/VoltAgent/awesome-claude-design" target="_blank" rel="noopener">awesome-claude-design</a> collection. The file's front matter (colours, type scale, radii, spacing, components) is projected into <code>tokens.css</code>; every component on this page reads those tokens and nothing else.</p>
+    </div>
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="card-title">Swap the design system</div>
+        <div class="prose">
+          <ol>
+            <li>Pick a system in the collection and open its preview on <a href="https://getdesign.md/" target="_blank" rel="noopener">getdesign.md</a>.</li>
+            <li>Save its <code>DESIGN.md</code> over <code>design/DESIGN.md</code> (raw files live at <code>VoltAgent/awesome-design-md/design-md/&lt;slug&gt;/DESIGN.md</code>).</li>
+            <li>Re-derive <code>hl_screener/webui/static/tokens.css</code> from the new front matter, keeping the same variable names. Reload this page.</li>
+          </ol>
+          <p>The same file can be uploaded to <a href="https://claude.ai/design" target="_blank" rel="noopener">Claude Design</a> ("Create new design system") to get a full kit, and pasted into a Claude Code session as the brief for any new screen.</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Components in use</div>
+        <div class="samples">
+          <button class="btn btn-primary">Primary</button>
+          <button class="btn btn-secondary">Secondary</button>
+          <button class="btn btn-tertiary">Tertiary</button>
+          <span class="badge">idle</span><span class="badge running">running</span><span class="badge done">done</span><span class="badge failed">failed</span>
+        </div>
+        <div class="samples" style="margin-top: 8px">
+          <label class="field" style="flex: 1; min-width: 200px"><span>Text input</span><input type="text" placeholder="0x…"></label>
+          <span class="tile" style="min-width: 140px"><span class="label">Stat tile</span><span class="value" style="display:block">39.4%</span><span class="sub">hero number</span></span>
+        </div>
+        <p class="card-body">Cards on surface-1 with hairline borders, 12px corners; console and table panels are the 16px "product screenshot" tile; tabs are the pill toggle; lavender is reserved for the primary action, the brand mark, focus rings and the one chart series.</p>
+      </div>
+    </div>
+    <h3 class="section-title">Colour tokens <span class="caption">read live from tokens.css</span></h3>
+    <div class="swatches" id="swatches"></div>
+    <h3 class="section-title">Type scale <span class="caption">Inter and JetBrains Mono as the substitutes the DESIGN.md names</span></h3>
+    <div class="panel tight"><div class="panel-body type-ramp" id="type-ramp"></div></div>
+  </section>
+
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
