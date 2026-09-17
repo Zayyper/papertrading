@@ -17,7 +17,5 @@ RUN mkdir -p /app/data /app/out
 VOLUME ["/app/data", "/app/out"]
 
 EXPOSE 8765
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/api/status', timeout=4).status == 200 else 1)" || exit 1
-
+# the health check lives in docker-compose.yml on the `ui` service only (the `paper` service has no port)
 CMD ["python", "-m", "hl_screener", "ui", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
