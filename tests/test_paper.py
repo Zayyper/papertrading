@@ -91,6 +91,21 @@ def test_trader_follows_a_round_trip(tmp_path):
     store.close()
 
 
+def test_reconcile_follows_missed_fills_late_and_once(tmp_path):
+    store = Store(tmp_path / "p.db")
+    addr = "0x" + "a" * 40
+    api = FakeLiveAPI()
+    api.fills_since = lambda user, start_ms: [{"tid": 9, "time": 5_000, "coin": "ETH", "px": "100", "sz": "10", "side": "B", "startPosition": "0"}]
+    trader = PaperTrader(api, Config(), [{"address": addr}], store, equity_base=1000.0, max_leverage=10.0)
+    asyncio.run(trader.refresh_leader_equity())
+    trader.leaders[addr].last_fill_time = 4_000          # as if resumed from a database after downtime
+    asyncio.run(trader.reconcile())
+    assert store.one("SELECT late, action FROM paper_fills") == {"late": 1, "action": "open"}
+    asyncio.run(trader.reconcile())                       # the same fill again: ignored
+    assert store.one("SELECT COUNT(*) n FROM paper_fills")["n"] == 1
+    store.close()
+
+
 def test_read_leaders_from_shortlist_and_plain_list(tmp_path):
     csv_path = tmp_path / "shortlist.csv"
     csv_path.write_text("address,display_name,is_f_avg_penalty_bps,is_f_roi,oos_f_roi\n0x" + "b" * 40 + ",bob,12.5,0.2,-0.1\n", encoding="utf-8")

@@ -463,8 +463,7 @@ class PaperTrader:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFills", "user": addr}}))
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
                     self.store.event("info", "websocket connected" if first else "websocket reconnected")
-                    if not first:
-                        await self.reconcile()
+                    await self.reconcile()   # also on the first connect: fills made while the service was down (restart, redeploy)
                     first = False
                     backoff = 2.0
                     last_ping = time.time()
