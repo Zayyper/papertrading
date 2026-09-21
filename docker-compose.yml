@@ -8,7 +8,7 @@ services:
     environment:
       HL_UI_PASSWORD: ${HL_UI_PASSWORD:-}      # required on the internet; blank = no password (localhost only)
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"   # loopback only: on a server the page is reached through Coolify's HTTPS proxy, never directly
     volumes:
       - hl-data:/app/data
       - hl-out:/app/out
