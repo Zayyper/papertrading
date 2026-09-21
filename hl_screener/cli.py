@@ -162,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         rep = pumpfun.build_report(db, latency_slots=a.latency_slots, stake_sol=a.stake)
         pumpfun.save_report(db, rep)
+        pumpfun.update_follow(db, rep)
         pumpfun.print_report(rep)
         return 0
 

@@ -135,7 +135,13 @@ python -m hl_screener pump report      # rank now from what was collected
   after the wallet buys at the curve state left by every earlier trade, sells the same way after
   the wallet's first sell, pays pump.fun fees and 0.0005 SOL per transaction.
 - **Golden** = copier profitable in both halves of the window, wallet profitable in both halves,
-  two best tokens under half its winnings, and it launches no tokens.
+  two best tokens under half its winnings, it launches no tokens, it is not in a cluster, and the
+  window spans 12 hours or more.
+- **Golden wallets are paper-followed live**, inside the collector, from the moment a report flags
+  them and for good after that: each first buy of a token copied with 0.1 SOL landing 2 slots
+  behind the wallet (later if the feed lags), sold when it first sells, on the live curve with
+  its fees. The Paper tab shows each followed wallet's copies next to the copier return the
+  report measured before following it. That comparison is the out-of-sample test.
 - The page's **Pump** tab shows the collector status, base rates, copy candidates and snipers.
 
 ## Running on a server (Coolify)

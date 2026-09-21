@@ -554,9 +554,44 @@
   function stopPaperPolling() { clearInterval(paper.timer); paper.timer = null; }
 
   async function loadPaper() {
-    let d;
-    try { d = await api("GET", `/api/paper?log_since=${paper.logSince}`); } catch (e) { toast(e.message); return; }
+    let d, pp;
+    try { [d, pp] = await Promise.all([api("GET", `/api/paper?log_since=${paper.logSince}`), api("GET", "/api/pump/paper")]); } catch (e) { toast(e.message); return; }
     renderPaper(d);
+    renderPumpPaper(pp);
+  }
+
+  function renderPumpPaper(d) {
+    const p = d.paper || {};
+    const W = p.wallets || [];
+    $("#pp-caption").textContent = p.at
+      ? `each wallet the Pump tab flags golden, from that moment on: its first buy of a token copied with ${p.stake_sol} SOL landing ${p.latency_slots} slots behind it, sold when it first sells, live curve prices and fees, no real orders · ${fmtInt(p.pending)} waiting to land`
+      : "";
+    const empty = !d.exists ? "The pump.fun collector is not running yet." :
+      "No golden wallet yet. A wallet needs 12+ hours of data, 10+ tokens, profit in both halves of the window for itself and its copier, no dominant token, no launches and no cluster. Each one is followed from the moment a report flags it.";
+    sortableTable($("#pp-wallets"), [
+      { key: "wallet", label: "Wallet", render: (r) => solscan(r.wallet) + (r.golden_now ? ' <span class="badge done">golden now</span>' : ' <span class="badge">no longer golden</span>') },
+      { key: "added_at", label: "Followed since", render: (r) => `<span class="muted">${fmtTime((r.added_at || 0) * 1000)}</span>` },
+      { key: "copied", label: "Copied", num: true, render: (r) => fmtInt(r.copied) },
+      { key: "open", label: "Open", num: true, render: (r) => fmtInt(r.open) },
+      { key: "realized", label: "Realized, SOL", num: true, render: (r) => solAmt(r.realized) },
+      { key: "unrealized", label: "Open, SOL", num: true, title: "open copies marked at the live curve, after fees and the exit transaction", render: (r) => solAmt(r.unrealized) },
+      { key: "total", label: "Total, SOL", num: true, render: (r) => solAmt(r.total) },
+      { key: "roi", label: "Per copy", num: true, title: "total over SOL put into copies", render: (r) => pct(r.roi) },
+      { key: "report_copy_roi", label: "Report said", num: true, title: "the copier return the report measured before following it: the forward result is the test of this number", render: (r) => pct(r.report_copy_roi) },
+      { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
+      { key: "delay_slots", label: "Delay", num: true, title: "slots between the wallet's trade and the copy landing", render: (r) => isNum(r.delay_slots) ? fmtNum(r.delay_slots, 1) + " slots" : "n/a" },
+      { key: "slip_bps", label: "Slippage", num: true, render: (r) => isNum(r.slip_bps) ? fmtNum(r.slip_bps, 0) + " bps" : "n/a" },
+    ], W, { sortKey: "total", dir: -1, empty });
+    sortableTable($("#pp-fills"), [
+      { key: "ts", label: "Time", render: (f) => `<span class="muted">${fmtTime(f.ts * 1000)}</span>` },
+      { key: "wallet", label: "Wallet", render: (f) => solscan(f.wallet) },
+      { key: "mint", label: "Token", render: (f) => `<a class="addr" href="https://pump.fun/coin/${esc(f.mint)}" target="_blank" rel="noopener" title="${esc(f.mint)}">${shortAddr(f.mint)}</a>` },
+      { key: "side", label: "Side", render: (f) => f.side + (f.timed_out ? ' <span class="muted" title="token went quiet: landed at its last price">quiet</span>' : "") },
+      { key: "sol", label: "SOL", num: true, render: (f) => fmtNum(f.sol, 4) },
+      { key: "land_slot", label: "Delay", num: true, render: (f) => `${f.land_slot - f.trigger_slot} slots` },
+      { key: "slip_bps", label: "Slippage", num: true, render: (f) => isNum(f.slip_bps) ? `<span class="${f.slip_bps > 0 ? "neg" : "pos"}">${fmtNum(f.slip_bps, 0)} bps</span>` : "n/a" },
+      { key: "pnl", label: "PnL, SOL", num: true, render: (f) => f.side === "sell" ? solAmt(f.pnl) : '<span class="tertiary">–</span>' },
+    ], p.recent || [], { sortKey: "ts", dir: -1, empty: "No copy yet. They appear when a followed wallet trades." });
   }
 
   function renderPaper(d) {

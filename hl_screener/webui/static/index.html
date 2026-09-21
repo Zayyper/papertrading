@@ -149,6 +149,11 @@
       <div class="panel tight"><div class="panel-head"><div class="panel-title">Events</div></div><pre id="paper-events" class="console" style="min-height: 120px; max-height: 300px"></pre></div>
       <div class="panel tight"><div class="panel-head"><div class="panel-title">Service output</div></div><pre id="paper-log" class="console" style="min-height: 120px; max-height: 300px"></pre></div>
     </div>
+
+    <h3 class="section-title">pump.fun golden wallets, followed live <span class="caption" id="pp-caption"></span></h3>
+    <div class="panel tight"><div class="table-wrap" id="pp-wallets"></div></div>
+    <h3 class="section-title">pump.fun copies <span class="caption">latest 50; slippage is the copy's price against the wallet's own, positive = worse</span></h3>
+    <div class="panel tight"><div class="table-wrap" id="pp-fills" style="max-height: 420px"></div></div>
   </section>
 
   <!-- ============================ PUMP ============================ -->
@@ -165,7 +170,7 @@
     <h3 class="section-title">Snipers <span class="caption">first buy within a couple of slots of the token's creation</span></h3>
     <div class="panel tight"><div class="table-wrap" id="pump-snipers" style="max-height: 560px"></div></div>
     <details class="panel report"><summary>How to read this</summary><div class="md"><ul>
-      <li><b>Golden</b> means the copier made money in both halves of the window, the wallet itself was profitable in both halves, no two tokens make more than half of its winnings, it launches no tokens of its own, and it is not part of a cluster.</li>
+      <li><b>Golden</b> means the copier made money in both halves of the window, the wallet itself was profitable in both halves, no two tokens make more than half of its winnings, it launches no tokens of its own, it is not part of a cluster, and the window spans at least 12 hours. Golden wallets are paper-followed live from that moment on: see the Paper tab.</li>
       <li><b>Cluster ×N</b>: N wallets bought the same tokens in the same slot on at least half of this wallet's tokens. That is one operator behind several wallets, or a coordinated group trading its own launches. Their edge is knowing the launch; it ends the moment they sell to their followers.</li>
       <li><b>Same slot</b> snipes land in the block that created the token: bundled with the launch or colocated with the validator. Nobody can copy those.</li>
       <li><b>Dev</b> marks wallets that also launch tokens. A sniper that launches tokens is most likely buying its own or its friends' launches.</li>

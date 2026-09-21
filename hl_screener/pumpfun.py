@@ -134,6 +134,11 @@ CREATE INDEX IF NOT EXISTS ix_trades_mint ON trades(mint, slot);
 CREATE INDEX IF NOT EXISTS ix_trades_wallet ON trades(wallet, mint, slot);
 CREATE INDEX IF NOT EXISTS ix_mints_ts ON mints(ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS follow (wallet TEXT PRIMARY KEY, added_at INTEGER, golden_now INTEGER, report_copy_roi REAL);
+CREATE TABLE IF NOT EXISTS pfills (id INTEGER PRIMARY KEY, wallet TEXT, mint TEXT, side TEXT, trigger_slot INTEGER,
+                                   land_slot INTEGER, ts INTEGER, sol REAL, tok REAL, leader_px REAL, px REAL,
+                                   slip_bps REAL, pnl REAL, timed_out INTEGER);
+CREATE TABLE IF NOT EXISTS ppos (wallet TEXT, mint TEXT, tok REAL, cost REAL, opened INTEGER, PRIMARY KEY (wallet, mint));
 """
 
 
@@ -159,6 +164,151 @@ def get_meta(c: sqlite3.Connection, key: str, default: Any = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# paper follower: the golden wallets, followed live
+# ---------------------------------------------------------------------------
+class PaperFollow:
+    """Forward test of the golden wallets, out-of-sample by construction: a wallet is followed only from the
+    moment a report flags it, and kept after that. Its first buy of each token is copied with `stake_sol`,
+    landing `latency_slots` after it, or right after the newest slot the feed has shown if the feed lags more;
+    the copy is sold when the wallet first sells, the same way. Priced on the live curve at the wallet's own
+    fee rate plus `tx_cost_sol` per transaction: the report's replay rules, so the two compare directly.
+    Nothing is ever sent to Solana."""
+
+    def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = 0.0005):
+        self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
+        self.follow: set[str] = set()
+        self.reload()
+        self.pos = {(w, m): [tok, cost, opened] for w, m, tok, cost, opened in c.execute("SELECT wallet, mint, tok, cost, opened FROM ppos")}
+        self.copied = set(c.execute("SELECT DISTINCT wallet, mint FROM pfills WHERE side = 'buy'"))
+        self.pending: dict[str, list[dict[str, Any]]] = {}
+        self.curve: dict[str, tuple[int, int, float]] = {}     # mint -> reserves after its last trade, when seen
+        self.tip = 0                                            # newest slot the feed has shown
+        for (_, m) in self.pos:                                 # after a restart, mark open copies at the last stored price
+            row = c.execute("""SELECT t.vsol, t.vtok FROM trades t JOIN mints mm ON mm.id = t.mint WHERE mm.addr = ?
+                               ORDER BY t.slot DESC, t.rowid DESC LIMIT 1""", (m,)).fetchone()
+            if row:
+                self.curve[m] = (row[0], row[1], time.time())
+
+    def reload(self) -> None:
+        self.follow = {w for (w,) in self.c.execute("SELECT wallet FROM follow")}
+
+    def on_trade(self, slot: int, mint: str, user: str, e: dict[str, Any]) -> None:
+        self.tip = max(self.tip, slot)
+        acts = self.pending.get(mint)
+        if acts:                                                # copies due: land at the state before this trade
+            self._run_due(mint, acts, [slot >= a["land"] for a in acts])
+        self.curve[mint] = (e["vsol"], e["vtok"], time.time())
+        if user not in self.follow or not e["tok"]:
+            return
+        key, side = (user, mint), ("buy" if e["buy"] else "sell")
+        mine = [a for a in self.pending.get(mint, ()) if a["wallet"] == user]
+        if any(a["side"] == side for a in mine):
+            return
+        if side == "buy" and key in self.copied:
+            return                                              # only its first buy of a token is copied
+        if side == "sell" and key not in self.pos and not mine:
+            return                                              # nothing copied to sell
+        if side == "buy":
+            self.copied.add(key)
+        leader_px = ((e["sol"] + e["fee"]) if e["buy"] else (e["sol"] - e["fee"])) / e["tok"]
+        self.pending.setdefault(mint, []).append({"wallet": user, "side": side, "trigger": slot, "land": max(slot + self.L, self.tip + 1),
+                                                  "rate": e["fee"] / e["sol"] if e["sol"] else FEE, "leader_px": leader_px, "t": time.time()})
+
+    def _run_due(self, mint: str, acts: list[dict[str, Any]], due: list[bool], timed_out: bool = False) -> None:
+        """Run the queue up to its last due action, in order, so a copied sell never runs before its buy."""
+        last = max((i for i, d in enumerate(due) if d), default=-1)
+        if last < 0:
+            return
+        if acts[last + 1:]:
+            self.pending[mint] = acts[last + 1:]
+        else:
+            self.pending.pop(mint, None)
+        for a in acts[:last + 1]:
+            self._execute(a, mint, timed_out)
+
+    def tick(self) -> None:
+        """Copies on a token that went quiet land at its current state: nothing traded since."""
+        now = time.time()
+        for mint, acts in list(self.pending.items()):
+            self._run_due(mint, acts, [now - a["t"] > (a["land"] - a["trigger"]) * 0.4 + 2 for a in acts], timed_out=True)
+
+    def _execute(self, a: dict[str, Any], mint: str, timed_out: bool = False) -> None:
+        st, key = self.curve.get(mint), (a["wallet"], mint)
+        if not st or st[0] <= 0 or st[1] <= 0:
+            return
+        vsol, vtok, now = st[0], st[1], int(time.time())
+        if a["side"] == "buy":
+            tok = vtok - vsol * vtok / (vsol + self.stake * LAMPORTS / (1 + a["rate"]))
+            if tok <= 0:
+                return
+            sol, pnl, px = self.stake, None, self.stake * LAMPORTS / tok
+            slip = (px / a["leader_px"] - 1) * 1e4 if a["leader_px"] > 0 else None
+            self.pos[key] = [tok, self.stake, now]
+            self.c.execute("INSERT OR REPLACE INTO ppos VALUES (?,?,?,?,?)", (*key, tok, self.stake, now))
+        else:
+            held = self.pos.pop(key, None)
+            if held is None:
+                return
+            tok, cost = held[0], held[1]
+            sol = (vsol - vsol * vtok / (vtok + tok)) * (1 - a["rate"]) / LAMPORTS
+            pnl, px = sol - cost - 2 * self.tx, sol * LAMPORTS / tok
+            slip = (1 - px / a["leader_px"]) * 1e4 if a["leader_px"] > 0 else None
+            self.c.execute("DELETE FROM ppos WHERE wallet = ? AND mint = ?", key)
+        self.c.execute("""INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, ts, sol, tok, leader_px, px, slip_bps, pnl, timed_out)
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (*key, a["side"], a["trigger"], a["land"], now, sol, tok, a["leader_px"], px, slip, pnl, int(timed_out)))
+
+    def forget(self, max_age_s: float = 6 * 3600) -> None:
+        keep = {m for (_, m) in self.pos} | set(self.pending)
+        cutoff = time.time() - max_age_s
+        self.curve = {m: v for m, v in self.curve.items() if v[2] >= cutoff or m in keep}
+
+    def summary(self) -> dict[str, Any]:
+        rows = {w: {"wallet": w, "added_at": added, "golden_now": bool(g), "report_copy_roi": roi, "copied": 0, "closed": 0,
+                    "open": 0, "realized": 0.0, "unrealized": 0.0, "wins": 0, "delay_slots": None, "slip_bps": None}
+                for w, added, g, roi in self.c.execute("SELECT wallet, added_at, golden_now, report_copy_roi FROM follow")}
+        for w, copied, closed, realized, wins, delay, slip in self.c.execute(
+                """SELECT wallet, SUM(side = 'buy'), SUM(side = 'sell'), COALESCE(SUM(pnl), 0), SUM(pnl > 0),
+                          AVG(land_slot - trigger_slot), AVG(slip_bps) FROM pfills GROUP BY wallet"""):
+            if w in rows:
+                rows[w].update(copied=copied, closed=closed, realized=realized, wins=wins, delay_slots=delay, slip_bps=slip)
+        open_ = []
+        for (w, m), (tok, cost, opened) in self.pos.items():
+            st = self.curve.get(m)
+            value = (st[0] - st[0] * st[1] / (st[1] + tok)) * (1 - FEE) / LAMPORTS if st and st[1] > 0 else None
+            pnl = value - cost - 2 * self.tx if value is not None else None
+            if w in rows:
+                rows[w]["open"] += 1
+                rows[w]["unrealized"] += pnl or 0.0
+            open_.append({"wallet": w, "mint": m, "cost": cost, "value": value, "pnl": pnl, "opened": opened})
+        for r in rows.values():
+            r["total"] = r["realized"] + r["unrealized"]
+            r["roi"] = r["total"] / (r["copied"] * self.stake) if r["copied"] else None
+            r["win_rate"] = r["wins"] / r["closed"] if r["closed"] else None
+        cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
+        recent = [dict(zip(cols, r)) for r in self.c.execute(f"SELECT {', '.join(cols)} FROM pfills ORDER BY id DESC LIMIT 50")]
+        return {"at": int(time.time()), "stake_sol": self.stake, "latency_slots": self.L, "tx_cost_sol": self.tx,
+                "pending": sum(len(v) for v in self.pending.values()),
+                "wallets": sorted(rows.values(), key=lambda r: r["added_at"] or 0), "open": open_, "recent": recent}
+
+
+def update_follow(db_path: str | Path, rep: dict[str, Any]) -> int:
+    """Start following every wallet this report flags golden; remember which are still golden now."""
+    golden = {r["addr"]: r for r in rep.get("traders", []) if r.get("golden")}
+    c = connect(db_path)
+    try:
+        c.execute("UPDATE follow SET golden_now = 0")
+        for addr, r in golden.items():
+            c.execute("""INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, ?, 1, ?)
+                         ON CONFLICT(wallet) DO UPDATE SET golden_now = 1, report_copy_roi = excluded.report_copy_roi""",
+                      (addr, int(time.time()), r.get("copy_roi")))
+        c.commit()
+        return len(golden)
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------------
 # collector
 # ---------------------------------------------------------------------------
 class Collector:
@@ -175,6 +325,8 @@ class Collector:
                                       "reconnects": 0, **(get_meta(self.c, "stats") or {})}
         self.stats["started"] = int(time.time())
         self.stats["ws"] = ws_url.split("?")[0]              # never store an API key that may sit in the query string
+        self.paper = PaperFollow(self.c)
+        self.last_paper = 0.0
 
     def wallet_id(self, addr: str) -> int:
         i = self.wallets.get(addr)
@@ -209,10 +361,14 @@ class Collector:
                 if e is None:
                     self.stats["parse_errors"] += 1
                     continue
-                m = self.mints.get(b58(e["mint"]))
-                if m is None or not e["sol_quote"]:
-                    continue                      # born before we started watching, or not quoted in SOL
-                self.buf.append((slot, e["ts"], m[0], self.wallet_id(b58(e["user"])), int(e["buy"]),
+                if not e["sol_quote"]:
+                    continue
+                mint, user = b58(e["mint"]), b58(e["user"])
+                self.paper.on_trade(slot, mint, user, e)          # followed wallets are copied on any token
+                m = self.mints.get(mint)
+                if m is None:
+                    continue                      # born before we started watching: not stored
+                self.buf.append((slot, e["ts"], m[0], self.wallet_id(user), int(e["buy"]),
                                  e["sol"], e["tok"], e["fee"], e["vsol"], e["vtok"]))
 
     def flush(self) -> None:
@@ -220,13 +376,20 @@ class Collector:
             self.c.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)", self.buf)
             self.stats["trades"] += len(self.buf)
             self.buf.clear()
-        self.stats["heartbeat"] = int(time.time())
+        self.paper.tick()
+        now = time.time()
+        if now - self.last_paper >= 10:
+            self.paper.reload()                                   # the report thread adds golden wallets
+            set_meta(self.c, "paper", self.paper.summary())
+            self.last_paper = now
+        self.stats["heartbeat"] = int(now)
         set_meta(self.c, "stats", self.stats)
         self.c.commit()
 
     def forget_old_mints(self) -> None:
         cutoff = time.time() - self.retention_s
         self.mints = {a: v for a, v in self.mints.items() if v[1] >= cutoff}
+        self.paper.forget()
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         import websockets  # here so `pump report` works without the package
@@ -300,7 +463,9 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                 n = prune(db_path, col.retention_s)
                 rep = build_report(db_path)
                 save_report(db_path, rep)
-                log.info("report: %s wallets ranked, %s tokens pruned", rep.get("counts", {}).get("wallets_ranked"), n)
+                g = update_follow(db_path, rep)
+                log.info("report: %s wallets ranked, %d golden (followed from now on), %s tokens pruned",
+                         rep.get("counts", {}).get("wallets_ranked"), g, n)
             except Exception:  # noqa: BLE001
                 log.exception("report failed")
 
@@ -406,9 +571,12 @@ def twins(c: sqlite3.Connection, wallet: int, max_positions: int = 1000) -> int:
 
 
 def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10, min_snipes: int = 5, latency_slots: int = 2,
-                 stake_sol: float = 0.1, tx_cost_sol: float = 0.0005, top: int = 100, max_positions: int = 1000) -> dict[str, Any]:
+                 stake_sol: float = 0.1, tx_cost_sol: float = 0.0005, top: int = 100, max_positions: int = 1000,
+                 min_hours: float = 12) -> dict[str, Any]:
+    """`min_hours`: no wallet is called golden before the window spans this long. Golden wallets get followed
+    for good, so a verdict from the first minutes of data would pin noise to the paper test."""
     params = {"snipe_slots": snipe_slots, "min_tokens": min_tokens, "min_snipes": min_snipes, "latency_slots": latency_slots,
-              "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE}
+              "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours}
     t_build = time.time()
     c = connect(db_path, readonly=True)
     try:
@@ -443,7 +611,7 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
                       "copy_win_rate": sim["wins"] / sim["n"] if sim["n"] else None})
             r["golden"] = bool(sim["roi_h1"] is not None and sim["roi_h2"] is not None and sim["roi_h1"] > 0 and sim["roi_h2"] > 0
                                and r["pnl_h1"] > 0 and r["pnl_h2"] > 0 and (r["top2_share"] or 1) <= 0.5
-                               and r["launched"] == 0 and r["twins"] == 0)
+                               and r["launched"] == 0 and r["twins"] == 0 and (t_last - t0) / 3600 >= min_hours)
         # base rates over every wallet with enough tokens: is making money here common, and does it persist?
         both = [r for r in traders if r["n_h1"] >= min_tokens // 2 and r["n"] - r["n_h1"] >= min_tokens // 2]
         h1_win = [r for r in both if r["pnl_h1"] > 0]

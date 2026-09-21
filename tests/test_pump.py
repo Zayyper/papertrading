@@ -103,6 +103,47 @@ def test_collector_report_snipers_devs_and_copy_replay(tmp_path):
     col.c.close()
 
 
+def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
+    col = Collector(tmp_path / "pump.db")
+    G, X, Y, Z = (bytes([i]) * 32 for i in (80, 81, 82, 83))
+    col.c.execute("INSERT INTO follow VALUES (?, 0, 1, 0.5)", (b58(G),))
+    col.paper.reload()
+    mint, curve, held, states = bytes([9]) * 32, Curve(), {}, {}
+
+    def trade(slot, who, buy, amount, m=mint, cv=curve):
+        if buy:
+            tok = cv.buy(amount)
+            held[(who, m)] = held.get((who, m), 0) + tok
+            b = trade_bytes(m, who, True, amount, tok, cv.vsol, cv.vtok)
+        else:
+            tok = held.pop((who, m))
+            b = trade_bytes(m, who, False, cv.sell(tok), tok, cv.vsol, cv.vtok)
+        states[(m, slot)] = (cv.vsol, cv.vtok)
+        col.on_logs(slot, ["Program data: " + base64.b64encode(b).decode()])
+
+    trade(100, G, True, 10**9)            # the followed wallet buys: the copy lands at slot 102 or later
+    trade(101, X, True, 2 * 10**9)        # not due yet
+    trade(103, Y, True, 10**9)            # due: the copy buys at the state X left
+    trade(104, G, True, 10**9)            # a second buy of the same token is not copied
+    trade(120, G, False, None)            # the wallet sells: the copy sells at slot 122 or later
+    trade(125, Z, True, 10**9)            # due: the copy sells at the state G's sell left
+    fills = col.c.execute("SELECT side, trigger_slot, land_slot, pnl, timed_out FROM pfills ORDER BY id").fetchall()
+    assert [f[:3] for f in fills] == [("buy", 100, 102), ("sell", 120, 122)]
+    assert abs(fills[1][3] - copy_trade(states[(mint, 101)], states[(mint, 120)], 0.1, 0.0005)) < 1e-6
+
+    quiet, cv2 = bytes([10]) * 32, Curve()
+    trade(200, G, True, 10**9, m=quiet, cv=cv2)   # nothing trades after this: the timeout lands the copy
+    col.paper.tick()
+    assert col.c.execute("SELECT COUNT(*) FROM pfills").fetchone()[0] == 2           # too early
+    for a in col.paper.pending[b58(quiet)]:
+        a["t"] -= 10
+    col.paper.tick()
+    assert col.c.execute("SELECT side, timed_out FROM pfills ORDER BY id DESC LIMIT 1").fetchone() == ("buy", 1)
+    s = col.paper.summary()["wallets"][0]
+    assert (s["copied"], s["closed"], s["open"]) == (2, 1, 1) and s["golden_now"]
+    col.c.close()
+
+
 def test_twins_are_wallets_buying_the_same_tokens_in_the_same_slot(tmp_path):
     col = Collector(tmp_path / "pump.db")
     A, B, C, dev = (bytes([i]) * 32 for i in (40, 41, 42, 43))
