@@ -120,11 +120,12 @@
     <div class="grid grid-2">
       <form class="card" id="form-paper">
         <div class="card-title">Service</div>
-        <label class="field"><span>Leaders</span><select name="leaders" id="paper-leaders-file"></select></label>
-        <label class="field"><span>Virtual equity per leader, USD</span><input name="equity" type="number" min="10" step="10" placeholder="config"></label>
-        <p class="card-body">Started from here it stops when this page's server stops. For a test that must survive reboots, run it in its own window: <code>python -m hl_screener paper</code>. Either way it resumes from its database.</p>
+        <p class="card-body" id="paper-external" hidden></p>
+        <label class="field paper-local"><span>Leaders</span><select name="leaders" id="paper-leaders-file"></select></label>
+        <label class="field paper-local"><span>Virtual equity per leader, USD</span><input name="equity" type="number" min="10" step="10" placeholder="config"></label>
+        <p class="card-body paper-local">Started from here it stops when this page's server stops. For a test that must survive reboots, run it in its own window: <code>python -m hl_screener paper</code>. Either way it resumes from its database.</p>
         <div class="card-foot">
-          <button class="btn btn-primary" type="submit" id="btn-paper-start">Start</button>
+          <button class="btn btn-primary paper-local" type="submit" id="btn-paper-start">Start</button>
           <button class="btn btn-secondary" type="button" id="btn-paper-stop" hidden>Stop</button>
           <span id="paper-service-badge" class="badge">idle</span>
           <span id="paper-heartbeat" class="caption"></span>

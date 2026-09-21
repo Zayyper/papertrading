@@ -561,16 +561,21 @@
   function renderPaper(d) {
     const svc = d.service, st = d.status || {};
     const running = svc && svc.status === "running";
-    const sel = $("#paper-leaders-file");
-    if (sel.options.length !== (d.leaders_files || []).length) sel.innerHTML = (d.leaders_files || []).map((f) => `<option value="${esc(f)}">${esc(f)}</option>`).join("") || `<option value="">no shortlist yet: run a screen first</option>`;
+    const external = !running && st.exists && isNum(st.heartbeat_age_s) && st.heartbeat_age_s < 120;   // e.g. the `paper` container in Coolify
+    $$(".paper-local").forEach((el) => { el.hidden = external; });
+    $("#paper-external").hidden = !external;
+    if (external) $("#paper-external").textContent = `Runs as its own service, separate from this page. Following ${(st.leaders || []).length} leaders from ${st.leaders_file || "its leaders file"}, ${fmtUsd((st.config || {}).equity_base)} each. Stop or restart it where it runs, for example the paper service in Coolify.`;
+    const files = d.leaders_files || [], sel = $("#paper-leaders-file");
+    if (sel.dataset.files !== files.join("|")) {   // rebuild only when the list changes, so a choice survives the 5 s refresh
+      sel.dataset.files = files.join("|");
+      sel.innerHTML = files.length ? files.map((f) => `<option value="${esc(f)}">${esc(f)}</option>`).join("") : `<option value="">no leaders file yet: run a screen first</option>`;
+    }
     $("#form-paper").elements.equity.placeholder = `${d.defaults.equity} (config)`;
-    $("#btn-paper-start").disabled = running || !(d.leaders_files || []).length;
+    $("#btn-paper-start").disabled = running || !files.length;
     $("#btn-paper-stop").hidden = !running;
     const badge = $("#paper-service-badge");
-    const external = !running && st.exists && isNum(st.heartbeat_age_s) && st.heartbeat_age_s < 120;   // e.g. the `paper` container
-    badge.textContent = svc ? svc.status : external ? "live, running elsewhere" : (st.exists ? "stopped" : "idle");
+    badge.textContent = svc ? svc.status : external ? "live" : (st.exists ? "stopped" : "idle");
     badge.className = "badge " + (svc ? svc.status : external ? "running" : "");
-    if (external) $("#btn-paper-start").disabled = true;
     $("#paper-heartbeat").textContent = st.exists ? `database ${esc(d.db.split(/[\\/]/).slice(-2).join("/"))} · last heartbeat ${ago(st.heartbeat_age_s)}` : "no paper database yet";
     if (svc && svc.lines && svc.lines.length) { paper.logLines.push(...svc.lines); paper.logLines = paper.logLines.slice(-300); paper.logSince = svc.next; $("#paper-log").textContent = paper.logLines.join("\n"); $("#paper-log").scrollTop = 1e9; }
     if (svc && paper.logSince > svc.next) { paper.logSince = 0; paper.logLines = []; }

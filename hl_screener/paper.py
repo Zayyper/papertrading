@@ -551,7 +551,8 @@ def status(db_path: str | Path, mids: dict[str, float] | None = None) -> dict[st
             snaps.setdefault(r["address"], []).append([r["time"], r["equity"], r["leader_equity"]])
         fills = st.rows("SELECT * FROM paper_fills ORDER BY time DESC LIMIT 200")
         events = st.rows("SELECT * FROM events ORDER BY time DESC LIMIT 60")
-        return {"exists": True, "config": cfg, "heartbeat": hb, "heartbeat_age_s": (now_ms() - hb) / 1000 if hb else None,
+        return {"exists": True, "config": cfg, "leaders_file": st.get_meta("leaders_file"),
+                "heartbeat": hb, "heartbeat_age_s": (now_ms() - hb) / 1000 if hb else None,
                 "leaders": leaders, "snapshots": snaps, "fills": fills, "events": events}
     finally:
         st.close()
@@ -586,6 +587,7 @@ def serve(api: HyperliquidAPI, cfg: Config, leaders_path: Path, db_path: Path, e
         print(f"no addresses in {leaders_path}")
         return 2
     store = Store(db_path)
+    store.set_meta("leaders_file", Path(leaders_path).as_posix())
     trader = PaperTrader(api, cfg, leaders, store, equity_base, max_leverage)
     logging.getLogger(__name__).setLevel(logging.INFO)  # fills are printed even without -v
     print(f"paper trader: {len(leaders)} leaders from {leaders_path}, ${equity_base:,.0f} each, max {max_leverage}x, db {db_path}. Ctrl+C to stop.", flush=True)

@@ -135,12 +135,13 @@ class App:
         from ..paper import status
         cfg, _ = self.cfg()
         out_dir = self.root / cfg.out_dir
-        files = sorted((p for p in out_dir.glob("shortlist_*.csv") if not p.name.startswith("shortlist_trades")),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        files = sorted((self.root / "paper").glob("*.csv")) + sorted(
+            (p for p in out_dir.glob("shortlist_*.csv") if not p.name.startswith("shortlist_trades")),
+            key=lambda p: p.stat().st_mtime, reverse=True)
         db = self.paper_db()
         st = status(db, self._live_mids() if db.exists() else None)
         return {"service": self.service.view(log_since) if self.service else None, "db": str(db), "status": st,
-                "leaders_files": [str(p.relative_to(self.root)) for p in files],
+                "leaders_files": [p.relative_to(self.root).as_posix() for p in files],
                 "defaults": {"equity": cfg.follower_equity_usd, "max_leverage": cfg.follower_max_leverage}}
 
     def start_service(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
