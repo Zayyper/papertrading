@@ -13,6 +13,16 @@ services:
       - hl-data:/app/data
       - hl-out:/app/out
 
+  pump:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "hl_screener", "pump", "collect"]
+    environment:
+      SOLANA_WS_URL: ${SOLANA_WS_URL:-}               # blank = Solana's public endpoint; a Helius/QuickNode URL is steadier
+      PUMP_RETENTION_DAYS: ${PUMP_RETENTION_DAYS:-3}  # about 0.3-0.6 GB per day of pump.fun trades
+    volumes:
+      - hl-data:/app/data
+
   paper:
     build: .
     restart: unless-stopped

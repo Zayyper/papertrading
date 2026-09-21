@@ -144,6 +144,18 @@ class App:
                 "leaders_files": [p.relative_to(self.root).as_posix() for p in files],
                 "defaults": {"equity": cfg.follower_equity_usd, "max_leverage": cfg.follower_max_leverage}}
 
+    def pump_view(self) -> dict[str, Any]:
+        cfg, _ = self.cfg()
+        db = self.root / cfg.data_dir / "pump" / "pump.db"
+        if not db.exists():
+            return {"exists": False, "now": time.time()}
+        from ..pumpfun import connect, get_meta
+        c = connect(db, readonly=True)
+        try:
+            return {"exists": True, "now": time.time(), "stats": get_meta(c, "stats", {}), "report": get_meta(c, "report")}
+        finally:
+            c.close()
+
     def start_service(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         leaders = (body.get("leaders") or "").strip()
         if not leaders:
@@ -485,6 +497,8 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             p = app.run_file(m.group(1), m.group(2), m.group(3))
             return self._file(p, p.name) if p else self._error(404, "file not found")
+        if path == "/api/pump":
+            return self._json(app.pump_view())
         if path == "/api/paper":
             since = int(q.get("log_since", ["0"])[0] or 0)
             return self._json(app.paper_view(since))

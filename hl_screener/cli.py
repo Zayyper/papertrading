@@ -4,12 +4,14 @@
   python -m hl_screener pool  [--config config.toml]            # just show who would be screened
   python -m hl_screener inspect 0xADDRESS [--config config.toml] # one trader, full detail
   python -m hl_screener ui    [--port 8765] [--no-browser]       # local web page for all of the above
+  python -m hl_screener pump collect|report                      # pump.fun snipers and traders on Solana
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -78,6 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--db", help="sqlite file (default <data_dir>/paper/paper.db)")
     pp.add_argument("--status", action="store_true", help="print the current state of the paper accounts and exit")
 
+    pf = sub.add_parser("pump", help="pump.fun on Solana: find snipers and consistently profitable traders, test copyability")
+    pf.add_argument("action", choices=["collect", "report"])
+    pf.add_argument("--db", help="sqlite file (default <data_dir>/pump/pump.db)")
+    pf.add_argument("--ws", help="Solana websocket RPC (default SOLANA_WS_URL, else the public mainnet endpoint)")
+    pf.add_argument("--retention-days", type=float, help="keep this many days of tokens (default PUMP_RETENTION_DAYS, else 3)")
+    pf.add_argument("--latency-slots", type=int, default=2, help="report: slots between a wallet's trade and the copier's (400 ms each)")
+    pf.add_argument("--stake", type=float, default=0.1, help="report: SOL the copier puts into each copied buy")
+
     u = sub.add_parser("ui", help="local web page: run jobs, watch progress, browse results, edit config")
     u.add_argument("--host", default="127.0.0.1")
     u.add_argument("--port", type=int, default=8765)
@@ -139,6 +149,20 @@ def main(argv: list[str] | None = None) -> int:
         for t in td.trips[-15:]:
             print(f"{datetime.fromtimestamp(t.open_time/1000, tz=timezone.utc):%Y-%m-%d %H:%M} {t.coin:>8} {'L' if t.direction>0 else 'S'} "
                   f"hold={t.hold_minutes:8.1f}min notional={t.max_notional:10,.0f} net={t.net_pnl:+9.2f} fills={t.n_fills}{' LIQ' if t.liquidated else ''}{'' if t.complete else ' (partial)'}")
+        return 0
+
+    if a.cmd == "pump":
+        from . import pumpfun
+        db = Path(a.db) if a.db else Path(cfg.data_dir) / "pump" / "pump.db"
+        if a.action == "collect":
+            return pumpfun.collect(db, a.ws or os.environ.get("SOLANA_WS_URL") or pumpfun.PUBLIC_WS,
+                                   a.retention_days or float(os.environ.get("PUMP_RETENTION_DAYS") or 3))
+        if not db.exists():
+            print(f"no data at {db}: run `python -m hl_screener pump collect` first", file=sys.stderr)
+            return 1
+        rep = pumpfun.build_report(db, latency_slots=a.latency_slots, stake_sol=a.stake)
+        pumpfun.save_report(db, rep)
+        pumpfun.print_report(rep)
         return 0
 
     if a.cmd == "paper":

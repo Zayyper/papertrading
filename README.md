@@ -111,6 +111,33 @@ Outputs land in `out/`:
 | `shortlist_trades_<date>.csv` | every simulated follower trade for the shortlist (entry/exit penalty, fees, funding) — the paper trader is compared against this |
 | `run_<date>.json` | benchmarks, drop counts, timings and the exact config used |
 
+## pump.fun on Solana: snipers and consistent traders
+
+A side screen on a different market, same honesty rules. It answers: who buys new pump.fun
+tokens in the first slots, who trades them profitably over many tokens, and would a copier keep
+any of it.
+
+```powershell
+python -m hl_screener pump collect     # stream every pump.fun trade into data/pump/pump.db, rank every 30 min
+python -m hl_screener pump report      # rank now from what was collected
+```
+
+- **Data.** The pump.fun program's own `CreateEvent` and `TradeEvent`, read from Solana's public
+  RPC with `logsSubscribe`. No key, no third party. The layout follows pump.fun's published IDL
+  and an event that does not fit it exactly is counted and dropped, never misread.
+  `SOLANA_WS_URL` swaps in another RPC.
+- **Scope.** Tokens created while the collector runs, quoted in SOL, on the bonding curve, so
+  every position is seen from its first buy. Graduated tokens are valued at their final curve
+  price; PumpSwap trading after graduation is not tracked. Kept `PUMP_RETENTION_DAYS` (3).
+- **Wallet profit** uses the exact fees from each event. A launcher's positions in its own tokens
+  never count as trading.
+- **Copier profit is replayed, not modelled.** A copier landing `--latency-slots` (2, about 0.8 s)
+  after the wallet buys at the curve state left by every earlier trade, sells the same way after
+  the wallet's first sell, pays pump.fun fees and 0.0005 SOL per transaction.
+- **Golden** = copier profitable in both halves of the window, wallet profitable in both halves,
+  two best tokens under half its winnings, and it launches no tokens.
+- The page's **Pump** tab shows the collector status, base rates, copy candidates and snipers.
+
 ## Running on a server (Coolify)
 
 The paper test should not depend on a PC staying on. `Dockerfile` + `docker-compose.yml` run

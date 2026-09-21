@@ -59,6 +59,7 @@
     $$(".tab").forEach((t) => { const on = t.dataset.view === name; t.classList.toggle("active", on); t.setAttribute("aria-selected", on); });
     if (name === "results") refreshRuns().then(redrawCharts);
     if (name === "paper") startPaperPolling(); else stopPaperPolling();
+    if (name === "pump") startPumpPolling(); else stopPumpPolling();
     if (name === "config" && !state.config) loadConfig();
     if (name === "design") renderDesign();
   }
@@ -664,6 +665,62 @@
     catch (err) { toast(err.message); }
   });
   $("#btn-paper-stop").addEventListener("click", async () => { try { await api("POST", "/api/paper/stop"); loadPaper(); } catch (err) { toast(err.message); } });
+
+  // ---------------------------------------------------------------- pump.fun
+  const pump = { timer: null };
+  function startPumpPolling() { stopPumpPolling(); loadPump(); pump.timer = setInterval(loadPump, 30000); }
+  function stopPumpPolling() { clearInterval(pump.timer); pump.timer = null; }
+  async function loadPump() {
+    let d;
+    try { d = await api("GET", "/api/pump"); } catch (e) { toast(e.message); return; }
+    renderPump(d);
+  }
+  const solscan = (a) => `<a class="addr" href="https://solscan.io/account/${esc(a)}" target="_blank" rel="noopener" title="${esc(a)}">${shortAddr(a)}</a>`;
+  const solAmt = (x) => isNum(x) ? `<span class="${signCls(x)}">${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}</span>` : "n/a";
+  const flags = (r) => (r.launched ? ` <span class="badge failed" title="launched ${r.launched} tokens">dev</span>` : "") +
+    (r.twins ? ` <span class="badge failed" title="${r.twins} other wallets bought the same tokens in the same slot on at least half of its tokens">cluster ×${r.twins + 1}</span>` : "");
+
+  function renderPump(d) {
+    const st = d.stats || {}, rep = d.report || {}, p = rep.params || {};
+    const hb = isNum(st.heartbeat) ? d.now - st.heartbeat : NaN, live = isNum(hb) && hb < 120;
+    $("#pump-tiles").innerHTML = !d.exists
+      ? `<div class="empty" style="grid-column: 1 / -1">No pump.fun data yet. Start the collector: <code>python -m hl_screener pump collect</code>, or the pump service in Coolify.</div>`
+      : tile("Collector", live ? "live" : "stalled", `heartbeat ${ago(hb)}${st.reconnects ? ` · ${fmtInt(st.reconnects)} reconnects` : ""}`) +
+        tile("Collecting for", isNum(st.since) ? elapsed(d.now - st.since) : "n/a", "since the first start") +
+        tile("Tokens seen", fmtInt(st.mints), `${fmtInt(st.non_sol || 0)} not quoted in SOL, skipped`) +
+        tile("Trades stored", fmtInt(st.trades), st.parse_errors ? `${fmtInt(st.parse_errors)} undecodable events` : "every event decoded") +
+        tile("Ranking", rep.generated ? ago(d.now - rep.generated) : "not yet", rep.generated ? `${fmtInt((rep.counts || {}).wallets_ranked)} wallets · refreshed every 30 min` : "the first one comes 30 min after start");
+    const b = rep.base || {};
+    $("#pump-base").textContent = isNum(b.profitable_share)
+      ? `Over ${fmtNum((rep.window || {}).hours, 1)} h: ${fmtPct(b.profitable_share, 0)} of the ${fmtInt(b.wallets)} wallets with ${p.min_tokens}+ tokens made money. ` +
+        (isNum(b.h1_winners_h2_profitable_share) ? `Of the ${fmtInt(b.h1_winners)} that made money in the first half, ${fmtPct(b.h1_winners_h2_profitable_share, 0)} also did in the second, against ${fmtPct(b.h2_profitable_share, 0)} of everyone: that gap is how much past profit says about future profit.` : "")
+      : "";
+    const empty = rep.empty || !rep.generated ? "No ranking yet: it is computed every 30 minutes from what has been collected." : "No wallet qualifies yet. It fills in as hours of data accumulate.";
+    sortableTable($("#pump-traders"), [
+      { key: "addr", label: "Wallet", render: (r) => solscan(r.addr) + (r.golden ? ' <span class="badge done">golden</span>' : "") + flags(r) },
+      { key: "n", label: "Tokens", num: true, render: (r) => fmtInt(r.n) },
+      { key: "win_rate", label: "Win rate", num: true, render: (r) => fmtPct(r.win_rate, 0) },
+      { key: "pnl_sol", label: "PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
+      { key: "roi", label: "ROI", num: true, title: "profit over SOL spent, its own trades", render: (r) => pct(r.roi) },
+      { key: "copy_roi", label: "Copier ROI", num: true, title: `profit per ${p.stake_sol} SOL copied buy, landing ${p.latency_slots} slots after the wallet`, render: (r) => pct(r.copy_roi) },
+      { key: "copy_roi_h1", label: "1st half", num: true, render: (r) => pct(r.copy_roi_h1) },
+      { key: "copy_roi_h2", label: "2nd half", num: true, render: (r) => pct(r.copy_roi_h2) },
+      { key: "top2_share", label: "Top-2 share", num: true, title: "share of its winnings from its two best tokens", render: (r) => fmtPct(r.top2_share, 0) },
+      { key: "avg_hold_min", label: "Avg hold", num: true, render: (r) => isNum(r.avg_hold_min) ? fmtNum(r.avg_hold_min, 1) + " min" : "n/a" },
+      { key: "snipe_share", label: "Snipes", num: true, title: "share of its tokens bought within a couple of slots of creation", render: (r) => fmtPct(r.snipe_share, 0) },
+    ], rep.traders || [], { sortKey: "copy_roi", dir: -1, empty });
+    const snipers = (rep.snipers || []).map((r) => ({ ...r, snipe_win_rate: r.snipes ? r.snipe_wins / r.snipes : null }));
+    sortableTable($("#pump-snipers"), [
+      { key: "addr", label: "Wallet", render: (r) => solscan(r.addr) + flags(r) },
+      { key: "snipes", label: "Snipes", num: true, render: (r) => fmtInt(r.snipes) },
+      { key: "block0", label: "Same slot", num: true, title: "bought in the creation slot itself: bundled with the launch or colocated, not copyable", render: (r) => fmtInt(r.block0) },
+      { key: "snipe_share", label: "Of its tokens", num: true, render: (r) => fmtPct(r.snipe_share, 0) },
+      { key: "snipe_pnl_sol", label: "Snipe PnL, SOL", num: true, render: (r) => solAmt(r.snipe_pnl_sol) },
+      { key: "snipe_win_rate", label: "Snipes won", num: true, render: (r) => fmtPct(r.snipe_win_rate, 0) },
+      { key: "n", label: "Tokens", num: true, render: (r) => fmtInt(r.n) },
+      { key: "pnl_sol", label: "All PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
+    ], snipers, { sortKey: "snipes", dir: -1, empty });
+  }
 
   // ---------------------------------------------------------------- config
   const KEY_PARAMS = [
