@@ -17,5 +17,4 @@ RUN mkdir -p /app/data /app/out
 VOLUME ["/app/data", "/app/out"]
 
 EXPOSE 8765
-# the health check lives in docker-compose.yml on the `ui` service only (the `paper` service has no port)
 CMD ["python", "-m", "hl_screener", "ui", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
