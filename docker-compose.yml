@@ -20,7 +20,7 @@ services:
     environment:
       SOLANA_WS_URL: ${SOLANA_WS_URL:-}               # blank = Solana's public endpoint (free, about 1 slot behind the chain)
       SOLANA_WS_FALLBACK: ${SOLANA_WS_FALLBACK:-}     # e.g. a Helius URL: used only after the main feed fails twice in a row, for 15 min
-      PUMP_RETENTION_DAYS: ${PUMP_RETENTION_DAYS:-3}  # about 0.5 GB per day of pump.fun and PumpSwap trades
+      PUMP_RETENTION_DAYS: ${PUMP_RETENTION_DAYS:-3}  # about 1.2 GB per day of pump.fun and PumpSwap trades; storing pauses under 1 GB free
     volumes:
       - hl-data:/app/data
 

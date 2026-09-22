@@ -201,6 +201,22 @@ def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
     col.c.close()
 
 
+def test_collector_stops_storing_while_the_disk_is_nearly_full(tmp_path):
+    col = Collector(tmp_path / "pump.db")
+    mint, dev, A = bytes([70]) * 32, bytes([71]) * 32, bytes([72]) * 32
+    col.on_logs(3000, logs(create_bytes(mint, dev)))
+    col.stats["disk_free_gb"] = 0.2
+    col.on_logs(3001, logs(trade_bytes(mint, A, True, 10**8, 10**12, 31 * 10**9, 10**15)))
+    col.flush()
+    count = lambda: col.c.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+    assert count() == 0 and col.stats["skipped_low_disk"] == 1 and col.stats["paused_low_disk"]
+    col.stats["disk_free_gb"] = 5.0                      # space is back: storing resumes
+    col.on_logs(3002, logs(trade_bytes(mint, A, False, 10**8, 10**12, 31 * 10**9, 10**15)))
+    col.flush()
+    assert count() == 1 and not col.stats["paused_low_disk"]
+    col.c.close()
+
+
 def test_twins_are_wallets_buying_the_same_tokens_in_the_same_slot(tmp_path):
     col = Collector(tmp_path / "pump.db")
     A, B, C, dev = (bytes([i]) * 32 for i in (40, 41, 42, 43))

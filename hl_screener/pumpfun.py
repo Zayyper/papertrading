@@ -45,6 +45,7 @@ SOL_QUOTE = bytes(32)          # quote_mint = default pubkey: the curve is quote
 WSOL = "So11111111111111111111111111111111111111112"        # a PumpSwap pool quoted in SOL
 FEE = 0.0125                   # 0.95 % protocol + 0.30 % creator per side, the common case (ponytail: per-token creator fees vary; read them from the events if it matters)
 LAMPORTS = 1e9
+MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -370,7 +371,7 @@ def update_follow(db_path: str | Path, rep: dict[str, Any]) -> int:
 # collector
 # ---------------------------------------------------------------------------
 def host_resources(path: Path) -> dict[str, float]:
-    """Free disk where the database lives, and free memory (Linux): this store grows about 0.5 GB a day."""
+    """Free disk where the database lives, and free memory (Linux): this store grows about 1.2 GB a day."""
     import shutil
     du = shutil.disk_usage(path)
     out = {"disk_free_gb": round(du.free / 1e9, 1), "disk_total_gb": round(du.total / 1e9, 1)}
@@ -502,8 +503,12 @@ class Collector:
 
     def flush(self) -> None:
         if self.buf:
-            self.c.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)", self.buf)
-            self.stats["trades"] += len(self.buf)
+            self.stats["paused_low_disk"] = self.stats.get("disk_free_gb", MIN_FREE_GB) < MIN_FREE_GB
+            if self.stats["paused_low_disk"]:                     # a full disk takes the whole server down: skip, keep following
+                self.stats["skipped_low_disk"] = self.stats.get("skipped_low_disk", 0) + len(self.buf)
+            else:
+                self.c.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)", self.buf)
+                self.stats["trades"] += len(self.buf)
             self.buf.clear()
         self.paper.tick()
         now = time.time()
@@ -563,9 +568,10 @@ class Collector:
                             last_flush = now
                         if now - last_line >= 60:
                             log.info("last minute: %d trades, %d new tokens (total %d / %d) | delay %s slot(s) | disk %s of %s GB free, "
-                                     "memory %s of %s GB free", self.stats["trades"] - seen[0], self.stats["mints"] - seen[1],
+                                     "memory %s of %s GB free%s", self.stats["trades"] - seen[0], self.stats["mints"] - seen[1],
                                      self.stats["trades"], self.stats["mints"], self.stats.get("lag_p50"), self.stats.get("disk_free_gb"),
-                                     self.stats.get("disk_total_gb"), self.stats.get("mem_avail_gb", "?"), self.stats.get("mem_total_gb", "?"))
+                                     self.stats.get("disk_total_gb"), self.stats.get("mem_avail_gb", "?"), self.stats.get("mem_total_gb", "?"),
+                                     f" | NOT STORING trades: under {MIN_FREE_GB:g} GB of disk free" if self.stats.get("paused_low_disk") else "")
                             seen, last_line = (self.stats["trades"], self.stats["mints"]), now
                         if now - last_forget >= 3600:
                             self.forget_old_mints()
