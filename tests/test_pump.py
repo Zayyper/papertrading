@@ -1,8 +1,10 @@
 import base64
 import struct
+import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
-                                 b58, build_report, copy_trade, paper_series, parse_amm_trade, parse_create, parse_trade, twins)
+                                 b58, build_report, copy_trade, paper_series, parse_amm_trade, parse_create, parse_trade,
+                                 twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -129,7 +131,7 @@ def test_collector_report_snipers_devs_and_copy_replay(tmp_path):
 def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
     col = Collector(tmp_path / "pump.db")
     G, X, Y, Z = (bytes([i]) * 32 for i in (80, 81, 82, 83))
-    col.c.execute("INSERT INTO follow VALUES (?, 0, 1, 0.5)", (b58(G),))
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, 0.5)", (b58(G),))
     col.paper.reload()
     mint, curve, held, states = bytes([9]) * 32, Curve(), {}, {}
 
@@ -176,7 +178,7 @@ def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     tok_old = c_old.buy(10**9)
     col.on_logs(20, logs(trade_bytes(old, G, True, 10**9, tok_old, c_old.vsol, c_old.vtok, ts=1_790_000_020)))   # before it is followed
     col.flush()
-    col.c.execute("INSERT INTO follow VALUES (?, ?, 1, 0.5)", (b58(G), 1_790_000_100))
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, ?, 1, 0.5)", (b58(G), 1_790_000_100))
     col.paper.reload()
     col.on_logs(30, logs(trade_bytes(old, G, False, c_old.sell(tok_old), tok_old, c_old.vsol, c_old.vtok, ts=1_790_000_130)))  # held from before: not its tracked trade
     tok = c_new.buy(10**9)
@@ -197,6 +199,59 @@ def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     col.c.close()
 
 
+def test_top_snipers_rotate_and_a_dropped_one_still_exits(tmp_path):
+    db = tmp_path / "pump.db"
+    col = Collector(db)
+    A, B, C, dev = (bytes([i]) * 32 for i in (100, 101, 102, 103))
+    now, curves, held = int(time.time()), {}, {}
+
+    def token(k, slot):
+        m = bytes([110 + k]) * 32
+        curves[m] = Curve()
+        col.on_logs(slot, logs(create_bytes(m, dev, ts=now)))
+        return m
+
+    def buy(m, who, slot, sol=10**8):
+        tok = curves[m].buy(sol)
+        held[(who, m)] = held.get((who, m), 0) + tok
+        col.on_logs(slot, logs(trade_bytes(m, who, True, sol, tok, curves[m].vsol, curves[m].vtok, ts=now)))
+
+    def sell(m, who, slot):
+        tok = held.pop((who, m))
+        col.on_logs(slot, logs(trade_bytes(m, who, False, curves[m].sell(tok), tok, curves[m].vsol, curves[m].vtok, ts=now)))
+
+    for k in range(4):                                   # A snipes four tokens, B two; the creator never counts
+        m = token(k, 1000 + 100 * k)
+        buy(m, A, 1000 + 100 * k + 1)
+        if k < 2:
+            buy(m, B, 1000 + 100 * k + 2)
+    col.flush()
+    assert [a for a, _ in update_snipers(db, top_n=2, window_h=24)] == [b58(A), b58(B)]
+    col.paper.reload()
+
+    m7 = token(10, 1300)                                 # B is in the set: its buy is copied
+    buy(m7, B, 1301)
+    buy(m7, dev, 1305)                                   # a later trade lands the copy
+    assert col.c.execute("SELECT COUNT(*) FROM pfills").fetchone()[0] == 1
+
+    for k in range(4, 9):                                # C takes the top, B drops out of it
+        m = token(k, 1400 + 10 * k)
+        buy(m, C, 1400 + 10 * k + 1)
+    col.flush()
+    assert [a for a, _ in update_snipers(db, top_n=2, window_h=24)] == [b58(C), b58(A)]
+    col.paper.reload()
+    assert b58(B) not in col.paper.follow and col.c.execute("SELECT COUNT(*) FROM follow").fetchone()[0] == 3
+
+    m8 = token(20, 1500)
+    buy(m8, B, 1501)                                     # dropped: no new copy
+    buy(m8, dev, 1505)
+    sell(m7, B, 1510)                                    # the copy it already opened still exits
+    buy(m7, dev, 1515)
+    assert col.c.execute("SELECT side, mint FROM pfills WHERE wallet = ? ORDER BY id", (b58(B),)).fetchall() \
+        == [("buy", b58(m7)), ("sell", b58(m7))]
+    col.c.close()
+
+
 def test_pumpswap_events_decode_to_post_trade_reserves():
     pool, user = bytes([3]) * 32, bytes([4]) * 32
     B, Q, vq = 10**15, 85 * 10**9, 7 * 10**9
@@ -211,7 +266,7 @@ def test_pumpswap_events_decode_to_post_trade_reserves():
 def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
     col = Collector(tmp_path / "pump.db")
     mint, dev, W, X, pool = bytes([50]) * 32, bytes([51]) * 32, bytes([52]) * 32, bytes([53]) * 32, bytes([54]) * 32
-    col.c.execute("INSERT INTO follow VALUES (?, 0, 1, NULL)", (b58(W),))
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, NULL)", (b58(W),))
     col.paper.reload()
     col.on_logs(400, logs(create_bytes(mint, dev)), "sig-create")
     col.on_logs(500, logs(pool_bytes(pool, mint, b58decode(WSOL)), AMM_PROGRAM), "sig-migrate")

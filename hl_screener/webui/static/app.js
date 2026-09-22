@@ -562,13 +562,16 @@
   function renderPumpPaper(d) {
     const p = d.paper || {};
     const W = p.wallets || [];
+    const sn = p.snipers || {};
     $("#pp-caption").textContent = p.at
-      ? `each wallet the ranking below flags golden, from that moment on: its first buy of a token copied with ${p.stake_sol} SOL landing ${p.latency_slots} slots behind it, sold when it first sells, live curve prices and fees, no real orders · ${fmtInt(p.pending)} waiting to land`
+      ? `every wallet the ranking below has called golden, from that moment on, plus the top ${sn.top ?? 5} snipers of the last ${sn.window_h ?? 2} h, re-ranked every ${Math.round((sn.every_s ?? 300) / 60)} min: the wallet's first buy of a token copied with ${p.stake_sol} SOL landing ${p.latency_slots} slots behind it, sold when it first sells, live curve prices and fees, no real orders · ${fmtInt(p.pending)} waiting to land`
       : "";
     const empty = !d.exists ? "The pump.fun collector is not running yet." :
-      "No golden wallet yet. A wallet needs 12+ hours of data, 10+ tokens, profit in both halves of the window for itself and its copier, no dominant token, no launches and no cluster. Each one is followed from the moment a report flags it.";
+      `No wallet followed yet. The top ${sn.top ?? 5} snipers of the moment join within ${Math.round((sn.every_s ?? 300) / 60)} minutes of the collector starting; a golden wallet needs 12+ hours of data, 10+ tokens, profit in both halves of the window for itself and its copier, no dominant token, no launches and no cluster.`;
     sortableTable($("#pp-wallets"), [
-      { key: "wallet", label: "Wallet", render: (r) => solscan(r.wallet) + (r.golden_now ? ' <span class="badge done">golden now</span>' : ' <span class="badge">no longer golden</span>') },
+      { key: "wallet", label: "Wallet", render: (r) => solscan(r.wallet) +
+        (r.golden_now ? ' <span class="badge done">golden now</span>' : r.golden_ever ? ' <span class="badge">no longer golden, still followed</span>' : "") +
+        (r.sniper_now ? ` <span class="badge done">top sniper #${r.sniper_rank}</span>` : r.golden_ever ? "" : ' <span class="badge">out of the top snipers</span>') },
       { key: "added_at", label: "Followed since", render: (r) => `<span class="muted">${fmtTime((r.added_at || 0) * 1000)}</span>` },
       { key: "copied", label: "Copied", num: true, render: (r) => fmtInt(r.copied) },
       { key: "open", label: "Open", num: true, render: (r) => fmtInt(r.open) },
@@ -593,10 +596,16 @@
       { key: "pnl", label: "PnL, SOL", num: true, render: (f) => f.side === "sell" ? solAmt(f.pnl) : '<span class="tertiary">–</span>' },
     ], p.recent || [], { sortKey: "ts", dir: -1, empty: "No copy yet. They appear when a followed wallet trades." });
     const ser = d.series || {};
-    drawCompare($("#pump-compare"), "pump", W.map((w) => {
-      const rows = ser[w.wallet] || [];
-      return { id: w.wallet, label: shortAddr(w.wallet), title: w.wallet, copy: rows.map((r) => [r[0] * 1000, r[1]]), own: rows.map((r) => [r[0] * 1000, r[2]]) };
-    }), { label: "Return of each copy and of each golden wallet itself since it was followed", empty });
+    const pts = (rows, i) => rows.map((r) => [r[0] * 1000, r[i]]);
+    const accounts = W.filter((w) => w.copied || w.golden_ever || w.sniper_now).map((w) => {
+      const rows = ser[w.wallet] || [], tag = w.golden_ever ? "golden" : w.sniper_now ? `sniper #${w.sniper_rank}` : "past sniper";
+      return { id: w.wallet, label: `${shortAddr(w.wallet)} · ${tag}`, title: w.wallet, copy: pts(rows, 1), own: pts(rows, 2) };
+    });
+    if ((ser.__snipers__ || []).length > 1) {   // the set rotates, so the pooled line is the one that answers the question
+      accounts.unshift({ id: "__snipers__", label: "all top snipers", copy: pts(ser.__snipers__, 1), own: pts(ser.__snipers__, 2),
+                         title: "every wallet followed for being a top sniper, those that have dropped out included" });
+    }
+    drawCompare($("#pump-compare"), "pump", accounts, { label: "Return of each copy and of each followed wallet itself since it was followed", empty });
   }
 
   function renderPaper(d) {

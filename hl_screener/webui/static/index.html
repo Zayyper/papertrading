@@ -160,8 +160,8 @@
     </div>
     <div class="tiles" id="pump-tiles"></div>
     <p class="caption" id="pump-base" style="margin-top: 8px"></p>
-    <h3 class="section-title">Golden wallets, followed live <span class="caption" id="pp-caption"></span></h3>
-    <p class="caption" style="margin: -4px 0 8px">Return since each wallet was followed. The copy, solid: profit per SOL put into copies. The wallet itself, dashed: profit per SOL it spent on the tokens it bought since then, tokens it still holds at the live price. One colour per wallet, up to 8 at once, a point every 5 minutes.</p>
+    <h3 class="section-title">Followed live <span class="caption" id="pp-caption"></span></h3>
+    <p class="caption" style="margin: -4px 0 8px">Return since each wallet was followed. The copy, solid: profit per SOL put into copies. The wallet itself, dashed: profit per SOL it spent on the tokens it bought since then, tokens it still holds at the live price. One colour per wallet, up to 8 at once, a point every 5 minutes. A golden wallet is followed for good; a top sniper only while it stays in the top, and a copy already open still exits on its sell.</p>
     <div class="panel tight compare" id="pump-compare"></div>
     <div class="panel tight" style="margin-top: var(--space-md)"><div class="table-wrap" id="pp-wallets"></div></div>
     <h3 class="section-title">Copies <span class="caption">latest 50; slippage is the copy's price against the wallet's own, positive = worse</span></h3>
@@ -171,9 +171,11 @@
     <h3 class="section-title">Snipers <span class="caption">first buy within a couple of slots of the token's creation</span></h3>
     <div class="panel tight"><div class="table-wrap" id="pump-snipers" style="max-height: 560px"></div></div>
     <details class="panel report"><summary>How to read this</summary><div class="md"><ul>
-      <li><b>Golden</b> means the copier made money in both halves of the window, the wallet itself was profitable in both halves, no two tokens make more than half of its winnings, it launches no tokens of its own, it is not part of a cluster, and the window spans at least 12 hours. Golden wallets are paper-followed live from that moment on: see Golden wallets, followed live, at the top.</li>
+      <li><b>Golden</b> means the copier made money in both halves of the window, the wallet itself was profitable in both halves, no two tokens make more than half of its winnings, it launches no tokens of its own, it is not part of a cluster, and the window spans at least 12 hours. Golden wallets are paper-followed live from that moment on: see Followed live, at the top.</li>
       <li><b>Cluster ×N</b>: N wallets bought the same tokens in the same slot on at least half of this wallet's tokens. That is one operator behind several wallets, or a coordinated group trading its own launches. Their edge is knowing the launch; it ends the moment they sell to their followers.</li>
       <li><b>Same slot</b> snipes land in the block that created the token: bundled with the launch or colocated with the validator. Nobody can copy those.</li>
+      <li>The <b>top snipers</b> of the moment are paper-copied too, re-ranked every few minutes because that list turns over fast. They are ranked on tokens bought within two slots of creation over the last hours, so it is the busiest snipers, not the most profitable ones; the chart above is what tells you whether following them pays. Same-slot snipes are copied two slots late, because that is the earliest anyone could.</li>
+      <li>The <b>top snipers</b> of the moment are paper-copied as well, re-ranked every few minutes because that list turns over fast. It is ranked on tokens bought within two slots of creation over the last hours, so it is the busiest snipers, not the most profitable ones: the copy above is what tells you whether following them pays, and same-slot snipes are copied two slots late because that is the earliest anyone could.</li>
       <li><b>Dev</b> marks wallets that also launch tokens. A sniper that launches tokens is most likely buying its own or its friends' launches.</li>
       <li>A token that graduates keeps being tracked on its PumpSwap pool, priced the same way, so positions and copies run straight through graduation.</li>
       <li><b>Feed delay</b> is measured against the chain's own slot clock. The copier lands one slot after it (at least two slots after the wallet): that is the best a copier on this feed could do, since a transaction lands in the next slot at the earliest. The live copies at the top measure what actually happens.</li>

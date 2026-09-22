@@ -46,6 +46,10 @@ WSOL = "So11111111111111111111111111111111111111112"        # a PumpSwap pool qu
 FEE = 0.0125                   # 0.95 % protocol + 0.30 % creator per side, the common case (ponytail: per-token creator fees vary; read them from the events if it matters)
 LAMPORTS = 1e9
 MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
+SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
+SNIPER_EVERY_S = 300           # how often that ranking is redone; it turns over fast
+SNIPER_WINDOW_H = 2.0          # the snipes it is ranked on
+POOLED_SNIPERS = "__snipers__"  # the chart's line for every sniper together, past ones included
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -189,7 +193,8 @@ CREATE INDEX IF NOT EXISTS ix_trades_mint ON trades(mint, slot);
 CREATE INDEX IF NOT EXISTS ix_trades_wallet ON trades(wallet, mint, slot);
 CREATE INDEX IF NOT EXISTS ix_mints_ts ON mints(ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS follow (wallet TEXT PRIMARY KEY, added_at INTEGER, golden_now INTEGER, report_copy_roi REAL);
+CREATE TABLE IF NOT EXISTS follow (wallet TEXT PRIMARY KEY, added_at INTEGER, golden_now INTEGER, report_copy_roi REAL,
+                                   golden_ever INTEGER DEFAULT 1, sniper_now INTEGER DEFAULT 0, sniper_rank INTEGER);
 CREATE TABLE IF NOT EXISTS pfills (id INTEGER PRIMARY KEY, wallet TEXT, mint TEXT, side TEXT, trigger_slot INTEGER,
                                    land_slot INTEGER, ts INTEGER, sol REAL, tok REAL, leader_px REAL, px REAL,
                                    slip_bps REAL, pnl REAL, timed_out INTEGER);
@@ -209,10 +214,14 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     c.executescript(SCHEMA)
-    try:
-        c.execute("ALTER TABLE mints ADD COLUMN pool TEXT")   # databases from before PumpSwap tracking
-    except sqlite3.OperationalError:
-        pass                                                   # already there
+    for ddl in ("ALTER TABLE mints ADD COLUMN pool TEXT",                    # before PumpSwap tracking
+                "ALTER TABLE follow ADD COLUMN golden_ever INTEGER DEFAULT 1",   # before the top snipers were followed too:
+                "ALTER TABLE follow ADD COLUMN sniper_now INTEGER DEFAULT 0",    # everyone already there was followed for being golden
+                "ALTER TABLE follow ADD COLUMN sniper_rank INTEGER"):
+        try:
+            c.execute(ddl)
+        except sqlite3.OperationalError:
+            pass                                               # already there
     return c
 
 
@@ -239,6 +248,7 @@ class PaperFollow:
     def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = 0.0005):
         self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
         self.follow: set[str] = set()
+        self.sniper_cfg = {"top": SNIPER_TOP, "every_s": SNIPER_EVERY_S, "window_h": SNIPER_WINDOW_H}   # shown on the page
         # the followed wallets' own positions, in SOL and tokens: what the copy is compared with
         self.own = {(w, m): [cost, proceeds, tok] for w, m, cost, proceeds, tok in c.execute("SELECT wallet, mint, cost, proceeds, tok FROM opos")}
         self.reload()
@@ -254,12 +264,14 @@ class PaperFollow:
                 self.curve[m] = (row[0], row[1], time.time())
 
     def reload(self) -> None:
-        follow = dict(self.c.execute("SELECT wallet, added_at FROM follow"))
-        for w in follow.keys() - self.follow:                  # newly followed, or a restart: its stored trades since then, once
+        """Who is copied right now: every wallet a report ever called golden, plus the snipers currently in the top set."""
+        follow = dict(self.c.execute("SELECT wallet, added_at FROM follow WHERE golden_ever = 1 OR sniper_now = 1"))
+        for w in follow.keys() - self.follow:                  # newly followed: the minutes between the ranking and this reload
             if not any(k[0] == w for k in self.own):
+                since = max(follow[w] or 0, time.time() - 600)
                 for m, buy, sol, tok, fee in self.c.execute(
                         """SELECT mm.addr, t.buy, t.sol, t.tok, t.fee FROM trades t JOIN wallets w ON w.id = t.wallet
-                           JOIN mints mm ON mm.id = t.mint WHERE w.addr = ? AND t.ts >= ? ORDER BY t.slot, t.rowid""", (w, follow[w] or 0)).fetchall():
+                           JOIN mints mm ON mm.id = t.mint WHERE w.addr = ? AND t.ts >= ? ORDER BY t.slot, t.rowid""", (w, since)).fetchall():
                     self._own((w, m), buy, sol, tok, fee)
         self.follow = set(follow)
 
@@ -292,11 +304,15 @@ class PaperFollow:
         if acts:                                                # copies due: land at the state before this trade
             self._run_due(mint, acts, [slot >= a["land"] for a in acts])
         self.curve[mint] = (e["vsol"], e["vtok"], time.time())
-        if user not in self.follow or not e["tok"]:
-            return
-        self._own((user, mint), e["buy"], e["sol"], e["tok"], e["fee"])
         key, side = (user, mint), ("buy" if e["buy"] else "sell")
         mine = [a for a in self.pending.get(mint, ()) if a["wallet"] == user]
+        following = user in self.follow
+        if not e["tok"] or not (following or key in self.pos or mine):
+            return
+        if following:
+            self._own(key, e["buy"], e["sol"], e["tok"], e["fee"])
+        elif e["buy"]:
+            return                                              # out of the top snipers: no new copies, open ones still exit
         if any(a["side"] == side for a in mine):
             return
         if side == "buy" and key in self.copied:
@@ -359,10 +375,12 @@ class PaperFollow:
         self.curve = {m: v for m, v in self.curve.items() if v[2] >= cutoff or m in keep}
 
     def summary(self) -> dict[str, Any]:
-        rows = {w: {"wallet": w, "added_at": added, "golden_now": bool(g), "report_copy_roi": roi, "copied": 0, "closed": 0,
+        rows = {w: {"wallet": w, "added_at": added, "golden_now": bool(g), "golden_ever": bool(ge), "sniper_now": bool(sn),
+                    "sniper_rank": rank, "report_copy_roi": roi, "copied": 0, "closed": 0,
                     "open": 0, "realized": 0.0, "unrealized": 0.0, "wins": 0, "delay_slots": None, "slip_bps": None,
                     "own_cost": 0.0, "own_pnl": 0.0}
-                for w, added, g, roi in self.c.execute("SELECT wallet, added_at, golden_now, report_copy_roi FROM follow")}
+                for w, added, g, ge, sn, rank, roi in self.c.execute(
+                    "SELECT wallet, added_at, golden_now, golden_ever, sniper_now, sniper_rank, report_copy_roi FROM follow")}
         for (w, m), (cost, proceeds, tok) in self.own.items():   # the wallet itself, held tokens at the live curve (0 if never priced)
             if w in rows:
                 rows[w]["own_cost"] += cost
@@ -388,7 +406,7 @@ class PaperFollow:
         cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
         recent = [dict(zip(cols, r)) for r in self.c.execute(f"SELECT {', '.join(cols)} FROM pfills ORDER BY id DESC LIMIT 50")]
         return {"at": int(time.time()), "stake_sol": self.stake, "latency_slots": self.L, "tx_cost_sol": self.tx,
-                "pending": sum(len(v) for v in self.pending.values()),
+                "snipers": self.sniper_cfg, "pending": sum(len(v) for v in self.pending.values()),
                 "wallets": sorted(rows.values(), key=lambda r: r["added_at"] or 0), "open": open_, "recent": recent}
 
 
@@ -399,11 +417,41 @@ def update_follow(db_path: str | Path, rep: dict[str, Any]) -> int:
     try:
         c.execute("UPDATE follow SET golden_now = 0")
         for addr, r in golden.items():
-            c.execute("""INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, ?, 1, ?)
-                         ON CONFLICT(wallet) DO UPDATE SET golden_now = 1, report_copy_roi = excluded.report_copy_roi""",
+            c.execute("""INSERT INTO follow(wallet, added_at, golden_now, golden_ever, report_copy_roi) VALUES (?, ?, 1, 1, ?)
+                         ON CONFLICT(wallet) DO UPDATE SET golden_now = 1, golden_ever = 1, report_copy_roi = excluded.report_copy_roi""",
                       (addr, int(time.time()), r.get("copy_roi")))
         c.commit()
         return len(golden)
+    finally:
+        c.close()
+
+
+SNIPERS_SQL = """
+WITH recent AS MATERIALIZED (SELECT id, slot, creator FROM mints WHERE ts >= :since)
+SELECT w.addr, COUNT(DISTINCT t.mint) AS snipes
+FROM recent m
+JOIN trades t INDEXED BY ix_trades_mint ON t.mint = m.id AND t.slot <= m.slot + :snipe AND t.buy = 1 AND t.wallet != m.creator
+JOIN wallets w ON w.id = t.wallet
+GROUP BY t.wallet ORDER BY snipes DESC LIMIT :top
+"""     # MATERIALIZED: read the window's tokens first, then only the first slots of each, never the whole trades table
+
+
+def update_snipers(db_path: str | Path, top_n: int = SNIPER_TOP, window_h: float = SNIPER_WINDOW_H,
+                   snipe_slots: int = 2) -> list[tuple[str, int]]:
+    """Follow the snipers of the moment: the `top_n` wallets that bought the most tokens within `snipe_slots` of
+    their creation over the last `window_h`, launchers excluded. That ranking turns over fast, so it is redone
+    every few minutes and a wallet is copied only while it is in the set; copies already open still exit on its
+    sells. Unlike a golden wallet, which is followed for good, a sniper leaves the moment it drops out."""
+    c = connect(db_path)
+    try:
+        rows = c.execute(SNIPERS_SQL, {"snipe": snipe_slots, "since": time.time() - window_h * 3600, "top": top_n}).fetchall()
+        c.execute("UPDATE follow SET sniper_now = 0, sniper_rank = NULL WHERE sniper_now = 1")
+        for i, (addr, _) in enumerate(rows, start=1):
+            c.execute("""INSERT INTO follow(wallet, added_at, golden_now, golden_ever, sniper_now, sniper_rank) VALUES (?, ?, 0, 0, 1, ?)
+                         ON CONFLICT(wallet) DO UPDATE SET sniper_now = 1, sniper_rank = excluded.sniper_rank""",
+                      (addr, int(time.time()), i))
+        c.commit()
+        return rows
     finally:
         c.close()
 
@@ -415,6 +463,12 @@ def paper_series(c: sqlite3.Connection) -> dict[str, list[list[float]]]:
     for ts, w, cp, cc, op, oc in c.execute("SELECT ts, wallet, copy_pnl, copy_cost, own_pnl, own_cost FROM psnap ORDER BY wallet, ts"):
         if w in out:
             out[w].append([ts, cp / cc if cc else 0.0, op / oc if oc else 0.0])
+    # the top snipers pooled: the set rotates, so wallet by wallet the lines are short and the sum is the answer
+    pooled = [[ts, cp / cc if cc else 0.0, op / oc if oc else 0.0] for ts, cp, cc, op, oc in c.execute(
+        """SELECT ts, SUM(copy_pnl), SUM(copy_cost), SUM(own_pnl), SUM(own_cost) FROM psnap
+           WHERE wallet IN (SELECT wallet FROM follow WHERE golden_ever = 0) GROUP BY ts ORDER BY ts""")]
+    if pooled:
+        out[POOLED_SNIPERS] = pooled
     return out
 
 
@@ -569,7 +623,8 @@ class Collector:
             set_meta(self.c, "paper", summ)
             if now - self.last_snap >= 300:                       # the chart: copy and wallet, every 5 min
                 self.c.executemany("INSERT INTO psnap VALUES (?,?,?,?,?,?)", [
-                    (int(now), r["wallet"], r["total"], r["copied"] * self.paper.stake, r["own_pnl"], r["own_cost"]) for r in summ["wallets"]])
+                    (int(now), r["wallet"], r["total"], r["copied"] * self.paper.stake, r["own_pnl"], r["own_cost"])
+                    for r in summ["wallets"] if r["copied"] or r["golden_ever"] or r["sniper_now"]])   # a sniper that never traded needs no line
                 self.last_snap = now
             if self.lags:
                 s = sorted(self.lags)
@@ -669,24 +724,33 @@ def prune(db_path: str | Path, retention_s: float) -> int:
 
 
 def collect(db_path: str | Path, ws_url: str, retention_days: float, report_every_s: float = 1800,
-            fallback_url: str | None = None) -> int:
+            fallback_url: str | None = None, sniper_every_s: float = SNIPER_EVERY_S, sniper_top: int = SNIPER_TOP) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
     col = Collector(db_path, ws_url, retention_days, fallback_url)
+    col.paper.sniper_cfg = {"top": sniper_top, "every_s": sniper_every_s, "window_h": SNIPER_WINDOW_H}
     print(f"pump collector: {col.stats['ws']}{' (fallback feed set)' if fallback_url else ''}, keeping {retention_days:g} days, "
-          f"db {db_path}, ranking wallets every {report_every_s / 60:.0f} min. Ctrl+C to stop.", flush=True)
+          f"db {db_path}, ranking wallets every {report_every_s / 60:.0f} min, top {sniper_top} snipers every "
+          f"{sniper_every_s / 60:.0f} min. Ctrl+C to stop.", flush=True)
     halt = threading.Event()
 
     def maintenance() -> None:                                 # own thread and connection: never stalls the feed
-        while not halt.wait(report_every_s):
+        last_report, last_top = time.time(), []
+        while not halt.wait(sniper_every_s):
             try:
-                n = prune(db_path, col.retention_s)
-                rep = build_report(db_path)
-                save_report(db_path, rep)
-                g = update_follow(db_path, rep)
-                log.info("report: %s wallets ranked, %d golden (followed from now on), %s tokens pruned",
-                         rep.get("counts", {}).get("wallets_ranked"), g, n)
+                top = update_snipers(db_path, sniper_top)       # cheap: only the first slots of the window's tokens
+                if [a for a, _ in top] != last_top:
+                    log.info("top %d snipers: %s", len(top), ", ".join(f"{a[:4]}…{a[-4:]} ({n})" for a, n in top))
+                    last_top = [a for a, _ in top]
+                if time.time() - last_report >= report_every_s:
+                    n = prune(db_path, col.retention_s)
+                    rep = build_report(db_path)
+                    save_report(db_path, rep)
+                    g = update_follow(db_path, rep)
+                    last_report = time.time()
+                    log.info("report: %s wallets ranked, %d golden (followed from now on), %s tokens pruned",
+                             rep.get("counts", {}).get("wallets_ranked"), g, n)
             except Exception:  # noqa: BLE001
-                log.exception("report failed")
+                log.exception("maintenance failed")
 
     threading.Thread(target=maintenance, daemon=True).start()
     try:

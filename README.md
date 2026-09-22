@@ -155,6 +155,13 @@ python -m hl_screener pump report      # rank now from what was collected
   Pump tab charts each copy against the wallet itself (a point every 5 minutes, each line shown or
   hidden on its own) and lists the copies next to the copier return the report measured before
   following it. That comparison is the out-of-sample test.
+- **The top `SNIPER_TOP` (5) snipers are followed as well**, re-ranked every 5 minutes because that list
+  turns over fast: the wallets that bought the most tokens within two slots of creation over the last
+  2 hours, launchers excluded. A sniper is copied only while it is in that set (a copy already open
+  still exits on its sell), so the chart also carries one pooled line for all of them together — wallet
+  by wallet the lines are too short to read. They are ranked on activity, not on profit: whether
+  copying them pays is exactly what that line answers, and same-slot snipes are copied two slots late
+  because that is the earliest anyone could.
 - The page's **Pump** tab shows the collector status, base rates, the followed golden wallets, copy
   candidates and snipers. The **Paper** tab charts each Hyperliquid copy account against the
   leader's own account the same way.
