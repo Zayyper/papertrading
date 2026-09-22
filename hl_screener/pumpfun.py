@@ -49,7 +49,6 @@ MIN_FREE_GB = 1.0              # below this much free disk, trades are not store
 SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
 SNIPER_EVERY_S = 300           # how often that ranking is redone; it turns over fast
 SNIPER_WINDOW_H = 2.0          # the snipes it is ranked on
-POOLED_SNIPERS = "__snipers__"  # the chart's line for every sniper together, past ones included
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -463,12 +462,6 @@ def paper_series(c: sqlite3.Connection) -> dict[str, list[list[float]]]:
     for ts, w, cp, cc, op, oc in c.execute("SELECT ts, wallet, copy_pnl, copy_cost, own_pnl, own_cost FROM psnap ORDER BY wallet, ts"):
         if w in out:
             out[w].append([ts, cp / cc if cc else 0.0, op / oc if oc else 0.0])
-    # the top snipers pooled: the set rotates, so wallet by wallet the lines are short and the sum is the answer
-    pooled = [[ts, cp / cc if cc else 0.0, op / oc if oc else 0.0] for ts, cp, cc, op, oc in c.execute(
-        """SELECT ts, SUM(copy_pnl), SUM(copy_cost), SUM(own_pnl), SUM(own_cost) FROM psnap
-           WHERE wallet IN (SELECT wallet FROM follow WHERE golden_ever = 0) GROUP BY ts ORDER BY ts""")]
-    if pooled:
-        out[POOLED_SNIPERS] = pooled
     return out
 
 

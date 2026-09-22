@@ -597,15 +597,10 @@
     ], p.recent || [], { sortKey: "ts", dir: -1, empty: "No copy yet. They appear when a followed wallet trades." });
     const ser = d.series || {};
     const pts = (rows, i) => rows.map((r) => [r[0] * 1000, r[i]]);
-    const accounts = W.filter((w) => w.copied || w.golden_ever || w.sniper_now).map((w) => {
+    drawCompare($("#pump-compare"), "pump", W.filter((w) => w.copied || w.golden_ever || w.sniper_now).map((w) => {
       const rows = ser[w.wallet] || [], tag = w.golden_ever ? "golden" : w.sniper_now ? `sniper #${w.sniper_rank}` : "past sniper";
       return { id: w.wallet, label: `${shortAddr(w.wallet)} · ${tag}`, title: w.wallet, copy: pts(rows, 1), own: pts(rows, 2) };
-    });
-    if ((ser.__snipers__ || []).length > 1) {   // the set rotates, so the pooled line is the one that answers the question
-      accounts.unshift({ id: "__snipers__", label: "all top snipers", copy: pts(ser.__snipers__, 1), own: pts(ser.__snipers__, 2),
-                         title: "every wallet followed for being a top sniper, those that have dropped out included" });
-    }
-    drawCompare($("#pump-compare"), "pump", accounts, { label: "Return of each copy and of each followed wallet itself since it was followed", empty });
+    }), { label: "Return of each copy and of each followed wallet itself since it was followed", empty });
   }
 
   function renderPaper(d) {
