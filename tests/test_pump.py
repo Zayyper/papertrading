@@ -4,8 +4,8 @@ import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
-                                 maker_table, operator_groups, paper_series, parse_amm_trade, parse_create, parse_trade,
-                                 settle_launches, strategy_sim, twins, update_snipers)
+                                 cohorts_of, maker_table, operator_groups, paper_series, parse_amm_trade, parse_create,
+                                 parse_trade, settle_launches, strategy_sim, twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -278,6 +278,21 @@ def test_each_exit_rule_leaves_at_its_own_price(tmp_path):
     assert res["tp50"] > res["tp20"] > res["copy"]       # leaving before the dev did is what pays here
     assert res["copy"] < res["breakeven"] < res["tp50"]  # the stake came back early, the rest rode down with the dev
     col.c.close()
+
+
+def test_a_launch_is_only_in_the_crew_cohort_once_the_crew_was_already_known():
+    crew, bot = ["11", "22", "33"], "99"
+    rows = [{"creator": "A", "buyers": ",".join(crew), "ts": t} for t in range(5)]        # the crew builds its record
+    rows += [{"creator": "B", "buyers": ",".join(crew), "ts": 10},                        # it moves to a fresh wallet
+             {"creator": "B", "buyers": ",".join(crew), "ts": 11},                        # this is the coin to trade
+             {"creator": "C", "buyers": f"{bot},77", "ts": 12}]                           # a bot and a stranger: nothing
+    co = cohorts_of(rows)
+    assert [r["ts"] for r in co["first_coin"]] == [10]        # B's first coin only confirms the crew moved
+    assert [r["ts"] for r in co["crew_2nd"]] == [4, 11]       # from the second coin of a known wallet on
+    assert [r["ts"] for r in co["crew"]] == [4, 10, 11] and len(co["all"]) == 8
+    assert not cohorts_of(rows, seen_min=9)["crew"]           # a crew that green does not count yet
+    busy = [{"creator": f"X{i}", "buyers": "99,88", "ts": i} for i in range(40)]
+    assert not cohorts_of(busy)["crew"]                       # one snipe per maker, forever: never a crew
 
 
 def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():

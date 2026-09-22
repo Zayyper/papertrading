@@ -216,7 +216,8 @@ CREATE TABLE IF NOT EXISTS launches (
   entry_vsol INTEGER, entry_vtok INTEGER, maker_vsol INTEGER, maker_vtok INTEGER, end_vsol INTEGER, end_vtok INTEGER,
   be_vsol INTEGER, be_vtok INTEGER, t20_vsol INTEGER, t20_vtok INTEGER, t50_vsol INTEGER, t50_vtok INTEGER,
   t100_vsol INTEGER, t100_vtok INTEGER, fee_in REAL, fee_out REAL, stake REAL, latency INTEGER,
-  buyers TEXT, dev_buy REAL);   -- who sniped it (our own wallet ids) and what the maker put into its own bag
+  buyers TEXT, dev_buy REAL,    -- who sniped it (our own wallet ids) and what the maker put into its own bag
+  s30_vsol INTEGER, s30_vtok INTEGER, s60_vsol INTEGER, s60_vtok INTEGER);   -- the price 30 s and 60 s in
 CREATE INDEX IF NOT EXISTS ix_launches_creator ON launches(creator, ts);
 CREATE INDEX IF NOT EXISTS ix_launches_ts ON launches(ts);
 """
@@ -233,6 +234,7 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     c.executescript(SCHEMA)
     for ddl in ("ALTER TABLE launches ADD COLUMN buyers TEXT",               # before maker wallets were linked
                 "ALTER TABLE launches ADD COLUMN dev_buy REAL",
+                *(f"ALTER TABLE launches ADD COLUMN s{s}_{v} INTEGER" for s in (30, 60) for v in ("vsol", "vtok")),
                 "ALTER TABLE mints ADD COLUMN pool TEXT",                    # before PumpSwap tracking
                 "ALTER TABLE follow ADD COLUMN golden_ever INTEGER DEFAULT 1",   # before the top snipers were followed too:
                 "ALTER TABLE follow ADD COLUMN sniper_now INTEGER DEFAULT 0",    # everyone already there was followed for being golden
@@ -905,6 +907,9 @@ def strategy_states(c: sqlite3.Connection, mint: int, cslot: int, cts: int, crea
         out[f"t{round(tp * 100)}"] = land(i) if i is not None else None
     be = next((i for i, v in enumerate(worth) if v >= stake_sol), None)
     out["be"] = land(be) if be is not None and (maker is None or maker > be) else None
+    for secs in (30, 60):                                    # out on the clock, before the maker usually dumps
+        i = next((i for i in range(len(path) - 1, -1, -1) if path[i][5] <= cts + secs), None)
+        out[f"s{secs}"] = land(i) if i is not None else None
     return out
 
 
@@ -920,6 +925,8 @@ def launch_pnl(st: dict[str, Any], stake_sol: float = 0.1, tx_cost_sol: float = 
     out = {"copy": net(st["maker"]), "hold": net(st["end"])}
     for name in ("t20", "t50", "t100"):
         out["tp" + name[1:]] = net(st[name] or st["maker"])   # never got there: it leaves with the maker
+    for secs in (30, 60):                                     # the clock exits: out before the maker's usual dump
+        out[f"sell{secs}s"] = net(st.get(f"s{secs}") or st["entry"])
     if not st["be"]:
         out["breakeven"] = out["copy"]                        # the maker left first, or it was never worth the stake
     else:
@@ -940,7 +947,7 @@ def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, lat
 LAUNCH_COLS = ("mint", "creator", "slot", "ts", "symbol", "graduated", "dev_sold_s", "peak", "n_trades", "n_buyers",
                "entry_vsol", "entry_vtok", "maker_vsol", "maker_vtok", "end_vsol", "end_vtok", "be_vsol", "be_vtok",
                "t20_vsol", "t20_vtok", "t50_vsol", "t50_vtok", "t100_vsol", "t100_vtok", "fee_in", "fee_out", "stake",
-               "latency", "buyers", "dev_buy")
+               "latency", "buyers", "dev_buy", "s30_vsol", "s30_vtok", "s60_vsol", "s60_vtok")
 
 
 def _snipers_of(c: sqlite3.Connection, mint: int, cslot: int, creator: int, slots: int = 2, keep: int = 12) -> tuple[str, float]:
@@ -959,9 +966,10 @@ def _snipers_of(c: sqlite3.Connection, mint: int, cslot: int, creator: int, slot
 
 def row_states(r: dict[str, Any]) -> dict[str, Any]:
     """A stored launch back into the states `launch_pnl` prices."""
-    at = lambda k: (r[k + "_vsol"], r[k + "_vtok"]) if r[k + "_vsol"] is not None else None   # noqa: E731
+    at = lambda k: (r[k + "_vsol"], r[k + "_vtok"]) if r.get(k + "_vsol") is not None else None   # noqa: E731
     return {"entry": at("entry"), "maker": at("maker"), "end": at("end"), "be": at("be"), "t20": at("t20"),
-            "t50": at("t50"), "t100": at("t100"), "fee_in": r["fee_in"], "fee_out": r["fee_out"]}
+            "t50": at("t50"), "t100": at("t100"), "s30": at("s30"), "s60": at("s60"),
+            "fee_in": r["fee_in"], "fee_out": r["fee_out"]}
 
 
 def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake_sol: float = 0.1, hold_s: float = 900,
@@ -986,7 +994,10 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
             for k in ("entry", "maker", "end", "be", "t20", "t50", "t100"):
                 flat += list(st[k]) if st and st[k] else [None, None]
             flat += [st["fee_in"], st["fee_out"], stake_sol, latency_slots] if st else [None, None, stake_sol, latency_slots]
-            rows.append(tuple(flat + list(_snipers_of(c, mid, slot, creator))))
+            flat += list(_snipers_of(c, mid, slot, creator))
+            for k in ("s30", "s60"):
+                flat += list(st[k]) if st and st[k] else [None, None]
+            rows.append(tuple(flat))
         if rows:
             c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         # launches settled before the snipers were recorded, while their trades are still here
@@ -1109,43 +1120,80 @@ def maker_table(c: sqlite3.Connection, stake_sol: float = 0.1, tx_cost_sol: floa
     return makers[:top], ops[:top]
 
 
+def _rules_on(rows: list[dict[str, Any]], stake_sol: float, tx_cost_sol: float, mid: float) -> list[dict[str, Any]]:
+    """Each exit rule over one set of launches."""
+    acc: dict[str, dict[str, float]] = {}
+    for r in rows:
+        half = "h1" if r["ts"] < mid else "h2"
+        for name, pnl in launch_pnl(row_states(r), stake_sol, tx_cost_sol).items():
+            a = acc.setdefault(name, {"n": 0, "pnl": 0.0, "wins": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0})
+            a["n"] += 1
+            a["pnl"] += pnl
+            a["wins"] += pnl > 0
+            a["n_" + half] += 1
+            a["pnl_" + half] += pnl
+    out = []
+    for name, a in acc.items():
+        roi = {k: (a["pnl" + k] / (a["n" + k] * stake_sol) if a["n" + k] else None) for k in ("", "_h1", "_h2")}
+        out.append({"rule": name, "n": a["n"], "pnl_sol": a["pnl"], "roi": roi[""], "roi_h1": roi["_h1"],
+                    "roi_h2": roi["_h2"], "win_rate": a["wins"] / a["n"] if a["n"] else None})
+    return sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)
+
+
+def cohorts_of(rows: list[dict[str, Any]], seen_min: int = 4, max_makers: int = 3, min_hits: int = 2) -> dict[str, list]:
+    """Label every launch with what was known just before it happened, walking forward in time so nothing leaks
+    back from the future: was it sniped by a crew we already recognised, and had that wallet launched before?
+
+    crew        a crew we had already seen on other launches sniped this one
+    crew_2nd    and the wallet had launched before, so the crew's move to it was already confirmed
+    first_coin  the crew is there but this is the wallet's first coin: the one that confirms the move
+
+    A crew wallet comes back: it has sniped `seen_min`+ launches across at most `max_makers` maker wallets. A bot
+    doing its rounds snipes each maker once, so its launches and its makers are the same number and it never counts,
+    however long it runs."""
+    seen: collections.Counter = collections.Counter()
+    makers: dict[str, set[str]] = {}
+    launched: collections.Counter = collections.Counter()
+    out: dict[str, list] = {"all": [], "crew": [], "crew_2nd": [], "first_coin": []}
+    for r in sorted(rows, key=lambda r: r["ts"]):
+        buyers = (r["buyers"] or "").split(",") if r["buyers"] else []
+        hits = sum(1 for b in buyers if seen[b] >= seen_min and len(makers.get(b, ())) <= max_makers)
+        out["all"].append(r)
+        if hits >= min_hits:
+            out["crew"].append(r)
+            out["crew_2nd" if launched[r["creator"]] else "first_coin"].append(r)
+        for b in set(buyers):
+            seen[b] += 1
+            makers.setdefault(b, set()).add(r["creator"])
+        launched[r["creator"]] += 1
+    return out
+
+
 def strategy_report(db_path: str | Path, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, min_launches: int = 3,
                     days: float = 30, hold_s: float = 900) -> dict[str, Any]:
-    """Every exit rule on every launch of a repeat maker, one entry each, so the rules differ only in the exit.
-    Read from the stored launches, so the sample grows for as long as the collector runs."""
+    """Every exit rule on every launch of a repeat maker, one entry each, so the rules differ only in the exit,
+    and the same rules again on the launches a known crew sniped. Read from the stored launches, so the sample
+    grows for as long as the collector runs."""
     t_build = time.time()
     c = connect(db_path, readonly=True)
     try:
         rows = [r for r in read_launches(c, days) if r["entry_vsol"] is not None]
-        if not rows:
-            return {"generated": int(t_build), "empty": True, "params": {"min_launches": min_launches, "days": days}}
         made = collections.Counter(r["creator"] for r in rows)
         rows = [r for r in rows if made[r["creator"]] >= min_launches]
         if not rows:
             return {"generated": int(t_build), "empty": True, "params": {"min_launches": min_launches, "days": days}}
         t0, t_last = min(r["ts"] for r in rows), max(r["ts"] for r in rows)
-        mid, acc = (t0 + t_last) / 2, {}
-        for r in rows:
-            half = "h1" if r["ts"] < mid else "h2"
-            for name, pnl in launch_pnl(row_states(r), stake_sol, tx_cost_sol).items():
-                a = acc.setdefault(name, {"n": 0, "pnl": 0.0, "wins": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0})
-                a["n"] += 1
-                a["pnl"] += pnl
-                a["wins"] += pnl > 0
-                a["n_" + half] += 1
-                a["pnl_" + half] += pnl
-        out = []
-        for name, a in acc.items():
-            roi = {k: (a["pnl" + k] / (a["n" + k] * stake_sol) if a["n" + k] else None) for k in ("", "_h1", "_h2")}
-            out.append({"rule": name, "n": a["n"], "pnl_sol": a["pnl"], "roi": roi[""], "roi_h1": roi["_h1"],
-                        "roi_h2": roi["_h2"], "win_rate": a["wins"] / a["n"] if a["n"] else None})
+        mid = (t0 + t_last) / 2
+        cohorts = cohorts_of(rows)
+        groups = {name: _rules_on(sub, stake_sol, tx_cost_sol, mid) for name, sub in cohorts.items() if sub}
+        counts = {name: len(sub) for name, sub in cohorts.items()}
         return {"generated": int(time.time()), "build_s": round(time.time() - t_build, 1),
                 "params": {"stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "min_launches": min_launches, "days": days,
                            "hold_s": hold_s, "latency_slots": rows[0]["latency"]},
                 "counts": {"launches": len(rows), "makers": sum(1 for n in made.values() if n >= min_launches),
-                           "all_launches": len(made)},
+                           "all_launches": len(made), "cohorts": counts},
                 "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},
-                "rules": sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)}
+                "cohorts": groups, "rules": groups.get("all", [])}
     finally:
         c.close()
 

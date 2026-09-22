@@ -911,11 +911,26 @@
   const RULE_LABEL = {
     copy: "out when the maker sells", breakeven: "stake back early, ride the rest", tp20: "sell everything at +20%",
     tp50: "sell everything at +50%", tp100: "sell everything at +100%", hold: "no rule, out at the end (control)",
+    sell30s: "out on the clock, 30 s in", sell60s: "out on the clock, 60 s in",
   };
-  let lastRules = [];
+  const COHORT_LABEL = {
+    all: "All launches", crew: "Sniped by a known crew", crew_2nd: "Crew, second coin on", first_coin: "Crew, first coin",
+  };
+  const COHORT_NOTE = {
+    all: "every launch by a wallet with several launches in the window",
+    crew: "a crew we had already recognised sniped this launch",
+    crew_2nd: "and the wallet had launched before, so the crew's move to it was already confirmed: the plan",
+    first_coin: "the wallet's first coin, the one that confirms the crew moved and that you would skip",
+  };
+  let lastRules = [], cohort = store.get("strat:cohort", "all");
 
   function renderStrategies(d) {
-    const s = d.strategies || {}, p = s.params || {}, rules = lastRules = s.rules || [];
+    const s = d.strategies || {}, p = s.params || {}, groups = s.cohorts || {};
+    const names = Object.keys(COHORT_LABEL).filter((k) => (groups[k] || []).length);
+    if (!names.includes(cohort)) cohort = names[0] || "all";
+    const counts = (s.counts || {}).cohorts || {};
+    $("#strat-cohorts").innerHTML = names.map((k) => `<button type="button" data-cohort="${k}" class="${k === cohort ? "active" : ""}" title="${esc(COHORT_NOTE[k])}">${esc(COHORT_LABEL[k])} <b>${fmtInt(counts[k])}</b></button>`).join("");
+    const rules = lastRules = groups[cohort] || s.rules || [];
     const best = rules[0], copy = rules.find((r) => r.rule === "copy");
     $("#strat-tiles").innerHTML = !rules.length
       ? `<div class="empty" style="grid-column: 1 / -1">${d.exists ? "No comparison yet: it is computed with the ranking, every 30 minutes." : "The pump.fun collector is not running yet."}</div>`
@@ -926,7 +941,7 @@
         tile("Window", `${Math.round((p.hold_s ?? 900) / 60)} min`, `then out at whatever it is worth · ${fmtNum(((s.window || {}).hours || 0) / 24, 1)} days of launches kept`) +
         tile("Updated", s.generated ? ago(d.now - s.generated) : "never", s.build_s ? `took ${s.build_s}s` : "");
     $("#strat-rule").textContent = rules.length
-      ? `Every launch bought with ${p.stake_sol} SOL ${p.latency_slots} slots after the creation slot — the earliest a watcher of that wallet could land — then sold by each rule in turn. Same curve prices, fee, priority fee and tip as everywhere else.`
+      ? `${COHORT_NOTE[cohort]}. Each one bought with ${p.stake_sol} SOL ${p.latency_slots} slots after the creation slot — the earliest a watcher of that wallet could land, right behind the crew — then sold by each rule in turn. Same curve prices, fee, priority fee and tip as everywhere else.`
       : "";
     drawRules($("#strat-chart"), rules);
     sortableTable($("#strat-table"), [
@@ -1020,6 +1035,12 @@
   $("#btn-stop").addEventListener("click", async () => { try { await api("POST", "/api/jobs/current/stop"); } catch (e) { toast(e.message); } });
   $("#btn-clear").addEventListener("click", () => { consoleOut.textContent = ""; });
   $("#btn-results").addEventListener("click", () => { showView("results"); refreshRuns({ selectNewest: true }); });
+  $("#strat-cohorts").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-cohort]");
+    if (!b) return;
+    store.set("strat:cohort", cohort = b.dataset.cohort);
+    loadPump();
+  });
   $("#btn-config-save").addEventListener("click", saveConfig);
   $("#btn-config-reload").addEventListener("click", loadConfig);
 

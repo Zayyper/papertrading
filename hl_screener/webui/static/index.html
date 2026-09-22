@@ -199,6 +199,7 @@
       <p class="lede">Every launch by a wallet that launches repeatedly is bought the same way, then sold by a different rule. Only the exit changes, so the comparison is fair. If no rule beats copying the maker out, there is nothing here worth trading.</p>
     </div>
     <div class="tiles" id="strat-tiles"></div>
+    <div class="toolbar" style="margin-top: var(--space-md)"><span class="caption">Which launches</span><div class="seg" id="strat-cohorts"></div></div>
     <p class="caption" id="strat-rule" style="margin-top: 8px"></p>
     <div class="panel tight"><div class="chart" id="strat-chart"></div></div>
     <h3 class="section-title">Every rule on the same sample <span class="caption">profit per launch, after the fee, the priority fee and the tip</span></h3>
@@ -207,7 +208,9 @@
       <li><b>copy</b> is the benchmark: out when the maker first sells, landing two slots behind it. The same rule the Pump tab replays.</li>
       <li><b>breakeven</b> takes the stake back the moment the position is worth it, then rides the rest out with the maker. If the maker sells first, it is simply the copy.</li>
       <li><b>tp20 / tp50 / tp100</b> sell everything at that profit, counted after both transactions. If the price never gets there, they leave with the maker.</li>
+      <li><b>sell30s / sell60s</b> leave on the clock, 30 or 60 seconds in, without waiting for the maker. Makers here sell their own bag after about a minute, so these test getting out ahead of that.</li>
       <li><b>hold</b> has no rule at all: out at the end of the window. It is the control — a rule that cannot beat holding is noise.</li>
+      <li><b>Which launches.</b> "Crew, second coin on" is the plan of watching an operator's crew: a crew we had already recognised sniped this launch, and the wallet had launched before, so the crew's move to it was already confirmed. "Crew, first coin" is that confirmation launch itself — the one you would skip. Everything is walked forward in time, so a crew counts only from what was known before the launch happened, never from what we learned later.</li>
       <li>Every exit lands two slots after the trade that triggers it, because a rule can only react to a price it has already seen. Your own order would move the price too; that is not modelled, so every number here is a little kind.</li>
       <li><b>1st half / 2nd half</b> split the window in two. A rule that only works in one half is a coincidence, not a strategy.</li>
       <li>The sample is every launch by a wallet with several launches in the window. It says nothing about launches by one-time creators.</li>
