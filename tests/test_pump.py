@@ -1,8 +1,33 @@
 import base64
 import struct
 
-from hl_screener.pumpfun import (D_CREATE, D_TRADE, Collector, b58, build_report, copy_trade, parse_create,
-                                 parse_trade, twins)
+from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, PUMP_PROGRAM, WSOL, Collector,
+                                 b58, build_report, copy_trade, parse_amm_trade, parse_create, parse_trade, twins)
+
+
+def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
+    """A transaction's logs as Solana prints them: the event sits inside its program's invocation."""
+    return [f"Program {program} invoke [1]", "Program data: " + base64.b64encode(b).decode(), f"Program {program} success"]
+
+
+def b58decode(s: str) -> bytes:
+    n = 0
+    for ch in s:
+        n = n * 58 + _B58.index(ch)
+    return n.to_bytes(32, "big")
+
+
+def amm_bytes(buy, pool, user, base, B, Q, q, lp, q_net, user_q, vq=0, ix="buy"):
+    b = (D_BUY if buy else D_SELL) + struct.pack("<q", 1_790_000_000)
+    b += struct.pack("<13Q", base, 0, 0, 0, B, Q, q, 20, lp, 5, 0, q_net, user_q) + pool + user + bytes(32 * 5) + struct.pack("<QQ", 30, 0)
+    if buy:
+        b += struct.pack("<?QQQqQ", False, 0, 0, 0, 0, 0) + s(ix)
+    return b + struct.pack("<4Q", 0, 0, 0, 0) + vq.to_bytes(16, "little", signed=True) + struct.pack("<?QQQ", False, 0, 0, 0)
+
+
+def pool_bytes(pool, base_mint, quote_mint):
+    b = D_POOL + struct.pack("<qH", 0, 0) + bytes(32) + base_mint + quote_mint + struct.pack("<BB7QB", 6, 9, *([0] * 7), 255)
+    return b + pool + bytes(32 * 4) + struct.pack("<?Q??", False, 0, False, False)
 
 
 def s(x: str) -> bytes:
@@ -60,9 +85,6 @@ def test_collector_report_snipers_devs_and_copy_replay(tmp_path):
     W = {n: bytes([i]) * 32 for i, n in enumerate("DSTXYZ", start=20)}
     curve, held, states = Curve(), {}, {}
 
-    def line(b):
-        return "Program data: " + base64.b64encode(b).decode()
-
     def trade(slot, who, buy, amount):
         if buy:
             tok = curve.buy(amount)
@@ -73,9 +95,9 @@ def test_collector_report_snipers_devs_and_copy_replay(tmp_path):
             sol = curve.sell(tok)
             b = trade_bytes(mint, W[who], False, sol, tok, curve.vsol, curve.vtok, ts=1_790_000_000 + slot)
         states[slot] = (curve.vsol, curve.vtok)
-        col.on_logs(slot, [line(b)])
+        col.on_logs(slot, logs(b))
 
-    col.on_logs(1000, [line(create_bytes(mint, W["D"], ts=1_790_001_000)), "Program log: Instruction: CreateV2"])
+    col.on_logs(1000, logs(create_bytes(mint, W["D"], ts=1_790_001_000)))
     trade(1000, "D", True, 10**9)            # the dev's own buy: never counted as trading
     trade(1001, "S", True, 5 * 10**8)        # sniper: one slot after creation
     trade(1010, "T", True, 10**9)
@@ -84,10 +106,11 @@ def test_collector_report_snipers_devs_and_copy_replay(tmp_path):
     trade(1030, "T", False, None)
     trade(1031, "Z", True, 10**9)
     trade(1050, "S", False, None)
-    # a trade on a token born before the collector started is ignored
-    col.on_logs(1060, [line(trade_bytes(other_mint, W["X"], True, 10**9, 10**12, 31 * 10**9, 10**15))])
+    # a trade on a token born before the collector started is ignored, and so is an event another program logs
+    col.on_logs(1060, logs(trade_bytes(other_mint, W["X"], True, 10**9, 10**12, 31 * 10**9, 10**15)))
+    col.on_logs(1061, logs(trade_bytes(mint, W["X"], True, 10**9, 10**12, 31 * 10**9, 10**15), program="SomeOtherLaunchpad111111111111111111111111"))
     col.flush()
-    assert col.c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 8
+    assert col.c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 8 and col.stats["parse_errors"] == 0
 
     rep = build_report(db, min_tokens=1, min_snipes=1, latency_slots=2, stake_sol=0.1, tx_cost_sol=0.0005)
     traders = {r["addr"]: r for r in rep["traders"]}
@@ -119,7 +142,7 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
             tok = held.pop((who, m))
             b = trade_bytes(m, who, False, cv.sell(tok), tok, cv.vsol, cv.vtok)
         states[(m, slot)] = (cv.vsol, cv.vtok)
-        col.on_logs(slot, ["Program data: " + base64.b64encode(b).decode()])
+        col.on_logs(slot, logs(b))
 
     trade(100, G, True, 10**9)            # the followed wallet buys: the copy lands at slot 102 or later
     trade(101, X, True, 2 * 10**9)        # not due yet
@@ -144,15 +167,49 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
     col.c.close()
 
 
+def test_pumpswap_events_decode_to_post_trade_reserves():
+    pool, user = bytes([3]) * 32, bytes([4]) * 32
+    B, Q, vq = 10**15, 85 * 10**9, 7 * 10**9
+    buy = parse_amm_trade(amm_bytes(True, pool, user, 10**12, B, Q, 10**8, 2 * 10**5, 10**8 + 2 * 10**5, 10**8 + 5 * 10**5, vq, "buy_exact_quote_in"))
+    assert (buy["vtok"], buy["vsol"], buy["fee"], buy["sol"]) == (B - 10**12, Q + 10**8 + 2 * 10**5 + vq, 5 * 10**5, 10**8)
+    sell = parse_amm_trade(amm_bytes(False, pool, user, 10**12, B, Q, 10**8, 2 * 10**5, 10**8 - 2 * 10**5, 10**8 - 6 * 10**5, vq))
+    assert (sell["vtok"], sell["vsol"], sell["fee"]) == (B + 10**12, Q - 10**8 + 2 * 10**5 + vq, 6 * 10**5)
+    assert not sell["buy"] and buy["buy"] and buy["pool"] == pool
+    assert parse_amm_trade(amm_bytes(False, pool, user, 1, 1, 1, 1, 0, 1, 1) + b"\0") is None
+
+
+def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
+    col = Collector(tmp_path / "pump.db")
+    mint, dev, W, X, pool = bytes([50]) * 32, bytes([51]) * 32, bytes([52]) * 32, bytes([53]) * 32, bytes([54]) * 32
+    col.c.execute("INSERT INTO follow VALUES (?, 0, 1, NULL)", (b58(W),))
+    col.paper.reload()
+    col.on_logs(400, logs(create_bytes(mint, dev)), "sig-create")
+    col.on_logs(500, logs(pool_bytes(pool, mint, b58decode(WSOL)), AMM_PROGRAM), "sig-migrate")
+    assert col.pools == {b58(pool): b58(mint)} and col.stats["graduated"] == 1
+    B, Q = 10**15, 85 * 10**9
+    w_buy = logs(amm_bytes(True, pool, W, 10**12, B, Q, 10**8, 2 * 10**5, 10**8 + 2 * 10**5, 10**8 + 5 * 10**5), AMM_PROGRAM)
+    col.on_logs(510, w_buy, "sig-w")
+    col.on_logs(510, w_buy, "sig-w")                     # the same transaction again, from the other subscription
+    col.on_logs(511, logs(amm_bytes(True, bytes([99]) * 32, X, 5, B, Q, 5, 0, 5, 5), AMM_PROGRAM), "sig-other-pool")
+    B2, Q2 = B - 10**12, Q + 10**8 + 2 * 10**5
+    col.on_logs(513, logs(amm_bytes(True, pool, X, 10**11, B2, Q2, 10**7, 2 * 10**4, 10**7 + 2 * 10**4, 10**7 + 5 * 10**4), AMM_PROGRAM), "sig-x")
+    col.flush()
+    rows = col.c.execute("SELECT slot, sol, tok, fee, vsol, vtok FROM trades ORDER BY slot").fetchall()
+    assert rows[0] == (510, 10**8, 10**12, 5 * 10**5, Q2, B2) and len(rows) == 2 and col.stats["amm_trades"] == 2
+    copy = col.c.execute("SELECT side, trigger_slot, land_slot FROM pfills").fetchall()
+    assert copy == [("buy", 510, 512)]                   # W's PumpSwap buy was copied at the pool's reserves
+    col.c.close()
+
+
 def test_twins_are_wallets_buying_the_same_tokens_in_the_same_slot(tmp_path):
     col = Collector(tmp_path / "pump.db")
     A, B, C, dev = (bytes([i]) * 32 for i in (40, 41, 42, 43))
     for k in range(4):                                   # four launches; A and B always buy together, C never with them
         mint = bytes([60 + k]) * 32
         base = 2000 + 100 * k
-        col.on_logs(base, ["Program data: " + base64.b64encode(create_bytes(mint, dev)).decode()])
+        col.on_logs(base, logs(create_bytes(mint, dev)))
         for who, slot in ((A, base + 5), (B, base + 5), (C, base + 9 + k)):
-            col.on_logs(slot, ["Program data: " + base64.b64encode(trade_bytes(mint, who, True, 10**8, 10**12, 31 * 10**9, 10**15)).decode()])
+            col.on_logs(slot, logs(trade_bytes(mint, who, True, 10**8, 10**12, 31 * 10**9, 10**15)))
     col.flush()
     ids = dict(col.c.execute("SELECT addr, id FROM wallets"))
     assert twins(col.c, ids[b58(A)]) == 1 and twins(col.c, ids[b58(B)]) == 1 and twins(col.c, ids[b58(C)]) == 0

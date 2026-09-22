@@ -122,13 +122,24 @@ python -m hl_screener pump collect     # stream every pump.fun trade into data/p
 python -m hl_screener pump report      # rank now from what was collected
 ```
 
-- **Data.** The pump.fun program's own `CreateEvent` and `TradeEvent`, read from Solana's public
-  RPC with `logsSubscribe`. No key, no third party. The layout follows pump.fun's published IDL
-  and an event that does not fit it exactly is counted and dropped, never misread.
-  `SOLANA_WS_URL` swaps in another RPC.
-- **Scope.** Tokens created while the collector runs, quoted in SOL, on the bonding curve, so
-  every position is seen from its first buy. Graduated tokens are valued at their final curve
-  price; PumpSwap trading after graduation is not tracked. Kept `PUMP_RETENTION_DAYS` (3).
+- **Data.** The pump.fun program's own `CreateEvent` and `TradeEvent`, and PumpSwap's
+  `CreatePoolEvent`, `BuyEvent` and `SellEvent`, read from Solana's public RPC with
+  `logsSubscribe` (both programs on one socket). No key, no third party. Layouts follow pump.fun's
+  published IDLs; an event only counts when that program itself logged it, and one that does not
+  fit the layout exactly is counted and dropped, never misread.
+- **Scope.** Tokens created while the collector runs, quoted in SOL, so every position is seen
+  from its first buy. A token that graduates keeps being tracked on its PumpSwap pool: pool trades
+  are stored like curve trades, with the pool's effective reserves after the trade (the events
+  carry the reserves before it, checked on 13,379 consecutive live trades), so prices, profits and
+  copies run straight through graduation. Kept `PUMP_RETENTION_DAYS` (3).
+- **Feed delay** is measured on every trade against the chain's own slot clock (`slotSubscribe`):
+  on the public endpoint, 1 slot (0.4 s) at the median, 90th and 99th percentile. The report's
+  copier lands one slot after the measured median (at least 2 slots after the wallet); the paper
+  follower lands one slot after the chain's actual newest slot.
+- **Feeds.** `SOLANA_WS_URL` swaps the main RPC. `SOLANA_WS_FALLBACK` is used only after the main
+  one fails twice in a row, for 15 minutes. Helius meters websockets at 2 credits per 0.1 MB: this
+  stream (about 1.4 MB/s) would empty a free plan's million monthly credits in half a day, but
+  covering outages costs about 25,000 credits each. The page shows drops and seconds lost.
 - **Wallet profit** uses the exact fees from each event. A launcher's positions in its own tokens
   never count as trading.
 - **Copier profit is replayed, not modelled.** A copier landing `--latency-slots` (2, about 0.8 s)

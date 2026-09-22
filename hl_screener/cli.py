@@ -85,7 +85,8 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--db", help="sqlite file (default <data_dir>/pump/pump.db)")
     pf.add_argument("--ws", help="Solana websocket RPC (default SOLANA_WS_URL, else the public mainnet endpoint)")
     pf.add_argument("--retention-days", type=float, help="keep this many days of tokens (default PUMP_RETENTION_DAYS, else 3)")
-    pf.add_argument("--latency-slots", type=int, default=2, help="report: slots between a wallet's trade and the copier's (400 ms each)")
+    pf.add_argument("--latency-slots", type=int, help="report: slots between a wallet's trade and the copier's, 400 ms each "
+                                                       "(default: the measured feed delay + 1, at least 2)")
     pf.add_argument("--stake", type=float, default=0.1, help="report: SOL the copier puts into each copied buy")
 
     u = sub.add_parser("ui", help="local web page: run jobs, watch progress, browse results, edit config")
@@ -156,7 +157,8 @@ def main(argv: list[str] | None = None) -> int:
         db = Path(a.db) if a.db else Path(cfg.data_dir) / "pump" / "pump.db"
         if a.action == "collect":
             return pumpfun.collect(db, a.ws or os.environ.get("SOLANA_WS_URL") or pumpfun.PUBLIC_WS,
-                                   a.retention_days or float(os.environ.get("PUMP_RETENTION_DAYS") or 3))
+                                   a.retention_days or float(os.environ.get("PUMP_RETENTION_DAYS") or 3),
+                                   fallback_url=os.environ.get("SOLANA_WS_FALLBACK") or None)
         if not db.exists():
             print(f"no data at {db}: run `python -m hl_screener pump collect` first", file=sys.stderr)
             return 1

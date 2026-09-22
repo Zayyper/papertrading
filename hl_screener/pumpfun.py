@@ -3,20 +3,24 @@
     python -m hl_screener pump collect    # stream pump.fun from Solana 24/7 into SQLite, re-rank every 30 min
     python -m hl_screener pump report     # rank wallets now from what was collected
 
-Data: the pump.fun program's own CreateEvent / TradeEvent (layout: github.com/pump-fun/pump-public-docs,
-idl/pump.json), read from Solana's public RPC with logsSubscribe. No key; SOLANA_WS_URL swaps in another
-RPC (Helius, QuickNode...). Scope: tokens created while the collector runs, quoted in SOL, on the bonding
-curve. A graduated token trades on PumpSwap afterwards, which is not tracked: positions held through
-graduation are valued at the final curve price.
+Data: the pump.fun program's own CreateEvent / TradeEvent and, once a token graduates, the PumpSwap pool's
+BuyEvent / SellEvent (layouts: github.com/pump-fun/pump-public-docs, idl/pump.json and idl/pump_amm.json),
+read from Solana's public RPC with logsSubscribe; slotSubscribe on the same socket measures how many slots
+behind the chain each trade reaches us. No key. SOLANA_WS_URL swaps the RPC; SOLANA_WS_FALLBACK is used only
+while the main one keeps failing (Helius meters websockets at 2 credits per 0.1 MB: a free plan cannot carry
+this stream 24/7, but it can cover outages). Scope: tokens created while the collector runs, quoted in SOL.
+PumpSwap trades are stored like curve trades, with the pool's effective reserves after the trade, so prices,
+profits and copies run straight through graduation.
 
 Copy cost is not modelled here, it is replayed: a copier that lands `latency_slots` after the wallet
-buys at the curve state left by every trade before that slot, and sells the same way after the wallet's
-first sell, paying the pump.fun fees and a fixed per-transaction cost.
+buys at the reserves left by every trade before that slot, and sells the same way after the wallet's
+first sell, paying that trade's fees and a fixed per-transaction cost.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import hashlib
 import json
 import logging
@@ -30,10 +34,15 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"     # PumpSwap, where graduated tokens trade
 PUBLIC_WS = "wss://api.mainnet-beta.solana.com"
 D_TRADE = hashlib.sha256(b"event:TradeEvent").digest()[:8]
 D_CREATE = hashlib.sha256(b"event:CreateEvent").digest()[:8]
+D_BUY = hashlib.sha256(b"event:BuyEvent").digest()[:8]
+D_SELL = hashlib.sha256(b"event:SellEvent").digest()[:8]
+D_POOL = hashlib.sha256(b"event:CreatePoolEvent").digest()[:8]
 SOL_QUOTE = bytes(32)          # quote_mint = default pubkey: the curve is quoted in native SOL
+WSOL = "So11111111111111111111111111111111111111112"        # a PumpSwap pool quoted in SOL
 FEE = 0.0125                   # 0.95 % protocol + 0.30 % creator per side, the common case (ponytail: per-token creator fees vary; read them from the events if it matters)
 LAMPORTS = 1e9
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -121,6 +130,51 @@ def parse_create(b: bytes) -> dict[str, Any] | None:
     return {"mint": mint, "user": user, "name": name[:64], "symbol": symbol[:32], "ts": ts, "sol_quote": quote == SOL_QUOTE}
 
 
+def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
+    """PumpSwap BuyEvent / SellEvent, in the same terms as a curve trade: `sol` the amount the pool priced,
+    `fee` everything the user paid on top (buy) or lost (sell), `vsol`/`vtok` the pool's effective reserves
+    (real + virtual quote) AFTER the trade. The event itself carries the reserves before it: checked on
+    13,379 consecutive live trades, and constant product on real + virtual reserves reproduces them."""
+    buy = b[:8] == D_BUY
+    try:
+        r = _Reader(b)
+        ts = r.take("<q")
+        v = r.take("<13Q")
+        pool, user = r.pk(), r.pk()
+        r.skip(32 * 5 + 16)                       # token accounts, fee recipients, coin creator, creator fee bps/amount
+        if buy:
+            r.skip(1 + 8 * 4 + 8)                 # track_volume, volume totals, min_base_amount_out
+            r.string()                            # ix_name
+        r.skip(8 * 4)                             # cashback and buyback bps/amounts
+        vq = int.from_bytes(r.b[r.o:r.o + 16], "little", signed=True)
+        r.skip(16 + 1 + 8 + 16)                   # virtual_quote_reserves, can_boost, base_supply, holder rewards
+    except (struct.error, ValueError):
+        return None
+    if r.o != len(b):
+        return None
+    base, B, Q, q, q_net, user_q = v[0], v[4], v[5], v[6], v[11], v[12]
+    if buy:
+        vtok, vsol, fee = B - base, Q + q_net + vq, user_q - q
+    else:
+        vtok, vsol, fee = B + base, Q - q_net + vq, q - user_q
+    return {"pool": pool, "user": user, "buy": buy, "sol": q, "tok": base, "fee": max(fee, 0), "ts": ts, "vsol": vsol, "vtok": vtok}
+
+
+def parse_create_pool(b: bytes) -> dict[str, Any] | None:
+    try:
+        r = _Reader(b)
+        r.skip(8 + 2 + 32)                        # timestamp, index, creator
+        base, quote = r.pk(), r.pk()
+        r.skip(2 + 8 * 7 + 1)                     # decimals, amounts, pool_bump
+        pool = r.pk()
+        r.skip(32 * 4 + 1 + 8 + 1 + 1)            # lp_mint, token accounts, coin_creator, flags, creator_fee_bps
+    except (struct.error, ValueError):
+        return None
+    if r.o != len(b):
+        return None
+    return {"pool": pool, "base_mint": base, "quote_mint": quote}
+
+
 # ---------------------------------------------------------------------------
 # storage
 # ---------------------------------------------------------------------------
@@ -151,6 +205,10 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     c.executescript(SCHEMA)
+    try:
+        c.execute("ALTER TABLE mints ADD COLUMN pool TEXT")   # databases from before PumpSwap tracking
+    except sqlite3.OperationalError:
+        pass                                                   # already there
     return c
 
 
@@ -311,22 +369,34 @@ def update_follow(db_path: str | Path, rep: dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 # collector
 # ---------------------------------------------------------------------------
+def _no_key(text: str) -> str:
+    """Error texts can echo the URL: never let an API key reach the logs or the page."""
+    import re
+    return re.sub(r"(api[-_]?key=)[^&\s'\"]+", r"\1***", text)
+
+
 class Collector:
-    def __init__(self, db_path: str | Path, ws_url: str = PUBLIC_WS, retention_days: float = 3.0):
+    def __init__(self, db_path: str | Path, ws_url: str = PUBLIC_WS, retention_days: float = 3.0, fallback_url: str | None = None):
         self.db_path = Path(db_path)
         self.c = connect(self.db_path)
-        self.ws_url = ws_url
+        self.ws_url, self.fallback_url = ws_url, fallback_url or None
         self.retention_s = retention_days * 86_400
         self.wallets: dict[str, int] = dict(self.c.execute("SELECT addr, id FROM wallets"))
         cutoff = time.time() - self.retention_s
         self.mints: dict[str, tuple[int, int]] = {a: (i, ts) for a, i, ts in self.c.execute("SELECT addr, id, ts FROM mints WHERE ts >= ?", (cutoff,))}
+        self.pools: dict[str, str] = {p: a for a, p in self.c.execute("SELECT addr, pool FROM mints WHERE pool IS NOT NULL AND ts >= ?", (cutoff,))}
         self.buf: list[tuple] = []
-        self.stats: dict[str, Any] = {"since": int(time.time()), "trades": 0, "mints": 0, "non_sol": 0, "parse_errors": 0,
-                                      "reconnects": 0, **(get_meta(self.c, "stats") or {})}
+        self.stats: dict[str, Any] = {"since": int(time.time()), "trades": 0, "amm_trades": 0, "mints": 0, "graduated": 0, "non_sol": 0,
+                                      "parse_errors": 0, "reconnects": 0, "gap_s": 0.0, **(get_meta(self.c, "stats") or {})}
         self.stats["started"] = int(time.time())
         self.stats["ws"] = ws_url.split("?")[0]              # never store an API key that may sit in the query string
+        self.stats["fallback"] = bool(self.fallback_url)
         self.paper = PaperFollow(self.c)
         self.last_paper = 0.0
+        self.tip = 0                                          # the chain's newest slot (processed), from slotSubscribe
+        self.lags: collections.deque[int] = collections.deque(maxlen=20_000)
+        self.sigs: collections.deque[str] = collections.deque(maxlen=20_000)
+        self.sig_set: set[str] = set()
 
     def wallet_id(self, addr: str) -> int:
         i = self.wallets.get(addr)
@@ -335,15 +405,59 @@ class Collector:
             self.wallets[addr] = i
         return i
 
-    def on_logs(self, slot: int, logs: list[str]) -> None:
+    def on_logs(self, slot: int, logs: list[str], sig: str | None = None) -> None:
+        if sig:                                            # a transaction touching both programs arrives on both feeds
+            if sig in self.sig_set:
+                return
+            if len(self.sigs) == self.sigs.maxlen:
+                self.sig_set.discard(self.sigs[0])
+            self.sigs.append(sig)
+            self.sig_set.add(sig)
+        if self.tip:
+            self.lags.append(max(0, self.tip - slot))      # how far behind the chain this trade reached us
+            self.paper.tip = max(self.paper.tip, self.tip)
+        stack: list[str] = []                              # which program is running: only its own events count
         for line in logs:
             if not line.startswith("Program data: "):
+                if line.startswith("Program ") and " invoke [" in line:
+                    stack.append(line.split(" ", 2)[1])
+                elif line.startswith("Program ") and (line.endswith(" success") or " failed" in line) and stack:
+                    stack.pop()
                 continue
+            program = stack[-1] if stack else None
+            if program not in (PUMP_PROGRAM, AMM_PROGRAM):
+                continue                                   # another program's event, even if it shares a name
             try:
                 b = base64.b64decode(line[14:])
             except ValueError:
                 continue
-            if b[:8] == D_CREATE:
+            if program == AMM_PROGRAM:
+                if b[:8] not in (D_BUY, D_SELL, D_POOL):
+                    continue
+            elif b[:8] not in (D_CREATE, D_TRADE):
+                continue
+            if b[:8] in (D_BUY, D_SELL):
+                e = parse_amm_trade(b)
+                if e is None:
+                    self.stats["parse_errors"] += 1
+                    continue
+                mint = self.pools.get(b58(e["pool"]))
+                if mint is not None:                       # a pool of a token we track, after its graduation
+                    self.stats["amm_trades"] += 1
+                    self._trade(slot, mint, b58(e["user"]), e)
+            elif b[:8] == D_POOL:
+                e = parse_create_pool(b)
+                if e is None:
+                    self.stats["parse_errors"] += 1
+                    continue
+                if b58(e["quote_mint"]) != WSOL:
+                    continue
+                mint, pool = b58(e["base_mint"]), b58(e["pool"])
+                if mint in self.mints and pool not in self.pools:
+                    self.pools[pool] = mint
+                    self.c.execute("UPDATE mints SET pool = ? WHERE addr = ?", (pool, mint))
+                    self.stats["graduated"] += 1
+            elif b[:8] == D_CREATE:
                 e = parse_create(b)
                 if e is None:
                     self.stats["parse_errors"] += 1
@@ -361,15 +475,16 @@ class Collector:
                 if e is None:
                     self.stats["parse_errors"] += 1
                     continue
-                if not e["sol_quote"]:
-                    continue
-                mint, user = b58(e["mint"]), b58(e["user"])
-                self.paper.on_trade(slot, mint, user, e)          # followed wallets are copied on any token
-                m = self.mints.get(mint)
-                if m is None:
-                    continue                      # born before we started watching: not stored
-                self.buf.append((slot, e["ts"], m[0], self.wallet_id(user), int(e["buy"]),
-                                 e["sol"], e["tok"], e["fee"], e["vsol"], e["vtok"]))
+                if e["sol_quote"]:
+                    self._trade(slot, b58(e["mint"]), b58(e["user"]), e)
+
+    def _trade(self, slot: int, mint: str, user: str, e: dict[str, Any]) -> None:
+        self.paper.on_trade(slot, mint, user, e)                  # followed wallets are copied on any token
+        m = self.mints.get(mint)
+        if m is None:
+            return                                                # born before we started watching: not stored
+        self.buf.append((slot, e["ts"], m[0], self.wallet_id(user), int(e["buy"]),
+                         e["sol"], e["tok"], e["fee"], e["vsol"], e["vtok"]))
 
     def flush(self) -> None:
         if self.buf:
@@ -381,6 +496,9 @@ class Collector:
         if now - self.last_paper >= 10:
             self.paper.reload()                                   # the report thread adds golden wallets
             set_meta(self.c, "paper", self.paper.summary())
+            if self.lags:
+                s = sorted(self.lags)
+                self.stats.update({f"lag_p{p}": s[min(len(s) - 1, len(s) * p // 100)] for p in (50, 90, 99)})
             self.last_paper = now
         self.stats["heartbeat"] = int(now)
         set_meta(self.c, "stats", self.stats)
@@ -395,20 +513,36 @@ class Collector:
         import websockets  # here so `pump report` works without the package
         stop = stop or asyncio.Event()
         backoff, last_flush, last_line, last_forget = 2.0, time.time(), time.time(), time.time()
+        fails, fallback_until, gap_from = 0, 0.0, None
         seen = (self.stats["trades"], self.stats["mints"])
         while not stop.is_set():
+            on_fallback = bool(self.fallback_url) and time.time() < fallback_until
+            url = self.fallback_url if on_fallback else self.ws_url
             try:
-                async with websockets.connect(self.ws_url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30) as ws:
-                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                                              "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "confirmed"}]}))
+                async with websockets.connect(url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30) as ws:
+                    for i, program in enumerate((PUMP_PROGRAM, AMM_PROGRAM), 1):
+                        await ws.send(json.dumps({"jsonrpc": "2.0", "id": i, "method": "logsSubscribe",
+                                                  "params": [{"mentions": [program]}, {"commitment": "confirmed"}]}))
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "slotSubscribe"}))
+                    self.stats["ws"] = ("fallback: " if on_fallback else "") + url.split("?")[0]
                     log.info("connected to %s", self.stats["ws"])
-                    backoff = 2.0
+                    backoff, fails = 2.0, 0
+                    if gap_from is not None:
+                        self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + time.time() - gap_from, 1)
+                        gap_from = None
                     while not stop.is_set():
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)   # 30 s of silence on pump.fun = a stalled feed
-                        res = json.loads(raw).get("params", {}).get("result")
-                        if res and not res["value"].get("err"):
-                            self.on_logs(res["context"]["slot"], res["value"]["logs"])
+                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))   # 30 s of silence = a stalled feed
+                        method = msg.get("method")
+                        if method == "slotNotification":
+                            self.tip = max(self.tip, msg["params"]["result"]["slot"])
+                        elif method == "logsNotification":
+                            res = msg["params"]["result"]
+                            if not res["value"].get("err"):
+                                self.on_logs(res["context"]["slot"], res["value"]["logs"], res["value"].get("signature"))
                         now = time.time()
+                        if on_fallback and now >= fallback_until:
+                            log.info("fallback window over: back to the main feed")
+                            break
                         if now - last_flush >= 1:
                             self.flush()
                             last_flush = now
@@ -422,9 +556,14 @@ class Collector:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - any feed failure: keep what we have, reconnect
+                gap_from = gap_from or time.time()
                 self.flush()
+                fails += 1
                 self.stats["reconnects"] += 1
-                self.stats["last_error"] = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(e).__name__}: {e}"[:300]
+                self.stats["last_error"] = _no_key(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(e).__name__}: {e}")[:300]
+                if self.fallback_url and not on_fallback and fails >= 2:
+                    fallback_until = time.time() + 900     # the main feed keeps failing: 15 min on the fallback
+                    log.warning("main feed failed %d times in a row: using the fallback for 15 min", fails)
                 log.warning("feed error (%s); reconnecting in %.0fs", self.stats["last_error"], backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
@@ -450,11 +589,12 @@ def prune(db_path: str | Path, retention_s: float) -> int:
         c.close()
 
 
-def collect(db_path: str | Path, ws_url: str, retention_days: float, report_every_s: float = 1800) -> int:
+def collect(db_path: str | Path, ws_url: str, retention_days: float, report_every_s: float = 1800,
+            fallback_url: str | None = None) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
-    col = Collector(db_path, ws_url, retention_days)
-    print(f"pump collector: {col.stats['ws']}, keeping {retention_days:g} days, db {db_path}, "
-          f"ranking wallets every {report_every_s / 60:.0f} min. Ctrl+C to stop.", flush=True)
+    col = Collector(db_path, ws_url, retention_days, fallback_url)
+    print(f"pump collector: {col.stats['ws']}{' (fallback feed set)' if fallback_url else ''}, keeping {retention_days:g} days, "
+          f"db {db_path}, ranking wallets every {report_every_s / 60:.0f} min. Ctrl+C to stop.", flush=True)
     halt = threading.Event()
 
     def maintenance() -> None:                                 # own thread and connection: never stalls the feed
@@ -521,14 +661,25 @@ def _state_before(c: sqlite3.Connection, mint: int, slot: int | None) -> tuple[i
     return c.execute("SELECT vsol, vtok FROM trades WHERE mint=? AND slot < ? ORDER BY slot DESC, rowid DESC LIMIT 1", (mint, slot)).fetchone()
 
 
-def copy_trade(entry: tuple[int, int], exit_: tuple[int, int], stake_sol: float, tx_cost_sol: float) -> float:
-    """SOL PnL of buying `stake_sol` at curve state `entry` and selling everything at state `exit_`."""
+def copy_trade(entry: tuple[int, int], exit_: tuple[int, int], stake_sol: float, tx_cost_sol: float,
+               fee_in: float = FEE, fee_out: float = FEE) -> float:
+    """SOL PnL of buying `stake_sol` at reserves `entry` and selling everything at reserves `exit_`
+    (bonding curve or PumpSwap pool: both are constant product on the stored reserves)."""
     vsol, vtok = entry
-    net = stake_sol * LAMPORTS / (1 + FEE)
+    net = stake_sol * LAMPORTS / (1 + fee_in)
     tokens = vtok - vsol * vtok / (vsol + net)
     vsol2, vtok2 = exit_
-    out = (vsol2 - vsol2 * vtok2 / (vtok2 + tokens)) * (1 - FEE) if vtok2 > 0 else 0.0
+    out = (vsol2 - vsol2 * vtok2 / (vtok2 + tokens)) * (1 - fee_out) if vtok2 > 0 else 0.0
     return out / LAMPORTS - stake_sol - 2 * tx_cost_sol
+
+
+def _fee_rate(c: sqlite3.Connection, wallet: int, mint: int, buy: int, slot: int | None) -> float:
+    """The wallet's own fee rate on that trade: 1.25 % on the curve, less on PumpSwap."""
+    if slot is None:
+        return FEE
+    row = c.execute("SELECT fee * 1.0 / sol FROM trades WHERE wallet=? AND mint=? AND buy=? AND slot=? AND sol > 0 LIMIT 1",
+                    (wallet, mint, buy, slot)).fetchone()
+    return row[0] if row and row[0] is not None else FEE
 
 
 def copy_sim(c: sqlite3.Connection, wallet: int, mid: float, latency_slots: int, stake_sol: float, tx_cost_sol: float,
@@ -545,7 +696,7 @@ def copy_sim(c: sqlite3.Connection, wallet: int, mid: float, latency_slots: int,
             continue
         fs = c.execute("SELECT MIN(slot) FROM trades WHERE wallet=? AND mint=? AND buy=0 AND slot >= ?", (wallet, mint, fb)).fetchone()[0]
         exit_ = _state_before(c, mint, fs + latency_slots) if fs is not None else _state_before(c, mint, None)
-        p = copy_trade(entry, exit_, stake_sol, tx_cost_sol)
+        p = copy_trade(entry, exit_, stake_sol, tx_cost_sol, _fee_rate(c, wallet, mint, 1, fb), _fee_rate(c, wallet, mint, 0, fs))
         half = "h1" if mts < mid else "h2"
         out["n"] += 1
         out["pnl"] += p
@@ -570,16 +721,20 @@ def twins(c: sqlite3.Connection, wallet: int, max_positions: int = 1000) -> int:
     return sum(1 for (shared,) in rows if shared >= max(3, n / 2))
 
 
-def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10, min_snipes: int = 5, latency_slots: int = 2,
+def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10, min_snipes: int = 5, latency_slots: int | None = None,
                  stake_sol: float = 0.1, tx_cost_sol: float = 0.0005, top: int = 100, max_positions: int = 1000,
                  min_hours: float = 12) -> dict[str, Any]:
     """`min_hours`: no wallet is called golden before the window spans this long. Golden wallets get followed
-    for good, so a verdict from the first minutes of data would pin noise to the paper test."""
-    params = {"snipe_slots": snipe_slots, "min_tokens": min_tokens, "min_snipes": min_snipes, "latency_slots": latency_slots,
-              "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours}
+    for good, so a verdict from the first minutes of data would pin noise to the paper test.
+    `latency_slots` None: the feed delay the collector measured (median) plus one slot to send, at least 2."""
     t_build = time.time()
     c = connect(db_path, readonly=True)
     try:
+        measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")
+        if latency_slots is None:
+            latency_slots = max(2, measured + 1) if measured is not None else 2
+        params = {"snipe_slots": snipe_slots, "min_tokens": min_tokens, "min_snipes": min_snipes, "latency_slots": latency_slots,
+                  "latency_measured_p50": measured, "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours}
         t0, t1, n_mints = c.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM mints").fetchone()
         if not n_mints:
             return {"generated": int(t_build), "params": params, "empty": True}
@@ -625,7 +780,8 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
         stats = get_meta(c, "stats", {}) or {}
         return {"generated": int(time.time()), "build_s": round(time.time() - t_build, 1), "params": params,
                 "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},
-                "counts": {"tokens": n_mints, "trades": stats.get("trades"), "wallets_ranked": len(rows)},
+                "counts": {"tokens": n_mints, "graduated": c.execute("SELECT COUNT(*) FROM mints WHERE pool IS NOT NULL").fetchone()[0],
+                           "trades": stats.get("trades"), "wallets_ranked": len(rows)},
                 "base": base, "traders": slim(sorted(cands, key=lambda r: r.get("copy_roi") or -9, reverse=True)), "snipers": slim(snipers)}
     finally:
         c.close()

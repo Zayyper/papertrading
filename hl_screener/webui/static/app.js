@@ -720,10 +720,11 @@
     const hb = isNum(st.heartbeat) ? d.now - st.heartbeat : NaN, live = isNum(hb) && hb < 120;
     $("#pump-tiles").innerHTML = !d.exists
       ? `<div class="empty" style="grid-column: 1 / -1">No pump.fun data yet. Start the collector: <code>python -m hl_screener pump collect</code>, or the pump service in Coolify.</div>`
-      : tile("Collector", live ? "live" : "stalled", `heartbeat ${ago(hb)}${st.reconnects ? ` · ${fmtInt(st.reconnects)} reconnects` : ""}`) +
+      : tile("Collector", live ? "live" : "stalled", `${(st.ws || "").startsWith("fallback") ? "on the fallback feed · " : ""}heartbeat ${ago(hb)} · ${fmtInt(st.reconnects || 0)} drops, ${elapsed(st.gap_s || 0)} lost`) +
+        tile("Feed delay", isNum(st.lag_p50) ? `${st.lag_p50} slot${st.lag_p50 === 1 ? "" : "s"}` : "measuring", isNum(st.lag_p50) ? `behind the chain, about ${fmtNum(st.lag_p50 * 0.4, 1)} s · p90 ${st.lag_p90}, p99 ${st.lag_p99}` : "from the chain's slot clock") +
         tile("Collecting for", isNum(st.since) ? elapsed(d.now - st.since) : "n/a", "since the first start") +
-        tile("Tokens seen", fmtInt(st.mints), `${fmtInt(st.non_sol || 0)} not quoted in SOL, skipped`) +
-        tile("Trades stored", fmtInt(st.trades), st.parse_errors ? `${fmtInt(st.parse_errors)} undecodable events` : "every event decoded") +
+        tile("Tokens seen", fmtInt(st.mints), `${fmtInt(st.graduated || 0)} graduated to PumpSwap · ${fmtInt(st.non_sol || 0)} not in SOL, skipped`) +
+        tile("Trades stored", fmtInt(st.trades), `${fmtInt(st.amm_trades || 0)} on PumpSwap · ${st.parse_errors ? `${fmtInt(st.parse_errors)} undecodable` : "every event decoded"}`) +
         tile("Ranking", rep.generated ? ago(d.now - rep.generated) : "not yet", rep.generated ? `${fmtInt((rep.counts || {}).wallets_ranked)} wallets · refreshed every 30 min` : "the first one comes 30 min after start");
     const b = rep.base || {};
     $("#pump-base").textContent = isNum(b.profitable_share)

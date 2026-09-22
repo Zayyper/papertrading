@@ -161,7 +161,7 @@
     <div class="page-head">
       <p class="eyebrow">Pump</p>
       <h1 class="headline">Who snipes pump.fun, who trades it well, and could you copy them</h1>
-      <p class="lede">Every pump.fun trade on Solana, read from the pump.fun program's own events over Solana's public RPC. Only tokens born while the collector runs, quoted in SOL, on the bonding curve. A wallet's profit comes from its own trades; the copier columns replay the bonding curve to price what someone following two slots later (about 0.8 s) would really have paid and received, fees and transaction costs included. A launcher's positions in its own tokens never count.</p>
+      <p class="lede">Every pump.fun trade on Solana, read from the program's own events over Solana's public RPC, and every PumpSwap trade of those tokens once they graduate. Only tokens born while the collector runs, quoted in SOL. A wallet's profit comes from its own trades; the copier columns replay the real curve or pool to price what someone following it would have paid and received, landing one slot after the measured feed delay, fees and transaction costs included. A launcher's positions in its own tokens never count.</p>
     </div>
     <div class="tiles" id="pump-tiles"></div>
     <p class="caption" id="pump-base" style="margin-top: 8px"></p>
@@ -174,8 +174,8 @@
       <li><b>Cluster ×N</b>: N wallets bought the same tokens in the same slot on at least half of this wallet's tokens. That is one operator behind several wallets, or a coordinated group trading its own launches. Their edge is knowing the launch; it ends the moment they sell to their followers.</li>
       <li><b>Same slot</b> snipes land in the block that created the token: bundled with the launch or colocated with the validator. Nobody can copy those.</li>
       <li><b>Dev</b> marks wallets that also launch tokens. A sniper that launches tokens is most likely buying its own or its friends' launches.</li>
-      <li>Tokens that graduate to PumpSwap are valued at their final bonding-curve price; trading after graduation is not tracked.</li>
-      <li>The copier is a replay of the real curve, not a guess, but it assumes you could always land two slots after the wallet. A forward paper test would measure that.</li>
+      <li>A token that graduates keeps being tracked on its PumpSwap pool, priced the same way, so positions and copies run straight through graduation.</li>
+      <li><b>Feed delay</b> is measured against the chain's own slot clock. The copier lands one slot after it (at least two slots after the wallet): that is the best a copier on this feed could do, since a transaction lands in the next slot at the earliest. The Paper tab's live copies measure what actually happens.</li>
     </ul></div></details>
   </section>
 
