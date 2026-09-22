@@ -144,7 +144,10 @@ python -m hl_screener pump report      # rank now from what was collected
   never count as trading.
 - **Copier profit is replayed, not modelled.** A copier landing `--latency-slots` (2, about 0.8 s)
   after the wallet buys at the curve state left by every earlier trade, sells the same way after
-  the wallet's first sell, pays pump.fun fees and 0.0005 SOL per transaction.
+  the wallet's first sell, and pays pump.fun's fee plus `TX_COST_SOL` (0.0015 SOL) on each of the two
+  transactions: the 0.000005 SOL signature fee, 0.0005 SOL of priority fee and a 0.001 SOL Jito tip.
+  That is about 3% of a 0.1 SOL copy per round trip. The last two are auctions, so they are
+  assumptions in one place, not quotes: change them and see which wallets still pay to copy.
 - **Golden** = copier profitable in both halves of the window, wallet profitable in both halves,
   two best tokens under half its winnings, it launches no tokens, it is not in a cluster, and the
   window spans 12 hours or more.

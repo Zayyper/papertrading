@@ -3,8 +3,8 @@ import struct
 import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
-                                 b58, build_report, copy_trade, paper_series, parse_amm_trade, parse_create, parse_trade,
-                                 twins, update_snipers)
+                                 BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
+                                 paper_series, parse_amm_trade, parse_create, parse_trade, twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -154,7 +154,7 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
     trade(125, Z, True, 10**9)            # due: the copy sells at the state G's sell left
     fills = col.c.execute("SELECT side, trigger_slot, land_slot, pnl, timed_out FROM pfills ORDER BY id").fetchall()
     assert [f[:3] for f in fills] == [("buy", 100, 102), ("sell", 120, 122)]
-    assert abs(fills[1][3] - copy_trade(states[(mint, 101)], states[(mint, 120)], 0.1, 0.0005)) < 1e-6
+    assert abs(fills[1][3] - copy_trade(states[(mint, 101)], states[(mint, 120)], 0.1, TX_COST_SOL)) < 1e-6
 
     quiet, cv2 = bytes([10]) * 32, Curve()
     trade(200, G, True, 10**9, m=quiet, cv=cv2)   # nothing trades after this: the timeout lands the copy
@@ -197,6 +197,14 @@ def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     assert series[0] == [1_790_000_100, 0.0, 0.0] and len(series) == 2      # 0 when followed, then the 5-minute point
     assert abs(series[1][2] - w["own_roi"]) < 1e-12 and series[1][1] == (w["total"] / 0.1 if w["copied"] else 0.0)
     col.c.close()
+
+
+def test_a_copy_pays_signature_priority_and_tip_on_both_transactions():
+    entry, exit_ = (31 * 10**9, 10**15), (36 * 10**9, 9 * 10**14)
+    assert abs(TX_COST_SOL - (BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL)) < 1e-12 and TX_COST_SOL >= 0.001
+    free = copy_trade(entry, exit_, 0.1, 0.0)
+    assert abs(free - copy_trade(entry, exit_, 0.1, TX_COST_SOL) - 2 * TX_COST_SOL) < 1e-12   # in and out
+    assert 2 * TX_COST_SOL / 0.1 > 0.02                          # over 2% of the stake: it has to show up in the ranking
 
 
 def test_top_snipers_rotate_and_a_dropped_one_still_exits(tmp_path):

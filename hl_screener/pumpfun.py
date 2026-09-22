@@ -44,6 +44,12 @@ D_POOL = hashlib.sha256(b"event:CreatePoolEvent").digest()[:8]
 SOL_QUOTE = bytes(32)          # quote_mint = default pubkey: the curve is quoted in native SOL
 WSOL = "So11111111111111111111111111111111111111112"        # a PumpSwap pool quoted in SOL
 FEE = 0.0125                   # 0.95 % protocol + 0.30 % creator per side, the common case (ponytail: per-token creator fees vary; read them from the events if it matters)
+# what a copied transaction costs on top of pump.fun's fee. A copy that wants the next block pays for it:
+# the signature fee is fixed, the priority fee and the tip are auctions, so these are assumptions, not quotes.
+BASE_FEE_SOL = 0.000005        # Solana's signature fee, 5,000 lamports
+PRIORITY_SOL = 0.0005          # compute-unit price a fill that cannot wait has to pay
+TIP_SOL = 0.001                # Jito tip: what buys a place at the top of the block
+TX_COST_SOL = BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL   # charged on the copy's buy and again on its sell
 LAMPORTS = 1e9
 MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
 SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
@@ -241,10 +247,11 @@ class PaperFollow:
     moment a report flags it, and kept after that. Its first buy of each token is copied with `stake_sol`,
     landing `latency_slots` after it, or right after the newest slot the feed has shown if the feed lags more;
     the copy is sold when the wallet first sells, the same way. Priced on the live curve at the wallet's own
-    fee rate plus `tx_cost_sol` per transaction: the report's replay rules, so the two compare directly.
+    fee rate plus `tx_cost_sol` per transaction (signature, priority fee, tip): the report's replay rules,
+    so the two compare directly.
     Nothing is ever sent to Solana."""
 
-    def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = 0.0005):
+    def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL):
         self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
         self.follow: set[str] = set()
         self.sniper_cfg = {"top": SNIPER_TOP, "every_s": SNIPER_EVERY_S, "window_h": SNIPER_WINDOW_H}   # shown on the page
@@ -405,6 +412,7 @@ class PaperFollow:
         cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
         recent = [dict(zip(cols, r)) for r in self.c.execute(f"SELECT {', '.join(cols)} FROM pfills ORDER BY id DESC LIMIT 50")]
         return {"at": int(time.time()), "stake_sol": self.stake, "latency_slots": self.L, "tx_cost_sol": self.tx,
+                "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL},
                 "snipers": self.sniper_cfg, "pending": sum(len(v) for v in self.pending.values()),
                 "wallets": sorted(rows.values(), key=lambda r: r["added_at"] or 0), "open": open_, "recent": recent}
 
@@ -800,7 +808,9 @@ def _state_before(c: sqlite3.Connection, mint: int, slot: int | None) -> tuple[i
 def copy_trade(entry: tuple[int, int], exit_: tuple[int, int], stake_sol: float, tx_cost_sol: float,
                fee_in: float = FEE, fee_out: float = FEE) -> float:
     """SOL PnL of buying `stake_sol` at reserves `entry` and selling everything at reserves `exit_`
-    (bonding curve or PumpSwap pool: both are constant product on the stored reserves)."""
+    (bonding curve or PumpSwap pool: both are constant product on the stored reserves). `tx_cost_sol` is
+    everything one transaction costs outside pump.fun's own fee - signature, priority fee, tip - and is
+    paid twice, once to get in and once to get out."""
     vsol, vtok = entry
     net = stake_sol * LAMPORTS / (1 + fee_in)
     tokens = vtok - vsol * vtok / (vsol + net)
@@ -858,7 +868,7 @@ def twins(c: sqlite3.Connection, wallet: int, max_positions: int = 1000) -> int:
 
 
 def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10, min_snipes: int = 5, latency_slots: int | None = None,
-                 stake_sol: float = 0.1, tx_cost_sol: float = 0.0005, top: int = 100, max_positions: int = 1000,
+                 stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, top: int = 100, max_positions: int = 1000,
                  min_hours: float = 12) -> dict[str, Any]:
     """`min_hours`: no wallet is called golden before the window spans this long. Golden wallets get followed
     for good, so a verdict from the first minutes of data would pin noise to the paper test.
@@ -870,7 +880,8 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
         if latency_slots is None:
             latency_slots = max(2, measured + 1) if measured is not None else 2
         params = {"snipe_slots": snipe_slots, "min_tokens": min_tokens, "min_snipes": min_snipes, "latency_slots": latency_slots,
-                  "latency_measured_p50": measured, "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours}
+                  "latency_measured_p50": measured, "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours,
+                  "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL}}
         t0, t1, n_mints = c.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM mints").fetchone()
         if not n_mints:
             return {"generated": int(t_build), "params": params, "empty": True}
