@@ -4,7 +4,8 @@ import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
-                                 paper_series, parse_amm_trade, parse_create, parse_trade, twins, update_snipers)
+                                 creator_sim, paper_series, parse_amm_trade, parse_create, parse_trade, twins,
+                                 update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -196,6 +197,43 @@ def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     series = paper_series(col.c)[b58(G)]
     assert series[0] == [1_790_000_100, 0.0, 0.0] and len(series) == 2      # 0 when followed, then the 5-minute point
     assert abs(series[1][2] - w["own_roi"]) < 1e-12 and series[1][1] == (w["total"] / 0.1 if w["copied"] else 0.0)
+    col.c.close()
+
+
+def test_following_a_coin_maker_buys_every_launch_and_exits_on_its_sell_or_the_timeout(tmp_path):
+    col = Collector(tmp_path / "pump.db")
+    dev, X = bytes([120]) * 32, bytes([121]) * 32
+    now, states = int(time.time()), {}
+
+    def launch(k, slot, dev_sells):
+        m, cv = bytes([130 + k]) * 32, Curve()
+        col.on_logs(slot, logs(create_bytes(m, dev, ts=now)))
+        tok = cv.buy(10**9)                                  # a sniper buys in the creation slot: that is our entry price
+        col.on_logs(slot, logs(trade_bytes(m, X, True, 10**9, tok, cv.vsol, cv.vtok, ts=now)))
+        states[(k, "entry")] = (cv.vsol, cv.vtok)
+        dev_tok = cv.buy(2 * 10**8)                          # the dev's own bag, bought two slots later
+        col.on_logs(slot + 2, logs(trade_bytes(m, dev, True, 2 * 10**8, dev_tok, cv.vsol, cv.vtok, ts=now + 1)))
+        states[(k, "beforesell")] = (cv.vsol, cv.vtok)
+        if dev_sells:
+            col.on_logs(slot + 20, logs(trade_bytes(m, dev, False, cv.sell(dev_tok), dev_tok, cv.vsol, cv.vtok, ts=now + 60)))
+            states[(k, "afterdump")] = (cv.vsol, cv.vtok)
+            col.on_logs(slot + 40, logs(trade_bytes(m, X, False, cv.sell(tok), tok, cv.vsol, cv.vtok, ts=now + 120)))
+        return m
+
+    launch(0, 1000, True)
+    launch(1, 2000, True)
+    launch(2, 3000, False)                                   # never sells: the copy has to time out
+    col.flush()
+    dev_id = col.c.execute("SELECT id FROM wallets WHERE addr = ?", (b58(dev),)).fetchone()[0]
+    sim = creator_sim(col.c, dev_id, now + 3600, latency_slots=2, stake_sol=0.1, tx_cost_sol=TX_COST_SOL,
+                      hold_s=300, max_positions=10)
+    assert sim["n"] == 3 and sim["dumped"] == 2                # every launch replayed, two of them dumped
+    # it lands at the price the creation-slot sniper left, and gets out two slots after the dev's sell: after the dump
+    dumped = sum(copy_trade(states[(k, "entry")], states[(k, "afterdump")], 0.1, TX_COST_SOL, 0.0125, 0.0125) for k in (0, 1))
+    timed_out = copy_trade(states[(2, "entry")], states[(2, "beforesell")], 0.1, TX_COST_SOL, 0.0125, 0.0125)
+    assert abs(sim["pnl"] - (dumped + timed_out)) < 1e-9
+    assert dumped / 2 < timed_out                              # selling into the dev's dump is the expensive exit
+    assert sim["dump_min"] == 1.0                              # 60 s from creation to the dev's first sell
     col.c.close()
 
 

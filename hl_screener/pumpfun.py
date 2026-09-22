@@ -828,6 +828,53 @@ def _fee_rate(c: sqlite3.Connection, wallet: int, mint: int, buy: int, slot: int
     return row[0] if row and row[0] is not None else FEE
 
 
+CREATORS_SQL = """
+SELECT m.creator, w.addr, COUNT(*) AS launches, SUM(m.pool IS NOT NULL) AS graduated
+FROM mints m JOIN wallets w ON w.id = m.creator
+GROUP BY m.creator HAVING launches >= :min_launches ORDER BY launches DESC LIMIT :top
+"""
+
+
+def _mint_fee_rate(c: sqlite3.Connection, mint: int, buy: int) -> float:
+    """The fee rate this token charges: 1.25 % on the curve, less on PumpSwap, and creators can set their own."""
+    row = c.execute("SELECT fee * 1.0 / sol FROM trades WHERE mint=? AND buy=? AND sol > 0 LIMIT 1", (mint, buy)).fetchone()
+    return row[0] if row and row[0] is not None else FEE
+
+
+def creator_sim(c: sqlite3.Connection, creator: int, mid: float, latency_slots: int, stake_sol: float, tx_cost_sol: float,
+                hold_s: float, max_positions: int) -> dict[str, Any]:
+    """Follow the coin maker: buy every token this wallet launches, `latency_slots` after the creation slot - the
+    earliest a watcher of that wallet could land - and sell when the creator first sells (same latency) or after
+    `hold_s`, whichever comes first. Unlike copying a trade, the wallet to watch is known before it acts."""
+    out: dict[str, Any] = {"n": 0, "pnl": 0.0, "wins": 0, "dumped": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0}
+    hold_slots, dumps = max(1, int(hold_s / 0.4)), []
+    for mint, cslot, cts in c.execute("SELECT id, slot, ts FROM mints WHERE creator = ? ORDER BY ts DESC LIMIT ?",
+                                      (creator, max_positions)).fetchall():
+        entry = _state_before(c, mint, cslot + latency_slots)
+        if not entry or entry[0] <= 0 or entry[1] <= 0:
+            continue                                        # nobody traded it before we could land: no price to pay
+        dump = c.execute("SELECT slot, ts FROM trades WHERE mint = ? AND wallet = ? AND buy = 0 ORDER BY slot LIMIT 1",
+                         (mint, creator)).fetchone()
+        exit_slot = min(dump[0] + latency_slots, cslot + hold_slots) if dump else cslot + hold_slots
+        p = copy_trade(entry, _state_before(c, mint, exit_slot) or entry, stake_sol, tx_cost_sol,
+                       _mint_fee_rate(c, mint, 1), _mint_fee_rate(c, mint, 0))
+        half = "h1" if cts < mid else "h2"
+        out["n"] += 1
+        out["pnl"] += p
+        out["wins"] += p > 0
+        out["n_" + half] += 1
+        out["pnl_" + half] += p
+        if dump:
+            out["dumped"] += 1
+            dumps.append((dump[1] - cts) / 60)
+    for k in ("", "_h1", "_h2"):
+        n = out["n" + k]
+        out["roi" + k] = out["pnl" + k] / (n * stake_sol) if n else None
+    dumps.sort()
+    out["dump_min"] = dumps[len(dumps) // 2] if dumps else None
+    return out
+
+
 def copy_sim(c: sqlite3.Connection, wallet: int, mid: float, latency_slots: int, stake_sol: float, tx_cost_sol: float,
              max_positions: int) -> dict[str, Any]:
     """Follow every buy of `wallet` on tokens it did not launch: enter `latency_slots` after its first buy,
@@ -869,7 +916,7 @@ def twins(c: sqlite3.Connection, wallet: int, max_positions: int = 1000) -> int:
 
 def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10, min_snipes: int = 5, latency_slots: int | None = None,
                  stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, top: int = 100, max_positions: int = 1000,
-                 min_hours: float = 12) -> dict[str, Any]:
+                 min_hours: float = 12, min_launches: int = 3, hold_s: float = 300) -> dict[str, Any]:
     """`min_hours`: no wallet is called golden before the window spans this long. Golden wallets get followed
     for good, so a verdict from the first minutes of data would pin noise to the paper test.
     `latency_slots` None: the feed delay the collector measured (median) plus one slot to send, at least 2."""
@@ -881,7 +928,8 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
             latency_slots = max(2, measured + 1) if measured is not None else 2
         params = {"snipe_slots": snipe_slots, "min_tokens": min_tokens, "min_snipes": min_snipes, "latency_slots": latency_slots,
                   "latency_measured_p50": measured, "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours,
-                  "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL}}
+                  "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL},
+                  "min_launches": min_launches, "hold_s": hold_s}
         t0, t1, n_mints = c.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM mints").fetchone()
         if not n_mints:
             return {"generated": int(t_build), "params": params, "empty": True}
@@ -924,12 +972,21 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
                 "pnl_h1_sol", "pnl_h2_sol", "top2_share", "avg_hold_min", "launched", "twins", "copy_n", "copy_roi", "copy_roi_h1",
                 "copy_roi_h2", "copy_win_rate", "golden")
         slim = lambda rs: [{k: r.get(k) for k in keep} for r in rs]  # noqa: E731
+        creators = []                                       # follow the coin maker: its next launch is a known event
+        for cid, addr, launches, graduated in c.execute(CREATORS_SQL, {"min_launches": min_launches, "top": top}):
+            sim = creator_sim(c, cid, mid, latency_slots, stake_sol, tx_cost_sol, hold_s, min(max_positions, 200))
+            if sim["n"]:
+                creators.append({"addr": addr, "launches": launches, "graduated": graduated, "grad_share": graduated / launches,
+                                 "replayed": sim["n"], "pnl_sol": sim["pnl"], "roi": sim["roi"], "roi_h1": sim["roi_h1"],
+                                 "roi_h2": sim["roi_h2"], "win_rate": sim["wins"] / sim["n"], "dump_share": sim["dumped"] / sim["n"],
+                                 "dump_min": sim["dump_min"]})
         stats = get_meta(c, "stats", {}) or {}
         return {"generated": int(time.time()), "build_s": round(time.time() - t_build, 1), "params": params,
                 "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},
                 "counts": {"tokens": n_mints, "graduated": c.execute("SELECT COUNT(*) FROM mints WHERE pool IS NOT NULL").fetchone()[0],
                            "trades": stats.get("trades"), "wallets_ranked": len(rows)},
-                "base": base, "traders": slim(sorted(cands, key=lambda r: r.get("copy_roi") or -9, reverse=True)), "snipers": slim(snipers)}
+                "base": base, "traders": slim(sorted(cands, key=lambda r: r.get("copy_roi") or -9, reverse=True)), "snipers": slim(snipers),
+                "creators": sorted(creators, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)}
     finally:
         c.close()
 
@@ -955,6 +1012,12 @@ def print_report(rep: dict[str, Any]) -> None:
     for r in rep["traders"][:10]:
         roi = f"{r['copy_roi']:+.1%}" if r["copy_roi"] is not None else "n/a"
         print(f"  {r['addr']}  tokens {r['n']:>4}  pnl {r['pnl_sol']:+8.2f} SOL  win {r['win_rate']:.0%}  copier {roi}{'  GOLDEN' if r['golden'] else ''}")
+    if rep.get("creators"):
+        print(f"\ncoin makers (buy every launch {rep['params']['latency_slots']} slots after creation, sell on its first sell "
+              f"or after {rep['params']['hold_s'] / 60:.0f} min):")
+        for r in rep["creators"][:10]:
+            roi = f"{r['roi']:+.1%}" if r["roi"] is not None else "n/a"
+            print(f"  {r['addr']}  launches {r['launches']:>4}  graduated {r['grad_share']:>4.0%}  sells own {r['dump_share']:>4.0%}  buyer {roi}")
     print("\ntop snipers (first buy within", rep["params"]["snipe_slots"], "slots of creation):")
     for r in rep["snipers"][:10]:
         print(f"  {r['addr']}  snipes {r['snipes']:>5}  same-slot {r['block0']:>5}  snipe pnl {r['snipe_pnl_sol']:+8.2f} SOL")

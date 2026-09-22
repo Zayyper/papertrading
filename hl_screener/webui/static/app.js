@@ -883,6 +883,22 @@
       { key: "n", label: "Tokens", num: true, render: (r) => fmtInt(r.n) },
       { key: "pnl_sol", label: "All PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
     ], snipers, { sortKey: "snipes", dir: -1, empty });
+    $("#pump-makers-rule").textContent = rep.generated
+      ? `Buy ${p.stake_sol} SOL of every token the wallet launches, landing ${p.latency_slots} slots after the creation slot, sell when the maker first sells (same delay) or after ${Math.round((p.hold_s ?? 300) / 60)} minutes, whichever comes first. Same curve prices, fee, priority fee and tip as everywhere else, and ${p.min_launches ?? 3}+ launches to appear here.`
+      : "";
+    sortableTable($("#pump-makers"), [
+      { key: "addr", label: "Maker", render: (r) => solscan(r.addr) },
+      { key: "launches", label: "Launches", num: true, render: (r) => fmtInt(r.launches) },
+      { key: "grad_share", label: "Graduated", num: true, title: "share of its tokens that reached PumpSwap", render: (r) => fmtPct(r.grad_share, 0) },
+      { key: "dump_share", label: "Sells own", num: true, title: "share of its launches where the maker sold its own bag", render: (r) => fmtPct(r.dump_share, 0) },
+      { key: "dump_min", label: "Sells after", num: true, title: "median minutes from launch to the maker's first sell", render: (r) => isNum(r.dump_min) ? fmtNum(r.dump_min, 1) + " min" : "never" },
+      { key: "roi", label: "Buyer ROI", num: true, title: "profit per SOL put into its launches, after the fee, the priority fee and the tip", render: (r) => pct(r.roi) },
+      { key: "roi_h1", label: "1st half", num: true, render: (r) => pct(r.roi_h1) },
+      { key: "roi_h2", label: "2nd half", num: true, render: (r) => pct(r.roi_h2) },
+      { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
+      { key: "pnl_sol", label: "PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
+      { key: "replayed", label: "Replayed", num: true, title: "launches that had a price to buy at", render: (r) => fmtInt(r.replayed) },
+    ], rep.creators || [], { sortKey: "roi", dir: -1, empty });
   }
 
   // ---------------------------------------------------------------- config

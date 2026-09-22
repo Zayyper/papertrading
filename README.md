@@ -164,6 +164,11 @@ python -m hl_screener pump report      # rank now from what was collected
   still exits on its sell), and each one gets its own pair of lines on the chart, like a golden
   wallet. They are ranked on activity, not on profit: whether copying them pays is what the chart
   answers, and same-slot snipes are copied two slots late because that is the earliest anyone could.
+- **Coin makers** are ranked too: every wallet with `min_launches` (3) or more launches in the window,
+  with the share of its tokens that graduated, how often and how fast it sells its own bag, and a replay
+  of buying every one of its launches — in `latency_slots` after the creation slot, out when the maker
+  first sells (same delay, so the copy sells into its dump) or after `hold_s` (5 min), whichever comes
+  first. It is the one strategy where the wallet to watch is known before it acts.
 - The page's **Pump** tab shows the collector status, base rates, the followed golden wallets, copy
   candidates and snipers. The **Paper** tab charts each Hyperliquid copy account against the
   leader's own account the same way.
