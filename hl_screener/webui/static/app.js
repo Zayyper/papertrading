@@ -723,6 +723,8 @@
       : tile("Collector", live ? "live" : "stalled", `${(st.ws || "").startsWith("fallback") ? "on the fallback feed · " : ""}heartbeat ${ago(hb)} · ${fmtInt(st.reconnects || 0)} drops, ${elapsed(st.gap_s || 0)} lost`) +
         tile("Feed delay", isNum(st.lag_p50) ? `${st.lag_p50} slot${st.lag_p50 === 1 ? "" : "s"}` : "measuring", isNum(st.lag_p50) ? `behind the chain, about ${fmtNum(st.lag_p50 * 0.4, 1)} s · p90 ${st.lag_p90}, p99 ${st.lag_p99}` : "from the chain's slot clock") +
         tile("Collecting for", isNum(st.since) ? elapsed(d.now - st.since) : "n/a", "since the first start") +
+        tile("Server", isNum(st.disk_free_gb) ? `${fmtNum(st.disk_free_gb, 1)} GB free` : "n/a",
+             `disk, of ${fmtNum(st.disk_total_gb, 0)} GB · memory ${isNum(st.mem_avail_gb) ? `${fmtNum(st.mem_avail_gb, 1)} of ${fmtNum(st.mem_total_gb, 0)} GB free` : "n/a"} · this store grows about 0.5 GB a day`) +
         tile("Tokens seen", fmtInt(st.mints), `${fmtInt(st.graduated || 0)} graduated to PumpSwap · ${fmtInt(st.non_sol || 0)} not in SOL, skipped`) +
         tile("Trades stored", fmtInt(st.trades), `${fmtInt(st.amm_trades || 0)} on PumpSwap · ${st.parse_errors ? `${fmtInt(st.parse_errors)} undecodable` : "every event decoded"}`) +
         tile("Ranking", rep.generated ? ago(d.now - rep.generated) : "not yet", rep.generated ? `${fmtInt((rep.counts || {}).wallets_ranked)} wallets · refreshed every 30 min` : "the first one comes 30 min after start");

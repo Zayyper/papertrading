@@ -369,6 +369,20 @@ def update_follow(db_path: str | Path, rep: dict[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 # collector
 # ---------------------------------------------------------------------------
+def host_resources(path: Path) -> dict[str, float]:
+    """Free disk where the database lives, and free memory (Linux): this store grows about 0.5 GB a day."""
+    import shutil
+    du = shutil.disk_usage(path)
+    out = {"disk_free_gb": round(du.free / 1e9, 1), "disk_total_gb": round(du.total / 1e9, 1)}
+    try:
+        with open("/proc/meminfo") as fh:
+            mem = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in fh)}
+        out.update(mem_avail_gb=round(mem["MemAvailable"] / 1e6, 1), mem_total_gb=round(mem["MemTotal"] / 1e6, 1))
+    except (OSError, KeyError, ValueError):
+        pass
+    return out
+
+
 def _no_key(text: str) -> str:
     """Error texts can echo the URL: never let an API key reach the logs or the page."""
     import re
@@ -499,6 +513,7 @@ class Collector:
             if self.lags:
                 s = sorted(self.lags)
                 self.stats.update({f"lag_p{p}": s[min(len(s) - 1, len(s) * p // 100)] for p in (50, 90, 99)})
+            self.stats.update(host_resources(self.db_path.parent))
             self.last_paper = now
         self.stats["heartbeat"] = int(now)
         set_meta(self.c, "stats", self.stats)
@@ -547,8 +562,10 @@ class Collector:
                             self.flush()
                             last_flush = now
                         if now - last_line >= 60:
-                            log.info("last minute: %d trades, %d new tokens (total %d / %d)", self.stats["trades"] - seen[0],
-                                     self.stats["mints"] - seen[1], self.stats["trades"], self.stats["mints"])
+                            log.info("last minute: %d trades, %d new tokens (total %d / %d) | delay %s slot(s) | disk %s of %s GB free, "
+                                     "memory %s of %s GB free", self.stats["trades"] - seen[0], self.stats["mints"] - seen[1],
+                                     self.stats["trades"], self.stats["mints"], self.stats.get("lag_p50"), self.stats.get("disk_free_gb"),
+                                     self.stats.get("disk_total_gb"), self.stats.get("mem_avail_gb", "?"), self.stats.get("mem_total_gb", "?"))
                             seen, last_line = (self.stats["trades"], self.stats["mints"]), now
                         if now - last_forget >= 3600:
                             self.forget_old_mints()
