@@ -887,8 +887,9 @@
     $("#pump-makers-rule").textContent = rep.generated
       ? `Buy ${p.stake_sol} SOL of every token the wallet launches, landing ${p.latency_slots} slots after the creation slot, sell when the maker first sells (same delay) or after ${Math.round((p.hold_s ?? 300) / 60)} minutes, whichever comes first. Same curve prices, fee, priority fee and tip as everywhere else, and ${p.min_launches ?? 3}+ launches to appear here. Every launch is kept for good, so this history goes on growing after the trades behind it are pruned.`
       : "";
-    sortableTable($("#pump-makers"), [
-      { key: "addr", label: "Maker", render: (r) => solscan(r.addr) },
+    const makerCols = (label) => [
+      { key: "addr", label, render: (r) => solscan(r.addr) + (r.n_wallets > 1 ? ` <span class="badge" title="${fmtInt(r.n_wallets)} wallets look like this one operator">×${fmtInt(r.n_wallets)} wallets</span>` : "") +
+        (r.operator && r.operator !== r.addr ? ` <span class="badge" title="grouped with ${esc(r.operator)}">linked</span>` : "") },
       { key: "launches", label: "Launches", num: true, render: (r) => fmtInt(r.launches) },
       { key: "grad_share", label: "Graduated", num: true, title: "share of its tokens that reached PumpSwap", render: (r) => fmtPct(r.grad_share, 0) },
       { key: "dump_share", label: "Sells own", num: true, title: "share of its launches where the maker sold its own bag", render: (r) => fmtPct(r.dump_share, 0) },
@@ -900,7 +901,10 @@
       { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
       { key: "pnl_sol", label: "PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
       { key: "replayed", label: "Replayed", num: true, title: "launches that had a price to buy at", render: (r) => fmtInt(r.replayed) },
-    ], rep.creators || [], { sortKey: "roi", dir: -1, empty });
+    ];
+    sortableTable($("#pump-operators"), makerCols("Operator"), rep.operators || [],
+                  { sortKey: "roi", dir: -1, empty: "No wallet is linked to another yet: it takes three shared snipers, and a few launches each." });
+    sortableTable($("#pump-makers"), makerCols("Maker"), rep.creators || [], { sortKey: "roi", dir: -1, empty });
   }
 
   // ---------------------------------------------------------------- strategy: the same launches, different exits

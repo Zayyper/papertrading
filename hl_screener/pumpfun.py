@@ -22,6 +22,7 @@ import asyncio
 import base64
 import collections
 import hashlib
+import itertools
 import json
 import logging
 import sqlite3
@@ -214,7 +215,8 @@ CREATE TABLE IF NOT EXISTS launches (
   dev_sold_s REAL, peak REAL, n_trades INTEGER, n_buyers INTEGER,
   entry_vsol INTEGER, entry_vtok INTEGER, maker_vsol INTEGER, maker_vtok INTEGER, end_vsol INTEGER, end_vtok INTEGER,
   be_vsol INTEGER, be_vtok INTEGER, t20_vsol INTEGER, t20_vtok INTEGER, t50_vsol INTEGER, t50_vtok INTEGER,
-  t100_vsol INTEGER, t100_vtok INTEGER, fee_in REAL, fee_out REAL, stake REAL, latency INTEGER);
+  t100_vsol INTEGER, t100_vtok INTEGER, fee_in REAL, fee_out REAL, stake REAL, latency INTEGER,
+  buyers TEXT, dev_buy REAL);   -- who sniped it (our own wallet ids) and what the maker put into its own bag
 CREATE INDEX IF NOT EXISTS ix_launches_creator ON launches(creator, ts);
 CREATE INDEX IF NOT EXISTS ix_launches_ts ON launches(ts);
 """
@@ -229,7 +231,9 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     c.executescript(SCHEMA)
-    for ddl in ("ALTER TABLE mints ADD COLUMN pool TEXT",                    # before PumpSwap tracking
+    for ddl in ("ALTER TABLE launches ADD COLUMN buyers TEXT",               # before maker wallets were linked
+                "ALTER TABLE launches ADD COLUMN dev_buy REAL",
+                "ALTER TABLE mints ADD COLUMN pool TEXT",                    # before PumpSwap tracking
                 "ALTER TABLE follow ADD COLUMN golden_ever INTEGER DEFAULT 1",   # before the top snipers were followed too:
                 "ALTER TABLE follow ADD COLUMN sniper_now INTEGER DEFAULT 0",    # everyone already there was followed for being golden
                 "ALTER TABLE follow ADD COLUMN sniper_rank INTEGER"):
@@ -935,7 +939,22 @@ def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, lat
 
 LAUNCH_COLS = ("mint", "creator", "slot", "ts", "symbol", "graduated", "dev_sold_s", "peak", "n_trades", "n_buyers",
                "entry_vsol", "entry_vtok", "maker_vsol", "maker_vtok", "end_vsol", "end_vtok", "be_vsol", "be_vtok",
-               "t20_vsol", "t20_vtok", "t50_vsol", "t50_vtok", "t100_vsol", "t100_vtok", "fee_in", "fee_out", "stake", "latency")
+               "t20_vsol", "t20_vtok", "t50_vsol", "t50_vtok", "t100_vsol", "t100_vtok", "fee_in", "fee_out", "stake",
+               "latency", "buyers", "dev_buy")
+
+
+def _snipers_of(c: sqlite3.Connection, mint: int, cslot: int, creator: int, slots: int = 2, keep: int = 12) -> tuple[str, float]:
+    """Who bought this launch in its first slots, and what the maker put into its own bag. The buyers are stored as
+    our own wallet ids (that table is never pruned) because an operator's other wallets snipe its launches: that is
+    what links its next wallet to this one."""
+    buyers, dev = [], 0.0
+    for wallet, buy, sol in c.execute("SELECT wallet, buy, sol FROM trades WHERE mint = ? AND slot <= ? ORDER BY slot, rowid LIMIT 60",
+                                      (mint, cslot + slots)):
+        if wallet == creator:
+            dev += sol / LAMPORTS if buy else 0.0
+        elif buy and wallet not in buyers:
+            buyers.append(wallet)
+    return ",".join(str(w) for w in buyers[:keep]), dev
 
 
 def row_states(r: dict[str, Any]) -> dict[str, Any]:
@@ -967,9 +986,15 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
             for k in ("entry", "maker", "end", "be", "t20", "t50", "t100"):
                 flat += list(st[k]) if st and st[k] else [None, None]
             flat += [st["fee_in"], st["fee_out"], stake_sol, latency_slots] if st else [None, None, stake_sol, latency_slots]
-            rows.append(tuple(flat))
+            rows.append(tuple(flat + list(_snipers_of(c, mid, slot, creator))))
         if rows:
-            c.executemany(f"INSERT OR IGNORE INTO launches VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
+            c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
+        # launches settled before the snipers were recorded, while their trades are still here
+        late = c.execute("""SELECT l.mint, m.id, m.slot, m.creator FROM launches l JOIN mints m ON m.addr = l.mint
+                            WHERE l.buyers IS NULL LIMIT ?""", (limit,)).fetchall()
+        if late:
+            c.executemany("UPDATE launches SET buyers = ?, dev_buy = ? WHERE mint = ?",
+                          [(*_snipers_of(c, mid, slot, creator), addr) for addr, mid, slot, creator in late])
         c.commit()
         return len(rows)
     finally:
@@ -983,18 +1008,58 @@ def read_launches(c: sqlite3.Connection, days: float = 30, limit: int = 200_000)
     return [dict(zip(LAUNCH_COLS, r)) for r in cur.fetchall()]
 
 
-def maker_table(c: sqlite3.Connection, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, min_launches: int = 3,
-                days: float = 30, top: int = 200) -> list[dict[str, Any]]:
-    """Coin makers ranked on their stored launches: how often they launch, how often and how fast they dump their
-    own bag, and what buying every one of their launches (out when they sell) would have paid."""
-    rows = read_launches(c, days)
-    if not rows:
-        return []
-    mid, by = (min(r["ts"] for r in rows) + max(r["ts"] for r in rows)) / 2, {}
+def operator_groups(rows: list[dict[str, Any]], min_shared: int = 3, max_reach: int = 20) -> dict[str, str]:
+    """Maker wallets that look like one hand. A maker that rotates to a fresh wallet every few launches leaves one
+    thing behind: its own other wallets snipe its launches, so the same early buyers turn up again. A buyer that
+    shows up for many different makers is a sniper bot doing its rounds, so it links nothing.
+    Returns wallet -> the group's name (the wallet in it with the most launches). Probable, never proven."""
+    launched, seen = collections.Counter(), {}
     for r in rows:
-        m = by.setdefault(r["creator"], {"addr": r["creator"], "launches": 0, "graduated": 0, "replayed": 0, "dumped": 0,
-                                         "pnl": 0.0, "wins": 0, "dumps": [], "peaks": [], "n_h1": 0, "pnl_h1": 0.0,
-                                         "n_h2": 0, "pnl_h2": 0.0, "first": r["ts"], "last": r["ts"]})
+        launched[r["creator"]] += 1
+        if r.get("buyers"):
+            seen.setdefault(r["creator"], set()).update(r["buyers"].split(","))
+    reach: dict[str, set[str]] = {}                          # buyer -> the makers it sniped
+    for maker, buyers in seen.items():
+        for b in buyers:
+            reach.setdefault(b, set()).add(maker)
+    shared: collections.Counter = collections.Counter()
+    for makers in reach.values():
+        if 2 <= len(makers) <= max_reach:
+            shared.update(itertools.combinations(sorted(makers), 2))
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for (a, b), n in shared.items():
+        if n >= min_shared:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+    groups: dict[str, list[str]] = {}
+    for maker in seen:
+        groups.setdefault(find(maker), []).append(maker)
+    out = {}
+    for members in groups.values():
+        head = max(members, key=lambda w: (launched[w], w))   # the busiest wallet names the group
+        out.update({w: head for w in members})
+    return out
+
+
+def _agg_launches(rows: list[dict[str, Any]], key_of, stake_sol: float, tx_cost_sol: float, mid: float,
+                  min_launches: int) -> list[dict[str, Any]]:
+    """The same summary per maker wallet or per operator, depending on the key."""
+    by: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        k = key_of(r)
+        m = by.setdefault(k, {"addr": k, "wallets": set(), "launches": 0, "graduated": 0, "replayed": 0, "dumped": 0,
+                              "pnl": 0.0, "wins": 0, "dumps": [], "peaks": [], "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0,
+                              "pnl_h2": 0.0, "first": r["ts"], "last": r["ts"]})
+        m["wallets"].add(r["creator"])
         m["launches"] += 1
         m["graduated"] += bool(r["graduated"])
         m["first"], m["last"] = min(m["first"], r["ts"]), max(m["last"], r["ts"])
@@ -1017,14 +1082,31 @@ def maker_table(c: sqlite3.Connection, stake_sol: float = 0.1, tx_cost_sol: floa
             continue
         m["dumps"].sort()
         m["peaks"].sort()
-        med = lambda xs: xs[len(xs) // 2] if xs else None    # noqa: E731
+        med = lambda xs: xs[len(xs) // 2] if xs else None     # noqa: E731
         roi = lambda k: (m["pnl" + k] / (m["n" + k] * stake_sol) if m["n" + k] else None)   # noqa: E731
-        out.append({"addr": m["addr"], "launches": m["launches"], "graduated": m["graduated"], "replayed": m["replayed"],
-                    "grad_share": m["graduated"] / m["launches"], "pnl_sol": m["pnl"],
-                    "roi": m["pnl"] / (m["replayed"] * stake_sol), "roi_h1": roi("_h1"),
-                    "roi_h2": roi("_h2"), "win_rate": m["wins"] / m["replayed"], "dump_share": m["dumped"] / m["launches"],
+        out.append({"addr": m["addr"], "n_wallets": len(m["wallets"]), "launches": m["launches"], "graduated": m["graduated"],
+                    "replayed": m["replayed"], "grad_share": m["graduated"] / m["launches"], "pnl_sol": m["pnl"],
+                    "roi": m["pnl"] / (m["replayed"] * stake_sol), "roi_h1": roi("_h1"), "roi_h2": roi("_h2"),
+                    "win_rate": m["wins"] / m["replayed"], "dump_share": m["dumped"] / m["launches"],
                     "dump_min": med(m["dumps"]), "peak_med": med(m["peaks"]), "first": m["first"], "last": m["last"]})
-    return sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)[:top]
+    return sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)
+
+
+def maker_table(c: sqlite3.Connection, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, min_launches: int = 3,
+                days: float = 30, top: int = 200) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Coin makers on their stored launches - how often they launch, how often and how fast they dump their own bag,
+    and what buying every launch (out when they sell) would have paid - per wallet and per operator."""
+    rows = read_launches(c, days)
+    if not rows:
+        return [], []
+    mid = (min(r["ts"] for r in rows) + max(r["ts"] for r in rows)) / 2
+    groups = operator_groups(rows)
+    makers = _agg_launches(rows, lambda r: r["creator"], stake_sol, tx_cost_sol, mid, min_launches)
+    for m in makers:
+        m["operator"] = groups.get(m["addr"], m["addr"])
+    ops = [o for o in _agg_launches(rows, lambda r: groups.get(r["creator"], r["creator"]), stake_sol, tx_cost_sol,
+                                    mid, min_launches) if o["n_wallets"] > 1]
+    return makers[:top], ops[:top]
 
 
 def strategy_report(db_path: str | Path, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, min_launches: int = 3,
@@ -1167,14 +1249,14 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
         slim = lambda rs: [{k: r.get(k) for k in keep} for r in rs]  # noqa: E731
         # follow the coin maker: its next launch is a known event. From the stored launches, so this history keeps
         # growing after the trades behind it are pruned.
-        creators = maker_table(c, stake_sol, tx_cost_sol, min_launches, maker_days, top)
+        creators, operators = maker_table(c, stake_sol, tx_cost_sol, min_launches, maker_days, top)
         stats = get_meta(c, "stats", {}) or {}
         return {"generated": int(time.time()), "build_s": round(time.time() - t_build, 1), "params": params,
                 "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},
                 "counts": {"tokens": n_mints, "graduated": c.execute("SELECT COUNT(*) FROM mints WHERE pool IS NOT NULL").fetchone()[0],
                            "trades": stats.get("trades"), "wallets_ranked": len(rows)},
                 "base": base, "traders": slim(sorted(cands, key=lambda r: r.get("copy_roi") or -9, reverse=True)), "snipers": slim(snipers),
-                "creators": sorted(creators, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)}
+                "creators": creators, "operators": operators}
     finally:
         c.close()
 

@@ -4,8 +4,8 @@ import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
-                                 maker_table, paper_series, parse_amm_trade, parse_create, parse_trade, settle_launches,
-                                 strategy_sim, twins, update_snipers)
+                                 maker_table, operator_groups, paper_series, parse_amm_trade, parse_create, parse_trade,
+                                 settle_launches, strategy_sim, twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -227,7 +227,7 @@ def test_following_a_coin_maker_buys_every_launch_and_exits_on_its_sell_or_the_t
     col.flush()
     assert settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=300) == 3      # the window has closed on all three
     assert settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=300) == 0      # and they are frozen, not redone
-    maker = maker_table(col.c, stake_sol=0.1, tx_cost_sol=TX_COST_SOL, min_launches=3)[0]
+    maker = maker_table(col.c, stake_sol=0.1, tx_cost_sol=TX_COST_SOL, min_launches=3)[0][0]
     assert (maker["addr"], maker["launches"], maker["replayed"]) == (b58(dev), 3, 3)
     assert maker["dump_share"] == 2 / 3 and maker["dump_min"] == 1.0                 # 60 s from launch to its first sell
     # it lands at the price the creation-slot sniper left, and gets out two slots after the dev's sell: after the dump
@@ -278,6 +278,22 @@ def test_each_exit_rule_leaves_at_its_own_price(tmp_path):
     assert res["tp50"] > res["tp20"] > res["copy"]       # leaving before the dev did is what pays here
     assert res["copy"] < res["breakeven"] < res["tp50"]  # the stake came back early, the rest rode down with the dev
     col.c.close()
+
+
+def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():
+    def launch(creator, buyers, ts=0):
+        return {"creator": creator, "buyers": ",".join(buyers), "ts": ts}
+
+    crew, bot = ["11", "22", "33"], "99"                     # its own wallets, and a sniper bot buying everything
+    rows = [launch("A", crew), launch("A", crew), launch("B", crew), launch("B", crew + ["44"])]
+    rows += [launch(f"X{i}", [bot, str(1000 + i)]) for i in range(25)]      # the bot's rounds link nothing
+    g = operator_groups(rows, min_shared=3)
+    assert g["A"] == g["B"]                                  # three shared snipers: one hand behind both wallets
+    assert len({g[f"X{i}"] for i in range(25)}) == 25        # the bot is too busy to mean anything
+    assert g["A"] in ("A", "B")                              # the group is named after one of its own wallets
+
+    thin = [launch("C", ["11", "22"]), launch("D", ["11", "22", "55"])]     # only two in common
+    assert operator_groups(thin, min_shared=3)["C"] != operator_groups(thin, min_shared=3)["D"]
 
 
 def test_a_copy_pays_signature_priority_and_tip_on_both_transactions():

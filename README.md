@@ -170,6 +170,12 @@ python -m hl_screener pump report      # rank now from what was collected
   year of maker history costs a few hundred MB, while the trades behind it are still pruned after
   `PUMP_RETENTION_DAYS`. States are stored rather than profits, so the fee, priority fee and tip stay
   changeable afterwards — the maker ranking and the Strategy tab are recomputed from them each time.
+- **Operators** group maker wallets that are probably one hand. A maker that rotates to a fresh wallet
+  every few launches still needs its own other wallets to snipe its launches, so the same early buyers
+  turn up again: three shared snipers group two wallets, and a buyer that appears for more than 20
+  different makers is a sniper bot doing its rounds and links nothing. Each launch stores who sniped it
+  (our own wallet ids, that table is never pruned), so the grouping survives pruning too. Probable,
+  never proven — but it is what turns five launches per wallet into a sample worth reading.
 - **Coin makers** are ranked too: every wallet with `min_launches` (3) or more launches in the window,
   with the share of its tokens that graduated, how often and how fast it sells its own bag, and a replay
   of buying every one of its launches — in `latency_slots` after the creation slot, out when the maker
