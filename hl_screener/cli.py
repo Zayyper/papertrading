@@ -162,14 +162,17 @@ def main(argv: list[str] | None = None) -> int:
         if not db.exists():
             print(f"no data at {db}: run `python -m hl_screener pump collect` first", file=sys.stderr)
             return 1
+        settled = pumpfun.settle_launches(db)
+        if settled:
+            print(f"settled {settled:,} launches into the permanent history")
         rep = pumpfun.build_report(db, latency_slots=a.latency_slots, stake_sol=a.stake)
         pumpfun.save_report(db, rep)
         pumpfun.update_follow(db, rep)
         pumpfun.print_report(rep)
-        strat = pumpfun.strategy_report(db, latency_slots=a.latency_slots, stake_sol=a.stake)
+        strat = pumpfun.strategy_report(db, stake_sol=a.stake)
         pumpfun.save_meta(db, "strategies", strat)
         if strat.get("rules"):
-            print(f"\nexit rules on {strat['counts']['launches']:,} launches of repeat makers "
+            print(f"\nexit rules on {strat['counts']['launches']:,} launches by {strat['counts']['makers']:,} repeat makers "
                   f"(same entry, {strat['params']['hold_s'] / 60:.0f} min window):")
             for r in strat["rules"]:
                 print(f"  {r['rule']:<10} {r['roi']:+7.1%} per launch  won {r['win_rate']:>4.0%}  total {r['pnl_sol']:+8.2f} SOL")

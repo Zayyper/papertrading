@@ -885,7 +885,7 @@
       { key: "pnl_sol", label: "All PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
     ], snipers, { sortKey: "snipes", dir: -1, empty });
     $("#pump-makers-rule").textContent = rep.generated
-      ? `Buy ${p.stake_sol} SOL of every token the wallet launches, landing ${p.latency_slots} slots after the creation slot, sell when the maker first sells (same delay) or after ${Math.round((p.hold_s ?? 300) / 60)} minutes, whichever comes first. Same curve prices, fee, priority fee and tip as everywhere else, and ${p.min_launches ?? 3}+ launches to appear here.`
+      ? `Buy ${p.stake_sol} SOL of every token the wallet launches, landing ${p.latency_slots} slots after the creation slot, sell when the maker first sells (same delay) or after ${Math.round((p.hold_s ?? 300) / 60)} minutes, whichever comes first. Same curve prices, fee, priority fee and tip as everywhere else, and ${p.min_launches ?? 3}+ launches to appear here. Every launch is kept for good, so this history goes on growing after the trades behind it are pruned.`
       : "";
     sortableTable($("#pump-makers"), [
       { key: "addr", label: "Maker", render: (r) => solscan(r.addr) },
@@ -893,6 +893,7 @@
       { key: "grad_share", label: "Graduated", num: true, title: "share of its tokens that reached PumpSwap", render: (r) => fmtPct(r.grad_share, 0) },
       { key: "dump_share", label: "Sells own", num: true, title: "share of its launches where the maker sold its own bag", render: (r) => fmtPct(r.dump_share, 0) },
       { key: "dump_min", label: "Sells after", num: true, title: "median minutes from launch to the maker's first sell", render: (r) => isNum(r.dump_min) ? fmtNum(r.dump_min, 1) + " min" : "never" },
+      { key: "peak_med", label: "Best worth", num: true, title: "median of the most a copy was ever worth in the window, as a multiple of the stake", render: (r) => isNum(r.peak_med) ? "×" + fmtNum(r.peak_med, 2) : "n/a" },
       { key: "roi", label: "Buyer ROI", num: true, title: "profit per SOL put into its launches, after the fee, the priority fee and the tip", render: (r) => pct(r.roi) },
       { key: "roi_h1", label: "1st half", num: true, render: (r) => pct(r.roi_h1) },
       { key: "roi_h2", label: "2nd half", num: true, render: (r) => pct(r.roi_h2) },
@@ -914,11 +915,11 @@
     const best = rules[0], copy = rules.find((r) => r.rule === "copy");
     $("#strat-tiles").innerHTML = !rules.length
       ? `<div class="empty" style="grid-column: 1 / -1">${d.exists ? "No comparison yet: it is computed with the ranking, every 30 minutes." : "The pump.fun collector is not running yet."}</div>`
-      : tile("Launches", fmtInt((s.counts || {}).launches), `by wallets with ${p.min_launches}+ launches · ${fmtNum((s.window || {}).hours, 1)} h of data`) +
+      : tile("Launches", fmtInt((s.counts || {}).launches), `of ${fmtInt((s.counts || {}).all_launches)} kept · by ${fmtInt((s.counts || {}).makers)} makers with ${p.min_launches}+ launches`) +
         tile("Best rule", esc(best.rule), `${fmtPct(best.roi)} per launch · ${esc(RULE_LABEL[best.rule] || "")}`) +
         tile("Copying the maker", pct(copy ? copy.roi : null), copy && isNum(best.roi) && isNum(copy.roi) ? `${fmtPct(best.roi - copy.roi)} behind the best rule` : "the benchmark") +
         tile("Each copy", `${p.stake_sol} SOL`, `${fmtNum(p.tx_cost_sol, 4)} SOL a transaction · lands ${p.latency_slots} slots late`) +
-        tile("Window", `${Math.round((p.hold_s ?? 900) / 60)} min`, "then out at whatever it is worth") +
+        tile("Window", `${Math.round((p.hold_s ?? 900) / 60)} min`, `then out at whatever it is worth · ${fmtNum(((s.window || {}).hours || 0) / 24, 1)} days of launches kept`) +
         tile("Updated", s.generated ? ago(d.now - s.generated) : "never", s.build_s ? `took ${s.build_s}s` : "");
     $("#strat-rule").textContent = rules.length
       ? `Every launch bought with ${p.stake_sol} SOL ${p.latency_slots} slots after the creation slot — the earliest a watcher of that wallet could land — then sold by each rule in turn. Same curve prices, fee, priority fee and tip as everywhere else.`

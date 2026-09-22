@@ -207,6 +207,16 @@ CREATE TABLE IF NOT EXISTS ppos (wallet TEXT, mint TEXT, tok REAL, cost REAL, op
 CREATE TABLE IF NOT EXISTS opos (wallet TEXT, mint TEXT, cost REAL, proceeds REAL, tok REAL, PRIMARY KEY (wallet, mint));
 CREATE TABLE IF NOT EXISTS psnap (ts INTEGER, wallet TEXT, copy_pnl REAL, copy_cost REAL, own_pnl REAL, own_cost REAL);
 CREATE INDEX IF NOT EXISTS ix_psnap ON psnap(wallet, ts);
+-- one small permanent row per launch: trades are pruned after a few days, this is what keeps a maker's history.
+-- It stores the curve state each exit rule reached, not a profit, so the cost assumptions stay changeable.
+CREATE TABLE IF NOT EXISTS launches (
+  mint TEXT PRIMARY KEY, creator TEXT, slot INTEGER, ts INTEGER, symbol TEXT, graduated INTEGER,
+  dev_sold_s REAL, peak REAL, n_trades INTEGER, n_buyers INTEGER,
+  entry_vsol INTEGER, entry_vtok INTEGER, maker_vsol INTEGER, maker_vtok INTEGER, end_vsol INTEGER, end_vtok INTEGER,
+  be_vsol INTEGER, be_vtok INTEGER, t20_vsol INTEGER, t20_vtok INTEGER, t50_vsol INTEGER, t50_vtok INTEGER,
+  t100_vsol INTEGER, t100_vtok INTEGER, fee_in REAL, fee_out REAL, stake REAL, latency INTEGER);
+CREATE INDEX IF NOT EXISTS ix_launches_creator ON launches(creator, ts);
+CREATE INDEX IF NOT EXISTS ix_launches_ts ON launches(ts);
 """
 
 
@@ -738,6 +748,9 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
         last_report, last_top = time.time(), []
         while not halt.wait(sniper_every_s):
             try:
+                settled = settle_launches(db_path)              # freeze closed launches before their trades are pruned
+                if settled:
+                    log.info("settled %d launches", settled)
                 top = update_snipers(db_path, sniper_top)       # cheap: only the first slots of the window's tokens
                 if [a for a, _ in top] != last_top:
                     log.info("top %d snipers: %s", len(top), ", ".join(f"{a[:4]}…{a[-4:]} ({n})" for a, n in top))
@@ -833,51 +846,10 @@ def _fee_rate(c: sqlite3.Connection, wallet: int, mint: int, buy: int, slot: int
     return row[0] if row and row[0] is not None else FEE
 
 
-CREATORS_SQL = """
-SELECT m.creator, w.addr, COUNT(*) AS launches, SUM(m.pool IS NOT NULL) AS graduated
-FROM mints m JOIN wallets w ON w.id = m.creator
-GROUP BY m.creator HAVING launches >= :min_launches ORDER BY launches DESC LIMIT :top
-"""
-
-
 def _mint_fee_rate(c: sqlite3.Connection, mint: int, buy: int) -> float:
     """The fee rate this token charges: 1.25 % on the curve, less on PumpSwap, and creators can set their own."""
     row = c.execute("SELECT fee * 1.0 / sol FROM trades WHERE mint=? AND buy=? AND sol > 0 LIMIT 1", (mint, buy)).fetchone()
     return row[0] if row and row[0] is not None else FEE
-
-
-def creator_sim(c: sqlite3.Connection, creator: int, mid: float, latency_slots: int, stake_sol: float, tx_cost_sol: float,
-                hold_s: float, max_positions: int) -> dict[str, Any]:
-    """Follow the coin maker: buy every token this wallet launches, `latency_slots` after the creation slot - the
-    earliest a watcher of that wallet could land - and sell when the creator first sells (same latency) or after
-    `hold_s`, whichever comes first. Unlike copying a trade, the wallet to watch is known before it acts."""
-    out: dict[str, Any] = {"n": 0, "pnl": 0.0, "wins": 0, "dumped": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0}
-    hold_slots, dumps = max(1, int(hold_s / 0.4)), []
-    for mint, cslot, cts in c.execute("SELECT id, slot, ts FROM mints WHERE creator = ? ORDER BY ts DESC LIMIT ?",
-                                      (creator, max_positions)).fetchall():
-        entry = _state_before(c, mint, cslot + latency_slots)
-        if not entry or entry[0] <= 0 or entry[1] <= 0:
-            continue                                        # nobody traded it before we could land: no price to pay
-        dump = c.execute("SELECT slot, ts FROM trades WHERE mint = ? AND wallet = ? AND buy = 0 ORDER BY slot LIMIT 1",
-                         (mint, creator)).fetchone()
-        exit_slot = min(dump[0] + latency_slots, cslot + hold_slots) if dump else cslot + hold_slots
-        p = copy_trade(entry, _state_before(c, mint, exit_slot) or entry, stake_sol, tx_cost_sol,
-                       _mint_fee_rate(c, mint, 1), _mint_fee_rate(c, mint, 0))
-        half = "h1" if cts < mid else "h2"
-        out["n"] += 1
-        out["pnl"] += p
-        out["wins"] += p > 0
-        out["n_" + half] += 1
-        out["pnl_" + half] += p
-        if dump:
-            out["dumped"] += 1
-            dumps.append((dump[1] - cts) / 60)
-    for k in ("", "_h1", "_h2"):
-        n = out["n" + k]
-        out["roi" + k] = out["pnl" + k] / (n * stake_sol) if n else None
-    dumps.sort()
-    out["dump_min"] = dumps[len(dumps) // 2] if dumps else None
-    return out
 
 
 def _value(state: tuple[int, int], tok: float, fee_out: float) -> float:
@@ -886,18 +858,18 @@ def _value(state: tuple[int, int], tok: float, fee_out: float) -> float:
     return (vsol - vsol * vtok / (vtok + tok)) * (1 - fee_out) / LAMPORTS if vtok > 0 and tok > 0 else 0.0
 
 
-def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, latency_slots: int, stake_sol: float,
-                 tx_cost_sol: float, hold_s: float, targets: tuple[float, ...] = (0.2, 0.5, 1.0)) -> dict[str, float] | None:
-    """One launch, one entry, every exit rule, so they can be compared on the same token:
+def strategy_states(c: sqlite3.Connection, mint: int, cslot: int, cts: int, creator: int, latency_slots: int,
+                    stake_sol: float, hold_s: float, targets: tuple[float, ...] = (0.2, 0.5, 1.0)) -> dict[str, Any] | None:
+    """Where each exit rule lands on one launch, as curve states, plus what the launch did:
 
     copy       out when the maker first sells, the plain copy
-    breakeven  take the stake back the moment the position is worth it, ride the rest out with the maker
-    tp20/50/100  sell everything at that profit, and if it never gets there, leave with the maker
-    hold       no rule at all, out at the end of the window: the control
+    be         the stake is worth taking back: break-even sells here, the rest rides on with the maker
+    t20/50/100 the position is worth that much more than the stake, gross
+    end        the last price of the window: where a rule with no exit ends up
 
     Entry is `latency_slots` after the creation slot and every exit lands the same `latency_slots` after the trade
-    that triggers it, because a rule can only react to a price it has already seen. Returns SOL PnL per rule.
-    ponytail: the break-even sale is sized at the price it lands on, not the price that triggered it."""
+    that triggers it, because a rule can only react to a price it has already seen. States, not profits: the fee,
+    priority fee and tip are charged later by `launch_pnl`, so those assumptions stay changeable."""
     entry = _state_before(c, mint, cslot + latency_slots)
     if not entry or entry[0] <= 0 or entry[1] <= 0:
         return None                                         # nothing traded before we could get in
@@ -905,9 +877,9 @@ def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, lat
     tokens = entry[1] - entry[0] * entry[1] / (entry[0] + stake_sol * LAMPORTS / (1 + fee_in))
     if tokens <= 0:
         return None
-    path = c.execute("""SELECT slot, vsol, vtok, (wallet = ? AND buy = 0) FROM trades
+    path = c.execute("""SELECT slot, vsol, vtok, wallet, buy, ts FROM trades
                         WHERE mint = ? AND slot >= ? AND slot <= ? ORDER BY slot, rowid""",
-                     (creator, mint, cslot + latency_slots, cslot + max(1, int(hold_s / 0.4)))).fetchall()
+                     (mint, cslot + latency_slots, cslot + max(1, int(hold_s / 0.4)))).fetchall()
 
     def land(i: int) -> tuple[int, int]:
         """The reserves our order reaches: the last state before it lands, `latency_slots` after path[i]."""
@@ -916,76 +888,182 @@ def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, lat
             j += 1
         return path[j][1], path[j][2]
 
-    def first(pred) -> int | None:
-        return next((i for i, r in enumerate(path) if pred(r)), None)
-
-    last = (path[-1][1], path[-1][2]) if path else entry
-    maker = first(lambda r: r[3])
-    copy_exit = land(maker) if maker is not None else last
-    out = {"copy": _value(copy_exit, tokens, fee_out) - stake_sol - 2 * tx_cost_sol,
-           "hold": _value(last, tokens, fee_out) - stake_sol - 2 * tx_cost_sol}
+    worth = [_value((r[1], r[2]), tokens, fee_out) for r in path]
+    maker = next((i for i, r in enumerate(path) if r[3] == creator and not r[4]), None)
+    out: dict[str, Any] = {"entry": entry, "end": (path[-1][1], path[-1][2]) if path else entry,
+                           "maker": land(maker) if maker is not None else ((path[-1][1], path[-1][2]) if path else entry),
+                           "peak": max(worth) / stake_sol if worth else 0.0,
+                           "dev_sold_s": (path[maker][5] - cts) if maker is not None else None,
+                           "n_trades": len(path), "n_buyers": len({r[3] for r in path if r[4]}),
+                           "fee_in": fee_in, "fee_out": fee_out}
     for tp in targets:
-        want = (1 + tp) * stake_sol + 2 * tx_cost_sol        # profit after both transactions, not before
-        i = first(lambda r, w=want: _value((r[1], r[2]), tokens, fee_out) >= w)
-        out[f"tp{round(tp * 100)}"] = _value(land(i) if i is not None else copy_exit, tokens, fee_out) - stake_sol - 2 * tx_cost_sol
-    back = stake_sol + 3 * tx_cost_sol                       # the stake back, and the three transactions this rule pays
-    be = first(lambda r: _value((r[1], r[2]), tokens, fee_out) >= back)
-    if be is None or (maker is not None and maker <= be):
-        out["breakeven"] = out["copy"]                       # the maker left first, or it was never worth the stake
-    else:
-        st = land(be)
-        t = back * LAMPORTS / (1 - fee_out)
-        sold = min(tokens, st[1] * (st[0] / (st[0] - t) - 1)) if st[0] > t else tokens
-        out["breakeven"] = _value(st, sold, fee_out) + _value(copy_exit, tokens - sold, fee_out) - stake_sol - 3 * tx_cost_sol
+        i = next((i for i, v in enumerate(worth) if v >= (1 + tp) * stake_sol), None)
+        out[f"t{round(tp * 100)}"] = land(i) if i is not None else None
+    be = next((i for i, v in enumerate(worth) if v >= stake_sol), None)
+    out["be"] = land(be) if be is not None and (maker is None or maker > be) else None
     return out
 
 
-STRATEGY_TOKENS_SQL = """
-WITH makers AS (SELECT creator FROM mints GROUP BY creator HAVING COUNT(*) >= :min_launches)
-SELECT m.id, m.slot, m.ts, m.creator FROM mints m JOIN makers k ON k.creator = m.creator
-ORDER BY m.ts DESC LIMIT :max_tokens
-"""
+def launch_pnl(st: dict[str, Any], stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL) -> dict[str, float]:
+    """What each rule made on one settled launch, at today's costs. The thresholds were measured on the gross
+    value, so the fee, priority fee and tip come out of the result rather than out of the trigger.
+    ponytail: the break-even sale is sized at the price it lands on, not the price that triggered it."""
+    entry, fee_out = st["entry"], st["fee_out"]
+    tokens = entry[1] - entry[0] * entry[1] / (entry[0] + stake_sol * LAMPORTS / (1 + st["fee_in"]))
+    if tokens <= 0:
+        return {}
+    net = lambda state, n=2: _value(state, tokens, fee_out) - stake_sol - n * tx_cost_sol   # noqa: E731
+    out = {"copy": net(st["maker"]), "hold": net(st["end"])}
+    for name in ("t20", "t50", "t100"):
+        out["tp" + name[1:]] = net(st[name] or st["maker"])   # never got there: it leaves with the maker
+    if not st["be"]:
+        out["breakeven"] = out["copy"]                        # the maker left first, or it was never worth the stake
+    else:
+        state, back = st["be"], stake_sol + 3 * tx_cost_sol   # the stake back, and the three transactions this rule pays
+        t = back * LAMPORTS / (1 - fee_out)
+        sold = min(tokens, state[1] * (state[0] / (state[0] - t) - 1)) if state[0] > t else tokens
+        out["breakeven"] = _value(state, sold, fee_out) + _value(st["maker"], tokens - sold, fee_out) - stake_sol - 3 * tx_cost_sol
+    return out
 
 
-def strategy_report(db_path: str | Path, latency_slots: int | None = None, stake_sol: float = 0.1,
-                    tx_cost_sol: float = TX_COST_SOL, hold_s: float = 900, min_launches: int = 3,
-                    max_tokens: int = 3000, targets: tuple[float, ...] = (0.2, 0.5, 1.0)) -> dict[str, Any]:
-    """Every exit rule on every launch of a repeat maker, one entry each, so the rules differ only in the exit."""
-    t_build = time.time()
-    c = connect(db_path, readonly=True)
+def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, latency_slots: int, stake_sol: float,
+                 tx_cost_sol: float, hold_s: float, targets: tuple[float, ...] = (0.2, 0.5, 1.0)) -> dict[str, float] | None:
+    """Every rule on one launch, straight from the trades: the states, priced at today's costs."""
+    st = strategy_states(c, mint, cslot, 0, creator, latency_slots, stake_sol, hold_s, targets)
+    return launch_pnl(st, stake_sol, tx_cost_sol) if st else None
+
+
+LAUNCH_COLS = ("mint", "creator", "slot", "ts", "symbol", "graduated", "dev_sold_s", "peak", "n_trades", "n_buyers",
+               "entry_vsol", "entry_vtok", "maker_vsol", "maker_vtok", "end_vsol", "end_vtok", "be_vsol", "be_vtok",
+               "t20_vsol", "t20_vtok", "t50_vsol", "t50_vtok", "t100_vsol", "t100_vtok", "fee_in", "fee_out", "stake", "latency")
+
+
+def row_states(r: dict[str, Any]) -> dict[str, Any]:
+    """A stored launch back into the states `launch_pnl` prices."""
+    at = lambda k: (r[k + "_vsol"], r[k + "_vtok"]) if r[k + "_vsol"] is not None else None   # noqa: E731
+    return {"entry": at("entry"), "maker": at("maker"), "end": at("end"), "be": at("be"), "t20": at("t20"),
+            "t50": at("t50"), "t100": at("t100"), "fee_in": r["fee_in"], "fee_out": r["fee_out"]}
+
+
+def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake_sol: float = 0.1, hold_s: float = 900,
+                    limit: int = 20_000) -> int:
+    """Freeze every launch whose window has closed into `launches`, before its trades are pruned. This is what
+    turns three days of trades into a maker history that keeps growing."""
+    c = connect(db_path)
     try:
         measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")
         if latency_slots is None:
             latency_slots = max(2, measured + 1) if measured is not None else 2
-        t0, t_last = c.execute("SELECT MIN(ts), MAX(ts) FROM mints").fetchone()
-        if t0 is None:
-            return {"generated": int(t_build), "empty": True}
-        mid = (t0 + ((c.execute("SELECT MAX(ts) FROM trades").fetchone() or [None])[0] or t_last)) / 2
-        acc: dict[str, dict[str, float]] = {}
-        launches = 0
-        for mint, cslot, cts, creator in c.execute(STRATEGY_TOKENS_SQL, {"min_launches": min_launches, "max_tokens": max_tokens}).fetchall():
-            res = strategy_sim(c, mint, cslot, creator, latency_slots, stake_sol, tx_cost_sol, hold_s, targets)
-            if not res:
-                continue
-            launches += 1
-            half = "h1" if cts < mid else "h2"
-            for name, pnl in res.items():
+        c.execute("UPDATE launches SET graduated = 1 WHERE graduated = 0 AND mint IN (SELECT addr FROM mints WHERE pool IS NOT NULL)")
+        todo = c.execute("""SELECT m.id, m.addr, m.slot, m.ts, m.symbol, w.addr, m.creator, m.pool IS NOT NULL
+                            FROM mints m JOIN wallets w ON w.id = m.creator
+                            WHERE m.ts <= ? AND NOT EXISTS (SELECT 1 FROM launches l WHERE l.mint = m.addr)
+                            ORDER BY m.ts LIMIT ?""", (time.time() - hold_s - 120, limit)).fetchall()
+        rows = []
+        for mid, addr, slot, ts, symbol, maker, creator, graduated in todo:
+            st = strategy_states(c, mid, slot, ts, creator, latency_slots, stake_sol, hold_s)
+            flat: list[Any] = [addr, maker, slot, ts, symbol, int(graduated)]
+            flat += [st["dev_sold_s"], st["peak"], st["n_trades"], st["n_buyers"]] if st else [None, None, None, None]
+            for k in ("entry", "maker", "end", "be", "t20", "t50", "t100"):
+                flat += list(st[k]) if st and st[k] else [None, None]
+            flat += [st["fee_in"], st["fee_out"], stake_sol, latency_slots] if st else [None, None, stake_sol, latency_slots]
+            rows.append(tuple(flat))
+        if rows:
+            c.executemany(f"INSERT OR IGNORE INTO launches VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
+        c.commit()
+        return len(rows)
+    finally:
+        c.close()
+
+
+def read_launches(c: sqlite3.Connection, days: float = 30, limit: int = 200_000) -> list[dict[str, Any]]:
+    """Settled launches of the last `days`, newest first: the permanent history, not the trade window."""
+    cur = c.execute(f"SELECT {', '.join(LAUNCH_COLS)} FROM launches WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                    (time.time() - days * 86_400, limit))
+    return [dict(zip(LAUNCH_COLS, r)) for r in cur.fetchall()]
+
+
+def maker_table(c: sqlite3.Connection, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, min_launches: int = 3,
+                days: float = 30, top: int = 200) -> list[dict[str, Any]]:
+    """Coin makers ranked on their stored launches: how often they launch, how often and how fast they dump their
+    own bag, and what buying every one of their launches (out when they sell) would have paid."""
+    rows = read_launches(c, days)
+    if not rows:
+        return []
+    mid, by = (min(r["ts"] for r in rows) + max(r["ts"] for r in rows)) / 2, {}
+    for r in rows:
+        m = by.setdefault(r["creator"], {"addr": r["creator"], "launches": 0, "graduated": 0, "replayed": 0, "dumped": 0,
+                                         "pnl": 0.0, "wins": 0, "dumps": [], "peaks": [], "n_h1": 0, "pnl_h1": 0.0,
+                                         "n_h2": 0, "pnl_h2": 0.0, "first": r["ts"], "last": r["ts"]})
+        m["launches"] += 1
+        m["graduated"] += bool(r["graduated"])
+        m["first"], m["last"] = min(m["first"], r["ts"]), max(m["last"], r["ts"])
+        if r["dev_sold_s"] is not None:
+            m["dumped"] += 1
+            m["dumps"].append(r["dev_sold_s"] / 60)
+        if r["entry_vsol"] is None:
+            continue                                         # nobody traded it before a copy could land
+        p = launch_pnl(row_states(r), stake_sol, tx_cost_sol)["copy"]
+        half = "h1" if r["ts"] < mid else "h2"
+        m["replayed"] += 1
+        m["pnl"] += p
+        m["wins"] += p > 0
+        m["peaks"].append(r["peak"] or 0.0)
+        m["n_" + half] += 1
+        m["pnl_" + half] += p
+    out = []
+    for m in by.values():
+        if m["launches"] < min_launches or not m["replayed"]:
+            continue
+        m["dumps"].sort()
+        m["peaks"].sort()
+        med = lambda xs: xs[len(xs) // 2] if xs else None    # noqa: E731
+        roi = lambda k: (m["pnl" + k] / (m["n" + k] * stake_sol) if m["n" + k] else None)   # noqa: E731
+        out.append({"addr": m["addr"], "launches": m["launches"], "graduated": m["graduated"], "replayed": m["replayed"],
+                    "grad_share": m["graduated"] / m["launches"], "pnl_sol": m["pnl"],
+                    "roi": m["pnl"] / (m["replayed"] * stake_sol), "roi_h1": roi("_h1"),
+                    "roi_h2": roi("_h2"), "win_rate": m["wins"] / m["replayed"], "dump_share": m["dumped"] / m["launches"],
+                    "dump_min": med(m["dumps"]), "peak_med": med(m["peaks"]), "first": m["first"], "last": m["last"]})
+    return sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)[:top]
+
+
+def strategy_report(db_path: str | Path, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, min_launches: int = 3,
+                    days: float = 30, hold_s: float = 900) -> dict[str, Any]:
+    """Every exit rule on every launch of a repeat maker, one entry each, so the rules differ only in the exit.
+    Read from the stored launches, so the sample grows for as long as the collector runs."""
+    t_build = time.time()
+    c = connect(db_path, readonly=True)
+    try:
+        rows = [r for r in read_launches(c, days) if r["entry_vsol"] is not None]
+        if not rows:
+            return {"generated": int(t_build), "empty": True, "params": {"min_launches": min_launches, "days": days}}
+        made = collections.Counter(r["creator"] for r in rows)
+        rows = [r for r in rows if made[r["creator"]] >= min_launches]
+        if not rows:
+            return {"generated": int(t_build), "empty": True, "params": {"min_launches": min_launches, "days": days}}
+        t0, t_last = min(r["ts"] for r in rows), max(r["ts"] for r in rows)
+        mid, acc = (t0 + t_last) / 2, {}
+        for r in rows:
+            half = "h1" if r["ts"] < mid else "h2"
+            for name, pnl in launch_pnl(row_states(r), stake_sol, tx_cost_sol).items():
                 a = acc.setdefault(name, {"n": 0, "pnl": 0.0, "wins": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0})
                 a["n"] += 1
                 a["pnl"] += pnl
                 a["wins"] += pnl > 0
                 a["n_" + half] += 1
                 a["pnl_" + half] += pnl
-        rows = []
+        out = []
         for name, a in acc.items():
             roi = {k: (a["pnl" + k] / (a["n" + k] * stake_sol) if a["n" + k] else None) for k in ("", "_h1", "_h2")}
-            rows.append({"rule": name, "n": a["n"], "pnl_sol": a["pnl"], "roi": roi[""], "roi_h1": roi["_h1"],
-                         "roi_h2": roi["_h2"], "win_rate": a["wins"] / a["n"] if a["n"] else None})
+            out.append({"rule": name, "n": a["n"], "pnl_sol": a["pnl"], "roi": roi[""], "roi_h1": roi["_h1"],
+                        "roi_h2": roi["_h2"], "win_rate": a["wins"] / a["n"] if a["n"] else None})
         return {"generated": int(time.time()), "build_s": round(time.time() - t_build, 1),
-                "params": {"latency_slots": latency_slots, "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "hold_s": hold_s,
-                           "min_launches": min_launches, "max_tokens": max_tokens, "targets": list(targets)},
-                "counts": {"launches": launches}, "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},
-                "rules": sorted(rows, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)}
+                "params": {"stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "min_launches": min_launches, "days": days,
+                           "hold_s": hold_s, "latency_slots": rows[0]["latency"]},
+                "counts": {"launches": len(rows), "makers": sum(1 for n in made.values() if n >= min_launches),
+                           "all_launches": len(made)},
+                "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},
+                "rules": sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)}
     finally:
         c.close()
 
@@ -1031,7 +1109,7 @@ def twins(c: sqlite3.Connection, wallet: int, max_positions: int = 1000) -> int:
 
 def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10, min_snipes: int = 5, latency_slots: int | None = None,
                  stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL, top: int = 100, max_positions: int = 1000,
-                 min_hours: float = 12, min_launches: int = 3, hold_s: float = 300) -> dict[str, Any]:
+                 min_hours: float = 12, min_launches: int = 3, hold_s: float = 300, maker_days: float = 30) -> dict[str, Any]:
     """`min_hours`: no wallet is called golden before the window spans this long. Golden wallets get followed
     for good, so a verdict from the first minutes of data would pin noise to the paper test.
     `latency_slots` None: the feed delay the collector measured (median) plus one slot to send, at least 2."""
@@ -1044,7 +1122,7 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
         params = {"snipe_slots": snipe_slots, "min_tokens": min_tokens, "min_snipes": min_snipes, "latency_slots": latency_slots,
                   "latency_measured_p50": measured, "stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "fee": FEE, "min_hours": min_hours,
                   "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL},
-                  "min_launches": min_launches, "hold_s": hold_s}
+                  "min_launches": min_launches, "hold_s": hold_s, "maker_days": maker_days}
         t0, t1, n_mints = c.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM mints").fetchone()
         if not n_mints:
             return {"generated": int(t_build), "params": params, "empty": True}
@@ -1087,14 +1165,9 @@ def build_report(db_path: str | Path, snipe_slots: int = 2, min_tokens: int = 10
                 "pnl_h1_sol", "pnl_h2_sol", "top2_share", "avg_hold_min", "launched", "twins", "copy_n", "copy_roi", "copy_roi_h1",
                 "copy_roi_h2", "copy_win_rate", "golden")
         slim = lambda rs: [{k: r.get(k) for k in keep} for r in rs]  # noqa: E731
-        creators = []                                       # follow the coin maker: its next launch is a known event
-        for cid, addr, launches, graduated in c.execute(CREATORS_SQL, {"min_launches": min_launches, "top": top}):
-            sim = creator_sim(c, cid, mid, latency_slots, stake_sol, tx_cost_sol, hold_s, min(max_positions, 200))
-            if sim["n"]:
-                creators.append({"addr": addr, "launches": launches, "graduated": graduated, "grad_share": graduated / launches,
-                                 "replayed": sim["n"], "pnl_sol": sim["pnl"], "roi": sim["roi"], "roi_h1": sim["roi_h1"],
-                                 "roi_h2": sim["roi_h2"], "win_rate": sim["wins"] / sim["n"], "dump_share": sim["dumped"] / sim["n"],
-                                 "dump_min": sim["dump_min"]})
+        # follow the coin maker: its next launch is a known event. From the stored launches, so this history keeps
+        # growing after the trades behind it are pruned.
+        creators = maker_table(c, stake_sol, tx_cost_sol, min_launches, maker_days, top)
         stats = get_meta(c, "stats", {}) or {}
         return {"generated": int(time.time()), "build_s": round(time.time() - t_build, 1), "params": params,
                 "window": {"start": t0, "end": t_last, "hours": (t_last - t0) / 3600},

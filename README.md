@@ -164,6 +164,12 @@ python -m hl_screener pump report      # rank now from what was collected
   still exits on its sell), and each one gets its own pair of lines on the chart, like a golden
   wallet. They are ranked on activity, not on profit: whether copying them pays is what the chart
   answers, and same-slot snipes are copied two slots late because that is the earliest anyone could.
+- **Every launch is kept for good.** Fifteen minutes after a token is created, its window is frozen into
+  the `launches` table: the curve state each exit rule reached, whether and when the maker sold its own
+  bag, the most a copy was ever worth, and the trade and buyer counts. About 170 bytes a launch, so a
+  year of maker history costs a few hundred MB, while the trades behind it are still pruned after
+  `PUMP_RETENTION_DAYS`. States are stored rather than profits, so the fee, priority fee and tip stay
+  changeable afterwards — the maker ranking and the Strategy tab are recomputed from them each time.
 - **Coin makers** are ranked too: every wallet with `min_launches` (3) or more launches in the window,
   with the share of its tokens that graduated, how often and how fast it sells its own bag, and a replay
   of buying every one of its launches — in `latency_slots` after the creation slot, out when the maker

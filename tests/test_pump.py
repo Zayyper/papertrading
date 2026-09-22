@@ -4,8 +4,8 @@ import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
-                                 creator_sim, paper_series, parse_amm_trade, parse_create, parse_trade, strategy_sim,
-                                 twins, update_snipers)
+                                 maker_table, paper_series, parse_amm_trade, parse_create, parse_trade, settle_launches,
+                                 strategy_sim, twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -201,9 +201,10 @@ def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
 
 
 def test_following_a_coin_maker_buys_every_launch_and_exits_on_its_sell_or_the_timeout(tmp_path):
-    col = Collector(tmp_path / "pump.db")
+    db = tmp_path / "pump.db"
+    col = Collector(db)
     dev, X = bytes([120]) * 32, bytes([121]) * 32
-    now, states = int(time.time()), {}
+    now, states = int(time.time()) - 3600, {}            # an hour ago: their windows have closed
 
     def launch(k, slot, dev_sells):
         m, cv = bytes([130 + k]) * 32, Curve()
@@ -224,16 +225,16 @@ def test_following_a_coin_maker_buys_every_launch_and_exits_on_its_sell_or_the_t
     launch(1, 2000, True)
     launch(2, 3000, False)                                   # never sells: the copy has to time out
     col.flush()
-    dev_id = col.c.execute("SELECT id FROM wallets WHERE addr = ?", (b58(dev),)).fetchone()[0]
-    sim = creator_sim(col.c, dev_id, now + 3600, latency_slots=2, stake_sol=0.1, tx_cost_sol=TX_COST_SOL,
-                      hold_s=300, max_positions=10)
-    assert sim["n"] == 3 and sim["dumped"] == 2                # every launch replayed, two of them dumped
+    assert settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=300) == 3      # the window has closed on all three
+    assert settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=300) == 0      # and they are frozen, not redone
+    maker = maker_table(col.c, stake_sol=0.1, tx_cost_sol=TX_COST_SOL, min_launches=3)[0]
+    assert (maker["addr"], maker["launches"], maker["replayed"]) == (b58(dev), 3, 3)
+    assert maker["dump_share"] == 2 / 3 and maker["dump_min"] == 1.0                 # 60 s from launch to its first sell
     # it lands at the price the creation-slot sniper left, and gets out two slots after the dev's sell: after the dump
     dumped = sum(copy_trade(states[(k, "entry")], states[(k, "afterdump")], 0.1, TX_COST_SOL, 0.0125, 0.0125) for k in (0, 1))
     timed_out = copy_trade(states[(2, "entry")], states[(2, "beforesell")], 0.1, TX_COST_SOL, 0.0125, 0.0125)
-    assert abs(sim["pnl"] - (dumped + timed_out)) < 1e-9
+    assert abs(maker["pnl_sol"] - (dumped + timed_out)) < 1e-9
     assert dumped / 2 < timed_out                              # selling into the dev's dump is the expensive exit
-    assert sim["dump_min"] == 1.0                              # 60 s from creation to the dev's first sell
     col.c.close()
 
 
