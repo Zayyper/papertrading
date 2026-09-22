@@ -166,6 +166,13 @@ def main(argv: list[str] | None = None) -> int:
         pumpfun.save_report(db, rep)
         pumpfun.update_follow(db, rep)
         pumpfun.print_report(rep)
+        strat = pumpfun.strategy_report(db, latency_slots=a.latency_slots, stake_sol=a.stake)
+        pumpfun.save_meta(db, "strategies", strat)
+        if strat.get("rules"):
+            print(f"\nexit rules on {strat['counts']['launches']:,} launches of repeat makers "
+                  f"(same entry, {strat['params']['hold_s'] / 60:.0f} min window):")
+            for r in strat["rules"]:
+                print(f"  {r['rule']:<10} {r['roi']:+7.1%} per launch  won {r['win_rate']:>4.0%}  total {r['pnl_sol']:+8.2f} SOL")
         return 0
 
     if a.cmd == "paper":

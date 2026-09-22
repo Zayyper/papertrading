@@ -4,8 +4,8 @@ import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
-                                 creator_sim, paper_series, parse_amm_trade, parse_create, parse_trade, twins,
-                                 update_snipers)
+                                 creator_sim, paper_series, parse_amm_trade, parse_create, parse_trade, strategy_sim,
+                                 twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -234,6 +234,48 @@ def test_following_a_coin_maker_buys_every_launch_and_exits_on_its_sell_or_the_t
     assert abs(sim["pnl"] - (dumped + timed_out)) < 1e-9
     assert dumped / 2 < timed_out                              # selling into the dev's dump is the expensive exit
     assert sim["dump_min"] == 1.0                              # 60 s from creation to the dev's first sell
+    col.c.close()
+
+
+def test_each_exit_rule_leaves_at_its_own_price(tmp_path):
+    col = Collector(tmp_path / "pump.db")
+    dev, X = bytes([140]) * 32, bytes([141]) * 32
+    now, m, cv, held = int(time.time()), bytes([150]) * 32, Curve(), {}
+
+    def trade(slot, who, buy, sol=None):
+        if buy:
+            tok = cv.buy(sol)
+            held[who] = held.get(who, 0) + tok
+            col.on_logs(slot, logs(trade_bytes(m, who, True, sol, tok, cv.vsol, cv.vtok, ts=now)))
+        else:
+            tok = held.pop(who)
+            col.on_logs(slot, logs(trade_bytes(m, who, False, cv.sell(tok), tok, cv.vsol, cv.vtok, ts=now)))
+        return cv.vsol, cv.vtok
+
+    A, B = bytes([142]) * 32, bytes([143]) * 32
+    col.on_logs(500, logs(create_bytes(m, dev, ts=now)))
+    entry = trade(500, X, True, 10**9)                   # the creation-slot sniper: the price our entry lands on
+    at_505 = trade(505, A, True, 45 * 10**8)             # pushes us past +20%, not yet +50%
+    at_510 = trade(510, B, True, 5 * 10**9)              # and past +50%
+    trade(515, dev, True, 2 * 10**9)                     # the dev buys its own bag
+    trade(520, dev, False)                               # and dumps it: our copy only gets out two slots later
+    trade(521, B, False)
+    after_dump = trade(521, A, False)                    # the holders follow it out: that is what the copy sells into
+    at_end = trade(600, bytes([146]) * 32, True, 10**8)  # the last trade of the window: where "hold" ends up
+    col.flush()
+
+    mint = col.c.execute("SELECT id FROM mints WHERE addr = ?", (b58(m),)).fetchone()[0]
+    dev_id = col.c.execute("SELECT id FROM wallets WHERE addr = ?", (b58(dev),)).fetchone()[0]
+    res = strategy_sim(col.c, mint, 500, dev_id, latency_slots=2, stake_sol=0.1, tx_cost_sol=TX_COST_SOL, hold_s=300)
+    tokens = entry[1] - entry[0] * entry[1] / (entry[0] + 0.1 * 1e9 / 1.0125)
+    out = lambda st, n_tx=2, tok=tokens: (st[0] - st[0] * st[1] / (st[1] + tok)) * (1 - 0.0125) / 1e9 - 0.1 - n_tx * TX_COST_SOL  # noqa: E731
+
+    assert abs(res["tp20"] - out(at_505)) < 1e-9         # triggered at 505, lands on the state that trade left
+    assert abs(res["tp50"] - out(at_510)) < 1e-9
+    assert abs(res["copy"] - out(after_dump)) < 1e-9     # out two slots after the dev's sell: into its dump
+    assert abs(res["hold"] - out(at_end)) < 1e-9
+    assert res["tp50"] > res["tp20"] > res["copy"]       # leaving before the dev did is what pays here
+    assert res["copy"] < res["breakeven"] < res["tp50"]  # the stake came back early, the rest rode down with the dev
     col.c.close()
 
 

@@ -169,6 +169,11 @@ python -m hl_screener pump report      # rank now from what was collected
   of buying every one of its launches — in `latency_slots` after the creation slot, out when the maker
   first sells (same delay, so the copy sells into its dump) or after `hold_s` (5 min), whichever comes
   first. It is the one strategy where the wallet to watch is known before it acts.
+- The **Strategy** tab compares exit rules on those launches: the same entry every time, then out when the
+  maker sells (`copy`), taking the stake back as soon as the position is worth it and riding the rest
+  (`breakeven`), selling everything at +20/50/100 % (`tp20`/`tp50`/`tp100`), or no rule at all (`hold`,
+  the control). Every exit lands `latency_slots` after the trade that triggers it, over a 15-minute
+  window, split into halves so a rule that only works in one of them is visible as such.
 - The page's **Pump** tab shows the collector status, base rates, the followed golden wallets, copy
   candidates and snipers. The **Paper** tab charts each Hyperliquid copy account against the
   leader's own account the same way.

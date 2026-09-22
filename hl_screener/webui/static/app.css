@@ -191,6 +191,8 @@ table.data td.empty { text-align: center; }
 .chart .dot { fill: var(--color-primary); stroke: var(--color-surface-1); stroke-width: 2; }
 .chart .hit { fill: transparent; cursor: crosshair; }
 .chart .bar { fill: var(--color-hairline-tertiary); }
+.chart .bar.pos { fill: var(--color-semantic-success); }   /* the bar means profit or loss, so it wears the semantic colour */
+.chart .bar.neg { fill: var(--color-semantic-danger); }
 .chart .crosshair { stroke: var(--color-hairline-tertiary); }
 .tooltip {
   position: absolute; pointer-events: none; z-index: 5; background: var(--color-surface-3); border: 1px solid var(--color-hairline-strong);

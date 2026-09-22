@@ -21,6 +21,7 @@
     <button class="tab" role="tab" data-view="results">Results</button>
     <button class="tab" role="tab" data-view="paper">Paper</button>
     <button class="tab" role="tab" data-view="pump">Pump</button>
+    <button class="tab" role="tab" data-view="strategy">Strategy</button>
     <button class="tab" role="tab" data-view="config">Config</button>
     <button class="tab" role="tab" data-view="design">Design</button>
   </nav>
@@ -184,6 +185,29 @@
       <li><b>Dev</b> marks wallets that also launch tokens. A sniper that launches tokens is most likely buying its own or its friends' launches.</li>
       <li>A token that graduates keeps being tracked on its PumpSwap pool, priced the same way, so positions and copies run straight through graduation.</li>
       <li><b>Feed delay</b> is measured against the chain's own slot clock. The copier lands one slot after it (at least two slots after the wallet): that is the best a copier on this feed could do, since a transaction lands in the next slot at the earliest. The live copies at the top measure what actually happens.</li>
+    </ul></div></details>
+  </section>
+
+  <!-- ============================ STRATEGY ============================ -->
+  <section class="view" id="view-strategy">
+    <div class="page-head">
+      <p class="eyebrow">Strategy</p>
+      <h1 class="headline">Same launches, same entry, different ways out</h1>
+      <p class="lede">Every launch by a wallet that launches repeatedly is bought the same way, then sold by a different rule. Only the exit changes, so the comparison is fair. If no rule beats copying the maker out, there is nothing here worth trading.</p>
+    </div>
+    <div class="tiles" id="strat-tiles"></div>
+    <p class="caption" id="strat-rule" style="margin-top: 8px"></p>
+    <div class="panel tight"><div class="chart" id="strat-chart"></div></div>
+    <h3 class="section-title">Every rule on the same sample <span class="caption">profit per launch, after the fee, the priority fee and the tip</span></h3>
+    <div class="panel tight"><div class="table-wrap" id="strat-table"></div></div>
+    <details class="panel report"><summary>How to read this</summary><div class="md"><ul>
+      <li><b>copy</b> is the benchmark: out when the maker first sells, landing two slots behind it. The same rule the Pump tab replays.</li>
+      <li><b>breakeven</b> takes the stake back the moment the position is worth it, then rides the rest out with the maker. If the maker sells first, it is simply the copy.</li>
+      <li><b>tp20 / tp50 / tp100</b> sell everything at that profit, counted after both transactions. If the price never gets there, they leave with the maker.</li>
+      <li><b>hold</b> has no rule at all: out at the end of the window. It is the control — a rule that cannot beat holding is noise.</li>
+      <li>Every exit lands two slots after the trade that triggers it, because a rule can only react to a price it has already seen. Your own order would move the price too; that is not modelled, so every number here is a little kind.</li>
+      <li><b>1st half / 2nd half</b> split the window in two. A rule that only works in one half is a coincidence, not a strategy.</li>
+      <li>The sample is every launch by a wallet with several launches in the window. It says nothing about launches by one-time creators.</li>
     </ul></div></details>
   </section>
 

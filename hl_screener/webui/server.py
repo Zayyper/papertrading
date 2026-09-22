@@ -146,7 +146,7 @@ class App:
                 "leaders_files": [p.relative_to(self.root).as_posix() for p in files],
                 "defaults": {"equity": cfg.follower_equity_usd, "max_leverage": cfg.follower_max_leverage}}
 
-    def pump_view(self, keys: tuple[str, ...] = ("stats", "report"), series: bool = False) -> dict[str, Any]:
+    def pump_view(self, keys: tuple[str, ...] = ("stats", "report", "strategies"), series: bool = False) -> dict[str, Any]:
         cfg, _ = self.cfg()
         db = self.root / cfg.data_dir / "pump" / "pump.db"
         if not db.exists():

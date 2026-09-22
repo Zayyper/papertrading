@@ -59,7 +59,7 @@
     $$(".tab").forEach((t) => { const on = t.dataset.view === name; t.classList.toggle("active", on); t.setAttribute("aria-selected", on); });
     if (name === "results") refreshRuns().then(redrawCharts);
     if (name === "paper") startPaperPolling(); else stopPaperPolling();
-    if (name === "pump") startPumpPolling(); else stopPumpPolling();
+    if (name === "pump" || name === "strategy") startPumpPolling(); else stopPumpPolling();
     if (name === "config" && !state.config) loadConfig();
     if (name === "design") renderDesign();
   }
@@ -428,7 +428,7 @@
   }
   const chartWidth = (container) => Math.max(320, (container.clientWidth || 640) - 32);
   let resizeTimer = null;
-  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { redrawCharts(); redrawCompares(); }, 150); });
+  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { redrawCharts(); redrawCompares(); drawRules($("#strat-chart"), lastRules); }, 150); });
 
   function niceTicks(lo, hi, n) {
     if (!(hi > lo)) return [lo];
@@ -834,6 +834,7 @@
     try { [d, pp] = await Promise.all([api("GET", "/api/pump"), api("GET", "/api/pump/paper")]); } catch (e) { toast(e.message); return; }
     renderPump(d);
     renderPumpPaper(pp);
+    renderStrategies(d);
   }
   const solscan = (a) => `<a class="addr" href="https://solscan.io/account/${esc(a)}" target="_blank" rel="noopener" title="${esc(a)}">${shortAddr(a)}</a>`;
   const solAmt = (x) => isNum(x) ? `<span class="${signCls(x)}">${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}</span>` : "n/a";
@@ -899,6 +900,57 @@
       { key: "pnl_sol", label: "PnL, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
       { key: "replayed", label: "Replayed", num: true, title: "launches that had a price to buy at", render: (r) => fmtInt(r.replayed) },
     ], rep.creators || [], { sortKey: "roi", dir: -1, empty });
+  }
+
+  // ---------------------------------------------------------------- strategy: the same launches, different exits
+  const RULE_LABEL = {
+    copy: "out when the maker sells", breakeven: "stake back early, ride the rest", tp20: "sell everything at +20%",
+    tp50: "sell everything at +50%", tp100: "sell everything at +100%", hold: "no rule, out at the end (control)",
+  };
+  let lastRules = [];
+
+  function renderStrategies(d) {
+    const s = d.strategies || {}, p = s.params || {}, rules = lastRules = s.rules || [];
+    const best = rules[0], copy = rules.find((r) => r.rule === "copy");
+    $("#strat-tiles").innerHTML = !rules.length
+      ? `<div class="empty" style="grid-column: 1 / -1">${d.exists ? "No comparison yet: it is computed with the ranking, every 30 minutes." : "The pump.fun collector is not running yet."}</div>`
+      : tile("Launches", fmtInt((s.counts || {}).launches), `by wallets with ${p.min_launches}+ launches · ${fmtNum((s.window || {}).hours, 1)} h of data`) +
+        tile("Best rule", esc(best.rule), `${fmtPct(best.roi)} per launch · ${esc(RULE_LABEL[best.rule] || "")}`) +
+        tile("Copying the maker", pct(copy ? copy.roi : null), copy && isNum(best.roi) && isNum(copy.roi) ? `${fmtPct(best.roi - copy.roi)} behind the best rule` : "the benchmark") +
+        tile("Each copy", `${p.stake_sol} SOL`, `${fmtNum(p.tx_cost_sol, 4)} SOL a transaction · lands ${p.latency_slots} slots late`) +
+        tile("Window", `${Math.round((p.hold_s ?? 900) / 60)} min`, "then out at whatever it is worth") +
+        tile("Updated", s.generated ? ago(d.now - s.generated) : "never", s.build_s ? `took ${s.build_s}s` : "");
+    $("#strat-rule").textContent = rules.length
+      ? `Every launch bought with ${p.stake_sol} SOL ${p.latency_slots} slots after the creation slot — the earliest a watcher of that wallet could land — then sold by each rule in turn. Same curve prices, fee, priority fee and tip as everywhere else.`
+      : "";
+    drawRules($("#strat-chart"), rules);
+    sortableTable($("#strat-table"), [
+      { key: "rule", label: "Rule", render: (r) => `<b>${esc(r.rule)}</b> <span class="muted">${esc(RULE_LABEL[r.rule] || "")}</span>` },
+      { key: "roi", label: "Per launch", num: true, title: "profit per SOL put in, after the fee, the priority fee and the tip", render: (r) => pct(r.roi) },
+      { key: "roi_h1", label: "1st half", num: true, render: (r) => pct(r.roi_h1) },
+      { key: "roi_h2", label: "2nd half", num: true, render: (r) => pct(r.roi_h2) },
+      { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
+      { key: "pnl_sol", label: "Total, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
+      { key: "n", label: "Launches", num: true, render: (r) => fmtInt(r.n) },
+    ], rules, { sortKey: "roi", dir: -1, empty: "No comparison yet: it is computed with the ranking, every 30 minutes." });
+  }
+
+  function drawRules(container, rules) {
+    if (!rules.length) { container.innerHTML = ""; return; }
+    const rowH = 32, W = chartWidth(container), m = { l: 92, r: 64, t: 8, b: 24 }, H = rules.length * rowH + m.t + m.b;
+    const vals = rules.map((r) => r.roi || 0), lo = Math.min(0, ...vals), hi = Math.max(0, ...vals), pad = (hi - lo) * 0.15 || 0.01;
+    const X = (v) => m.l + (v - lo + pad) / (hi - lo + 2 * pad) * (W - m.l - m.r);
+    const ticks = niceTicks(lo - pad, hi + pad, 5);
+    let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Profit per launch by exit rule">`;
+    s += `<g class="grid">${ticks.map((v) => `<line x1="${X(v).toFixed(1)}" x2="${X(v).toFixed(1)}" y1="${m.t}" y2="${H - m.b}"/>`).join("")}</g>`;
+    s += `<g class="axis">${ticks.map((v) => `<text x="${X(v).toFixed(1)}" y="${H - 8}" text-anchor="middle">${fmtPct(v, 0)}</text>`).join("")}</g>`;
+    rules.forEach((r, i) => {
+      const y = m.t + i * rowH + 5, v = r.roi || 0, x0 = X(0), x1 = X(v), left = Math.min(x0, x1), w = Math.max(Math.abs(x1 - x0), 1);
+      s += `<text class="cat" x="${m.l - 10}" y="${y + 15}" text-anchor="end">${esc(r.rule)}</text>`;
+      s += `<rect class="bar ${v >= 0 ? "pos" : "neg"}" x="${left.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="22" rx="4"><title>${esc(r.rule)}: ${fmtPct(r.roi)} per launch</title></rect>`;
+      s += `<text class="bar-label" x="${(v >= 0 ? x1 + 8 : x1 - 8).toFixed(1)}" y="${y + 15}" text-anchor="${v >= 0 ? "start" : "end"}">${fmtPct(r.roi)}</text>`;
+    });
+    container.innerHTML = s + `<line class="zero" x1="${X(0).toFixed(1)}" x2="${X(0).toFixed(1)}" y1="${m.t}" y2="${H - m.b}"/></svg>`;
   }
 
   // ---------------------------------------------------------------- config
