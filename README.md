@@ -151,9 +151,13 @@ python -m hl_screener pump report      # rank now from what was collected
 - **Golden wallets are paper-followed live**, inside the collector, from the moment a report flags
   them and for good after that: each first buy of a token copied with 0.1 SOL landing 2 slots
   behind the wallet (later if the feed lags), sold when it first sells, on the live curve with
-  its fees. The Paper tab shows each followed wallet's copies next to the copier return the
-  report measured before following it. That comparison is the out-of-sample test.
-- The page's **Pump** tab shows the collector status, base rates, copy candidates and snipers.
+  its fees. The wallet's own trades in the tokens it buys from then on are tracked too, so the
+  Pump tab charts each copy against the wallet itself (a point every 5 minutes, each line shown or
+  hidden on its own) and lists the copies next to the copier return the report measured before
+  following it. That comparison is the out-of-sample test.
+- The page's **Pump** tab shows the collector status, base rates, the followed golden wallets, copy
+  candidates and snipers. The **Paper** tab charts each Hyperliquid copy account against the
+  leader's own account the same way.
 
 ## Running on a server (Coolify)
 

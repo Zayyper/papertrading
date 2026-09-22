@@ -39,6 +39,12 @@
   --color-semantic-warning: #d4a72c;
   --color-focus-ring: rgba(94, 105, 209, 0.5);   /* "2px primary-focus outline at 50% opacity" */
 
+  /* extension: chart series, one per account on the comparison charts. The data-viz reference palette's
+     dark steps in its fixed order, validated against surface-1: lightness band, chroma floor, colour-blind
+     separation (worst neighbours ΔE 8.4) and 3:1 contrast all pass. Never cycled: at most 8 on screen. */
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+  --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+
   /* ---- typography (DESIGN.md `typography:`; substitutes per its font note:
           Inter for Linear Display/Text, JetBrains Mono for Linear Mono) ------------- */
   --font-display: "Inter", "SF Pro Display", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;

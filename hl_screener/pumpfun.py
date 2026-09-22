@@ -194,6 +194,9 @@ CREATE TABLE IF NOT EXISTS pfills (id INTEGER PRIMARY KEY, wallet TEXT, mint TEX
                                    land_slot INTEGER, ts INTEGER, sol REAL, tok REAL, leader_px REAL, px REAL,
                                    slip_bps REAL, pnl REAL, timed_out INTEGER);
 CREATE TABLE IF NOT EXISTS ppos (wallet TEXT, mint TEXT, tok REAL, cost REAL, opened INTEGER, PRIMARY KEY (wallet, mint));
+CREATE TABLE IF NOT EXISTS opos (wallet TEXT, mint TEXT, cost REAL, proceeds REAL, tok REAL, PRIMARY KEY (wallet, mint));
+CREATE TABLE IF NOT EXISTS psnap (ts INTEGER, wallet TEXT, copy_pnl REAL, copy_cost REAL, own_pnl REAL, own_cost REAL);
+CREATE INDEX IF NOT EXISTS ix_psnap ON psnap(wallet, ts);
 """
 
 
@@ -236,20 +239,52 @@ class PaperFollow:
     def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = 0.0005):
         self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
         self.follow: set[str] = set()
+        # the followed wallets' own positions, in SOL and tokens: what the copy is compared with
+        self.own = {(w, m): [cost, proceeds, tok] for w, m, cost, proceeds, tok in c.execute("SELECT wallet, mint, cost, proceeds, tok FROM opos")}
         self.reload()
         self.pos = {(w, m): [tok, cost, opened] for w, m, tok, cost, opened in c.execute("SELECT wallet, mint, tok, cost, opened FROM ppos")}
         self.copied = set(c.execute("SELECT DISTINCT wallet, mint FROM pfills WHERE side = 'buy'"))
         self.pending: dict[str, list[dict[str, Any]]] = {}
         self.curve: dict[str, tuple[int, int, float]] = {}     # mint -> reserves after its last trade, when seen
         self.tip = 0                                            # newest slot the feed has shown
-        for (_, m) in self.pos:                                 # after a restart, mark open copies at the last stored price
+        for m in {m for (_, m) in self.pos} | self._held():    # after a restart, mark open positions at the last stored price
             row = c.execute("""SELECT t.vsol, t.vtok FROM trades t JOIN mints mm ON mm.id = t.mint WHERE mm.addr = ?
                                ORDER BY t.slot DESC, t.rowid DESC LIMIT 1""", (m,)).fetchone()
             if row:
                 self.curve[m] = (row[0], row[1], time.time())
 
     def reload(self) -> None:
-        self.follow = {w for (w,) in self.c.execute("SELECT wallet FROM follow")}
+        follow = dict(self.c.execute("SELECT wallet, added_at FROM follow"))
+        for w in follow.keys() - self.follow:                  # newly followed, or a restart: its stored trades since then, once
+            if not any(k[0] == w for k in self.own):
+                for m, buy, sol, tok, fee in self.c.execute(
+                        """SELECT mm.addr, t.buy, t.sol, t.tok, t.fee FROM trades t JOIN wallets w ON w.id = t.wallet
+                           JOIN mints mm ON mm.id = t.mint WHERE w.addr = ? AND t.ts >= ? ORDER BY t.slot, t.rowid""", (w, follow[w] or 0)).fetchall():
+                    self._own((w, m), buy, sol, tok, fee)
+        self.follow = set(follow)
+
+    def _held(self) -> set[str]:
+        return {m for (_, m), p in self.own.items() if p[2] > 0}
+
+    def _own(self, key: tuple[str, str], buy: bool, sol: int, tok: int, fee: int) -> None:
+        """The followed wallet's own position in each token it buys once we follow it. A sell counts only for
+        the share we saw it buy: the rest it held from before."""
+        p = self.own.get(key)
+        if buy:
+            p = self.own.setdefault(key, [0.0, 0.0, 0.0])
+            p[0] += (sol + fee) / LAMPORTS
+            p[2] += tok
+        elif p and p[2] > 0 and tok > 0:
+            p[1] += (sol - fee) / LAMPORTS * min(1.0, p[2] / tok)
+            p[2] = max(0.0, p[2] - tok)
+        else:
+            return
+        self.c.execute("INSERT OR REPLACE INTO opos VALUES (?,?,?,?,?)", (*key, *p))
+
+    def _worth(self, mint: str, tok: float) -> float | None:
+        """SOL that selling `tok` would fetch at the token's live curve, after the fee; None when never priced."""
+        st = self.curve.get(mint)
+        return (st[0] - st[0] * st[1] / (st[1] + tok)) * (1 - FEE) / LAMPORTS if st and st[1] > 0 else None
 
     def on_trade(self, slot: int, mint: str, user: str, e: dict[str, Any]) -> None:
         self.tip = max(self.tip, slot)
@@ -259,6 +294,7 @@ class PaperFollow:
         self.curve[mint] = (e["vsol"], e["vtok"], time.time())
         if user not in self.follow or not e["tok"]:
             return
+        self._own((user, mint), e["buy"], e["sol"], e["tok"], e["fee"])
         key, side = (user, mint), ("buy" if e["buy"] else "sell")
         mine = [a for a in self.pending.get(mint, ()) if a["wallet"] == user]
         if any(a["side"] == side for a in mine):
@@ -318,14 +354,19 @@ class PaperFollow:
                        (*key, a["side"], a["trigger"], a["land"], now, sol, tok, a["leader_px"], px, slip, pnl, int(timed_out)))
 
     def forget(self, max_age_s: float = 6 * 3600) -> None:
-        keep = {m for (_, m) in self.pos} | set(self.pending)
+        keep = {m for (_, m) in self.pos} | set(self.pending) | self._held()
         cutoff = time.time() - max_age_s
         self.curve = {m: v for m, v in self.curve.items() if v[2] >= cutoff or m in keep}
 
     def summary(self) -> dict[str, Any]:
         rows = {w: {"wallet": w, "added_at": added, "golden_now": bool(g), "report_copy_roi": roi, "copied": 0, "closed": 0,
-                    "open": 0, "realized": 0.0, "unrealized": 0.0, "wins": 0, "delay_slots": None, "slip_bps": None}
+                    "open": 0, "realized": 0.0, "unrealized": 0.0, "wins": 0, "delay_slots": None, "slip_bps": None,
+                    "own_cost": 0.0, "own_pnl": 0.0}
                 for w, added, g, roi in self.c.execute("SELECT wallet, added_at, golden_now, report_copy_roi FROM follow")}
+        for (w, m), (cost, proceeds, tok) in self.own.items():   # the wallet itself, held tokens at the live curve (0 if never priced)
+            if w in rows:
+                rows[w]["own_cost"] += cost
+                rows[w]["own_pnl"] += proceeds - cost + ((self._worth(m, tok) or 0.0) if tok > 0 else 0.0)
         for w, copied, closed, realized, wins, delay, slip in self.c.execute(
                 """SELECT wallet, SUM(side = 'buy'), SUM(side = 'sell'), COALESCE(SUM(pnl), 0), SUM(pnl > 0),
                           AVG(land_slot - trigger_slot), AVG(slip_bps) FROM pfills GROUP BY wallet"""):
@@ -333,8 +374,7 @@ class PaperFollow:
                 rows[w].update(copied=copied, closed=closed, realized=realized, wins=wins, delay_slots=delay, slip_bps=slip)
         open_ = []
         for (w, m), (tok, cost, opened) in self.pos.items():
-            st = self.curve.get(m)
-            value = (st[0] - st[0] * st[1] / (st[1] + tok)) * (1 - FEE) / LAMPORTS if st and st[1] > 0 else None
+            value = self._worth(m, tok)
             pnl = value - cost - 2 * self.tx if value is not None else None
             if w in rows:
                 rows[w]["open"] += 1
@@ -343,6 +383,7 @@ class PaperFollow:
         for r in rows.values():
             r["total"] = r["realized"] + r["unrealized"]
             r["roi"] = r["total"] / (r["copied"] * self.stake) if r["copied"] else None
+            r["own_roi"] = r["own_pnl"] / r["own_cost"] if r["own_cost"] else None
             r["win_rate"] = r["wins"] / r["closed"] if r["closed"] else None
         cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
         recent = [dict(zip(cols, r)) for r in self.c.execute(f"SELECT {', '.join(cols)} FROM pfills ORDER BY id DESC LIMIT 50")]
@@ -365,6 +406,16 @@ def update_follow(db_path: str | Path, rep: dict[str, Any]) -> int:
         return len(golden)
     finally:
         c.close()
+
+
+def paper_series(c: sqlite3.Connection) -> dict[str, list[list[float]]]:
+    """Per followed wallet, [ts, copy return, wallet return] from the 5-minute snapshots, starting at 0 the moment it
+    was followed. Return = profit over SOL put in: into copies, or into the tokens the wallet bought since then."""
+    out = {w: [[added or 0, 0.0, 0.0]] for w, added in c.execute("SELECT wallet, added_at FROM follow")}
+    for ts, w, cp, cc, op, oc in c.execute("SELECT ts, wallet, copy_pnl, copy_cost, own_pnl, own_cost FROM psnap ORDER BY wallet, ts"):
+        if w in out:
+            out[w].append([ts, cp / cc if cc else 0.0, op / oc if oc else 0.0])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +458,7 @@ class Collector:
         self.stats["ws"] = ws_url.split("?")[0]              # never store an API key that may sit in the query string
         self.stats["fallback"] = bool(self.fallback_url)
         self.paper = PaperFollow(self.c)
-        self.last_paper = 0.0
+        self.last_paper = self.last_snap = 0.0
         self.tip = 0                                          # the chain's newest slot (processed), from slotSubscribe
         self.lags: collections.deque[int] = collections.deque(maxlen=20_000)
         self.sigs: collections.deque[str] = collections.deque(maxlen=20_000)
@@ -514,7 +565,12 @@ class Collector:
         now = time.time()
         if now - self.last_paper >= 10:
             self.paper.reload()                                   # the report thread adds golden wallets
-            set_meta(self.c, "paper", self.paper.summary())
+            summ = self.paper.summary()
+            set_meta(self.c, "paper", summ)
+            if now - self.last_snap >= 300:                       # the chart: copy and wallet, every 5 min
+                self.c.executemany("INSERT INTO psnap VALUES (?,?,?,?,?,?)", [
+                    (int(now), r["wallet"], r["total"], r["copied"] * self.paper.stake, r["own_pnl"], r["own_cost"]) for r in summ["wallets"]])
+                self.last_snap = now
             if self.lags:
                 s = sorted(self.lags)
                 self.stats.update({f"lag_p{p}": s[min(len(s) - 1, len(s) * p // 100)] for p in (50, 90, 99)})

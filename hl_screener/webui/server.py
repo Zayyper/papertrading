@@ -140,19 +140,28 @@ class App:
             key=lambda p: p.stat().st_mtime, reverse=True)
         db = self.paper_db()
         st = status(db, self._live_mids() if db.exists() else None)
+        if st.get("snapshots"):
+            st["snapshots"] = {a: _thin(v) for a, v in st["snapshots"].items()}
         return {"service": self.service.view(log_since) if self.service else None, "db": str(db), "status": st,
                 "leaders_files": [p.relative_to(self.root).as_posix() for p in files],
                 "defaults": {"equity": cfg.follower_equity_usd, "max_leverage": cfg.follower_max_leverage}}
 
-    def pump_view(self, keys: tuple[str, ...] = ("stats", "report")) -> dict[str, Any]:
+    def pump_view(self, keys: tuple[str, ...] = ("stats", "report"), series: bool = False) -> dict[str, Any]:
         cfg, _ = self.cfg()
         db = self.root / cfg.data_dir / "pump" / "pump.db"
         if not db.exists():
             return {"exists": False, "now": time.time()}
-        from ..pumpfun import connect, get_meta
+        import sqlite3
+        from ..pumpfun import connect, get_meta, paper_series
         c = connect(db, readonly=True)
         try:
-            return {"exists": True, "now": time.time(), **{k: get_meta(c, k) for k in keys}}
+            out = {"exists": True, "now": time.time(), **{k: get_meta(c, k) for k in keys}}
+            if series:
+                try:
+                    out["series"] = {w: _thin(v) for w, v in paper_series(c).items()}
+                except sqlite3.OperationalError:              # a database from before the chart: the collector adds its table
+                    out["series"] = {}
+            return out
         finally:
             c.close()
 
@@ -371,6 +380,12 @@ def _coerce(s: str | None) -> Any:
     return f
 
 
+def _thin(rows: list, n: int = 500) -> list:
+    """Every k-th point plus the last: a chart line needs a few hundred points, not every 5-minute snapshot."""
+    k = -(-len(rows) // n)
+    return rows if k <= 1 else rows[::k] + ([rows[-1]] if (len(rows) - 1) % k else [])
+
+
 def _clean(o: Any) -> Any:
     """Make an object JSON-safe: NaN -> null, inf -> "inf" (browsers reject NaN literals)."""
     if isinstance(o, dict):
@@ -500,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/pump":
             return self._json(app.pump_view())
         if path == "/api/pump/paper":
-            return self._json(app.pump_view(("paper",)))
+            return self._json(app.pump_view(("paper",), series=True))
         if path == "/api/paper":
             since = int(q.get("log_since", ["0"])[0] or 0)
             return self._json(app.paper_view(since))

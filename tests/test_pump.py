@@ -1,8 +1,8 @@
 import base64
 import struct
 
-from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, PUMP_PROGRAM, WSOL, Collector,
-                                 b58, build_report, copy_trade, parse_amm_trade, parse_create, parse_trade, twins)
+from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
+                                 b58, build_report, copy_trade, paper_series, parse_amm_trade, parse_create, parse_trade, twins)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -164,6 +164,36 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
     assert col.c.execute("SELECT side, timed_out FROM pfills ORDER BY id DESC LIMIT 1").fetchone() == ("buy", 1)
     s = col.paper.summary()["wallets"][0]
     assert (s["copied"], s["closed"], s["open"]) == (2, 1, 1) and s["golden_now"]
+    col.c.close()
+
+
+def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
+    col = Collector(tmp_path / "pump.db")
+    G, X, old, new = (bytes([i]) * 32 for i in (90, 91, 11, 12))
+    c_old, c_new = Curve(), Curve()
+    for m in (old, new):
+        col.on_logs(10, logs(create_bytes(m, X)))
+    tok_old = c_old.buy(10**9)
+    col.on_logs(20, logs(trade_bytes(old, G, True, 10**9, tok_old, c_old.vsol, c_old.vtok, ts=1_790_000_020)))   # before it is followed
+    col.flush()
+    col.c.execute("INSERT INTO follow VALUES (?, ?, 1, 0.5)", (b58(G), 1_790_000_100))
+    col.paper.reload()
+    col.on_logs(30, logs(trade_bytes(old, G, False, c_old.sell(tok_old), tok_old, c_old.vsol, c_old.vtok, ts=1_790_000_130)))  # held from before: not its tracked trade
+    tok = c_new.buy(10**9)
+    col.on_logs(40, logs(trade_bytes(new, G, True, 10**9, tok, c_new.vsol, c_new.vtok, ts=1_790_000_140)))
+    sold = c_new.sell(tok // 2)
+    col.on_logs(50, logs(trade_bytes(new, G, False, sold, tok // 2, c_new.vsol, c_new.vtok, ts=1_790_000_150)))
+    col.last_paper = col.last_snap = 0.0                 # the next flush writes a chart point
+    col.flush()
+    w = col.paper.summary()["wallets"][0]
+    fee = lambda sol: int(sol * 0.0095) + int(sol * 0.003)   # noqa: E731
+    left = tok - tok // 2
+    held = (c_new.vsol - c_new.vsol * c_new.vtok / (c_new.vtok + left)) * (1 - FEE) / 1e9
+    assert abs(w["own_cost"] - (10**9 + fee(10**9)) / 1e9) < 1e-12
+    assert abs(w["own_pnl"] - ((sold - fee(sold)) / 1e9 - w["own_cost"] + held)) < 1e-12
+    series = paper_series(col.c)[b58(G)]
+    assert series[0] == [1_790_000_100, 0.0, 0.0] and len(series) == 2      # 0 when followed, then the 5-minute point
+    assert abs(series[1][2] - w["own_roi"]) < 1e-12 and series[1][1] == (w["total"] / 0.1 if w["copied"] else 0.0)
     col.c.close()
 
 

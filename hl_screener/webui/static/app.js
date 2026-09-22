@@ -428,7 +428,7 @@
   }
   const chartWidth = (container) => Math.max(320, (container.clientWidth || 640) - 32);
   let resizeTimer = null;
-  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(redrawCharts, 150); });
+  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { redrawCharts(); redrawCompares(); }, 150); });
 
   function niceTicks(lo, hi, n) {
     if (!(hi > lo)) return [lo];
@@ -554,17 +554,16 @@
   function stopPaperPolling() { clearInterval(paper.timer); paper.timer = null; }
 
   async function loadPaper() {
-    let d, pp;
-    try { [d, pp] = await Promise.all([api("GET", `/api/paper?log_since=${paper.logSince}`), api("GET", "/api/pump/paper")]); } catch (e) { toast(e.message); return; }
+    let d;
+    try { d = await api("GET", `/api/paper?log_since=${paper.logSince}`); } catch (e) { toast(e.message); return; }
     renderPaper(d);
-    renderPumpPaper(pp);
   }
 
   function renderPumpPaper(d) {
     const p = d.paper || {};
     const W = p.wallets || [];
     $("#pp-caption").textContent = p.at
-      ? `each wallet the Pump tab flags golden, from that moment on: its first buy of a token copied with ${p.stake_sol} SOL landing ${p.latency_slots} slots behind it, sold when it first sells, live curve prices and fees, no real orders · ${fmtInt(p.pending)} waiting to land`
+      ? `each wallet the ranking below flags golden, from that moment on: its first buy of a token copied with ${p.stake_sol} SOL landing ${p.latency_slots} slots behind it, sold when it first sells, live curve prices and fees, no real orders · ${fmtInt(p.pending)} waiting to land`
       : "";
     const empty = !d.exists ? "The pump.fun collector is not running yet." :
       "No golden wallet yet. A wallet needs 12+ hours of data, 10+ tokens, profit in both halves of the window for itself and its copier, no dominant token, no launches and no cluster. Each one is followed from the moment a report flags it.";
@@ -577,6 +576,7 @@
       { key: "unrealized", label: "Open, SOL", num: true, title: "open copies marked at the live curve, after fees and the exit transaction", render: (r) => solAmt(r.unrealized) },
       { key: "total", label: "Total, SOL", num: true, render: (r) => solAmt(r.total) },
       { key: "roi", label: "Per copy", num: true, title: "total over SOL put into copies", render: (r) => pct(r.roi) },
+      { key: "own_roi", label: "Wallet itself", num: true, title: "the wallet's own profit per SOL it spent on the tokens it bought since we follow it, tokens it still holds at the live price", render: (r) => pct(r.own_roi) },
       { key: "report_copy_roi", label: "Report said", num: true, title: "the copier return the report measured before following it: the forward result is the test of this number", render: (r) => pct(r.report_copy_roi) },
       { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
       { key: "delay_slots", label: "Delay", num: true, title: "slots between the wallet's trade and the copy landing", render: (r) => isNum(r.delay_slots) ? fmtNum(r.delay_slots, 1) + " slots" : "n/a" },
@@ -592,6 +592,11 @@
       { key: "slip_bps", label: "Slippage", num: true, render: (f) => isNum(f.slip_bps) ? `<span class="${f.slip_bps > 0 ? "neg" : "pos"}">${fmtNum(f.slip_bps, 0)} bps</span>` : "n/a" },
       { key: "pnl", label: "PnL, SOL", num: true, render: (f) => f.side === "sell" ? solAmt(f.pnl) : '<span class="tertiary">–</span>' },
     ], p.recent || [], { sortKey: "ts", dir: -1, empty: "No copy yet. They appear when a followed wallet trades." });
+    const ser = d.series || {};
+    drawCompare($("#pump-compare"), "pump", W.map((w) => {
+      const rows = ser[w.wallet] || [];
+      return { id: w.wallet, label: shortAddr(w.wallet), title: w.wallet, copy: rows.map((r) => [r[0] * 1000, r[1]]), own: rows.map((r) => [r[0] * 1000, r[2]]) };
+    }), { label: "Return of each copy and of each golden wallet itself since it was followed", empty });
   }
 
   function renderPaper(d) {
@@ -643,9 +648,14 @@
       { key: "model_oos_roi", label: "Screen OOS", num: true, title: "copier return the screen measured in the hidden window", render: (l) => pct(l.model_oos_roi) },
       { key: "last_leader_fill", label: "Last leader trade", render: (l) => `<span class="muted">${fmtTime(l.last_leader_fill)}</span>` },
     ], L, { sortKey: "equity", dir: -1, empty: st.exists ? "No leaders in the database." : "Start the service to create the paper accounts." });
-    const charts = $("#paper-charts");
-    charts.innerHTML = L.map((l) => `<div class="panel tight"><div class="mini"><div class="mini-head"><b>${shortAddr(l.address)}</b><span class="caption ${signCls(l.roi)}">${fmtPct(l.roi)}</span></div><div class="chart" style="padding:0" data-addr="${esc(l.address)}"></div></div></div>`).join("");
-    for (const l of L) drawMini(charts.querySelector(`[data-addr="${l.address}"]`), (st.snapshots || {})[l.address] || [], l);
+    const snaps = st.snapshots || {};
+    drawCompare($("#paper-compare"), "paper", L.map((l) => {
+      const rows = snaps[l.address] || [], base = l.equity_base, ls = l.leader_equity_start;
+      return { id: l.address, label: shortAddr(l.address) + (l.name ? " · " + l.name : ""), title: l.address,
+               copy: base ? rows.filter((r) => isNum(r[1])).map((r) => [r[0], r[1] / base - 1]) : [],
+               own: ls ? rows.filter((r) => isNum(r[2])).map((r) => [r[0], r[2] / ls - 1]) : [] };
+    }), { label: "Return of each copy account and of each leader's own account since the test started",
+          empty: st.exists ? "Waiting for snapshots (one every five minutes)." : "Start the service to create the paper accounts." });
     const pos = L.flatMap((l) => (l.positions || []).map((p) => ({ ...p, leader: l.address })));
     sortableTable($("#paper-positions"), [
       { key: "leader", label: "Leader", render: (p) => `<span class="addr">${shortAddr(p.leader)}</span>` },
@@ -675,22 +685,132 @@
     $("#paper-events").textContent = (st.events || []).map((e) => `[${fmtTime(e.time)}] ${e.level}: ${e.message}`).join("\n");
   }
 
-  function drawMini(container, snaps, l) {
-    const pts = snaps.filter((s) => isNum(s[0]) && isNum(s[1]));
-    if (pts.length < 2) { container.innerHTML = `<div class="caption" style="padding: 18px 0">Waiting for snapshots (one every five minutes).</div>`; return; }
-    const base = l.equity_base || 1000, ls = l.leader_equity_start;
-    const lead = isNum(ls) && ls > 0 ? pts.filter((s) => isNum(s[2])).map((s) => [s[0], s[2] / ls * base]) : [];
-    const W = chartWidth(container) + 32, H = 120, m = { l: 44, r: 8, t: 8, b: 18 };
-    const x0 = pts[0][0], x1 = pts[pts.length - 1][0];
-    const ys = pts.map((p) => p[1]).concat(lead.map((p) => p[1]), [base]);
-    const y0 = Math.min(...ys), y1 = Math.max(...ys), pad = (y1 - y0) * 0.1 || base * 0.01;
-    const X = (t) => m.l + (t - x0) / Math.max(1, x1 - x0) * (W - m.l - m.r), Y = (v) => m.t + (y1 + pad - v) / (y1 - y0 + 2 * pad) * (H - m.t - m.b);
-    const path = (arr) => arr.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(" ");
-    container.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Equity of the paper account and of the leader">
-      <line class="zero" x1="${m.l}" x2="${W - m.r}" y1="${Y(base).toFixed(1)}" y2="${Y(base).toFixed(1)}"/>
-      <g class="axis"><text x="${m.l - 6}" y="${Y(base) + 4}" text-anchor="end">${fmtUsdShort(base)}</text><text x="${m.l}" y="${H - 4}">${fmtDate(x0)}</text><text x="${W - m.r}" y="${H - 4}" text-anchor="end">${fmtDate(x1)}</text></g>
-      ${lead.length > 1 ? `<path class="series leader" d="${path(lead)}"/>` : ""}
-      <path class="series" d="${path(pts)}"/></svg>`;
+  // ---------------------------------------------------------------- comparison chart: copies against the real accounts
+  // One hue per account from the eight validated series slots, held while the account is on screen, so hiding one
+  // never repaints the others; the copy is solid, the real account dashed, and each line toggles on its own.
+  // Choices are remembered per chart in this browser.
+  const CMP_MAX = 8;
+  const cmp = {};   // chart key -> { sel: saved choices, or null for the default; sig; last draw's arguments }
+  const lineKey = (slot, kind, on = true) => `<svg width="22" height="10" aria-hidden="true"><line x1="2" y1="5" x2="20" y2="5" stroke="${on ? `var(--series-${slot + 1})` : "var(--color-ink-tertiary)"}" stroke-width="2" stroke-linecap="round"${kind === "own" ? ' stroke-dasharray="6 4"' : ""}/></svg>`;
+
+  function cmpSel(key, accounts) {
+    const c = cmp[key] || (cmp[key] = { sel: store.get("cmp:" + key, null), sig: "", last: null });
+    if (c.sel && accounts.length) for (const id of Object.keys(c.sel)) if (!accounts.some((a) => a.id === id)) delete c.sel[id];
+    if (c.sel) return c.sel;
+    const sel = {};                                        // until the first click: the first four accounts, both lines
+    accounts.slice(0, 4).forEach((a, i) => { sel[a.id] = { copy: true, own: true, slot: i }; });
+    return sel;
+  }
+
+  function cmpToggle(key, id, kind) {
+    const c = cmp[key], sel = c.sel = cmpSel(key, c.last.accounts), cur = sel[id];
+    if (cur) {
+      cur[kind] = !cur[kind];
+      if (!cur.copy && !cur.own) delete sel[id];         // frees its colour for another account
+    } else {
+      const used = new Set(Object.values(sel).map((v) => v.slot));
+      const slot = [...Array(CMP_MAX).keys()].find((i) => !used.has(i));
+      if (slot === undefined) { toast(`Up to ${CMP_MAX} accounts at once: hide one to show another.`); return; }
+      sel[id] = { copy: kind === "copy", own: kind === "own", slot };
+    }
+    store.set("cmp:" + key, sel);
+    c.sig = "";
+    drawCompare(c.last.container, key, c.last.accounts, c.last.opts);
+  }
+
+  function redrawCompares() {
+    for (const [key, c] of Object.entries(cmp)) if (c.last) drawCompare(c.last.container, key, c.last.accounts, c.last.opts);
+  }
+
+  /** accounts: [{id, label, title, copy: [[ms, return]], own: [[ms, return]]}], returns as fractions (0.1 = +10%). */
+  function drawCompare(container, key, accounts, opts = {}) {
+    const sel = cmpSel(key, accounts), c = cmp[key];
+    c.last = { container, accounts, opts };
+    if (!container.querySelector(".cmp-plot")) {
+      container.innerHTML = `<div class="cmp-legend" role="group" aria-label="Show or hide each line"></div><div class="chart cmp-plot" style="padding: 0"></div>`;
+      container.addEventListener("click", (e) => { const b = e.target.closest(".cmp-btn"); if (b) cmpToggle(key, b.dataset.id, b.dataset.kind); });
+    }
+    const legend = container.querySelector(".cmp-legend"), plot = container.querySelector(".cmp-plot");
+    const sig = JSON.stringify([plot.clientWidth, sel, accounts.map((a) => [a.id, a.label, a.copy.length, a.copy[a.copy.length - 1], a.own.length, a.own[a.own.length - 1]])]);
+    if (sig === c.sig) return;                             // nothing new: keep the render and whatever the pointer shows
+    c.sig = sig;
+    const lastV = (pts) => pts.length ? pts[pts.length - 1][1] : null;
+    legend.innerHTML = accounts.map((a) => {
+      const s = sel[a.id];
+      const btn = (kind, name) => { const on = !!(s && s[kind]); return `<button type="button" class="cmp-btn" data-id="${esc(a.id)}" data-kind="${kind}" aria-pressed="${on}" title="${on ? "Hide" : "Show"} ${name}">${lineKey(s ? s.slot : 0, kind, on)}${name} <b>${fmtPct(lastV(a[kind]))}</b></button>`; };
+      return `<div class="cmp-acc"><span class="cmp-name" title="${esc(a.title || a.id)}">${esc(a.label)}</span>${btn("copy", "copy")}${btn("own", "real")}</div>`;
+    }).join("");
+    const lines = [];
+    for (const a of accounts) {
+      const s = sel[a.id];
+      if (s) for (const kind of ["copy", "own"]) if (s[kind] && a[kind].length) lines.push({ a, kind, slot: s.slot, pts: a[kind] });
+    }
+    if (!lines.length) { plot.innerHTML = `<div class="empty">${esc(accounts.length ? "Every line is hidden: pick one above." : opts.empty || "Nothing to chart yet.")}</div>`; return; }
+
+    const W = Math.max(320, plot.clientWidth || 640), H = 300, m = { l: 4, r: 60, t: 10, b: 26 };
+    let x0 = Infinity, x1 = -Infinity, v0 = 0, v1 = 0;
+    for (const l of lines) for (const [t, v] of l.pts) { x0 = Math.min(x0, t); x1 = Math.max(x1, t); v0 = Math.min(v0, v); v1 = Math.max(v1, v); }
+    x1 = Math.max(x1, x0 + 60e3);
+    const pad = (v1 - v0) * 0.08 || 0.01, y0 = v0 - pad, y1 = v1 + pad;
+    const X = (t) => m.l + (t - x0) / (x1 - x0) * (W - m.l - m.r), Y = (v) => m.t + (y1 - v) / (y1 - y0) * (H - m.t - m.b);
+    const color = (slot) => `var(--series-${slot + 1})`;
+    // alternating time bands on local hours or midnights, about a dozen across
+    const HOUR = 3600e3, step = [1, 3, 6, 12, 24, 168].map((h) => h * HOUR).find((st) => (x1 - x0) / st <= 12) || 168 * HOUR;
+    const off = new Date(x0).getTimezoneOffset() * 60e3, edges = [];
+    for (let t = Math.floor((x0 - off) / step) * step + off; t < x1; t += step) edges.push(t);
+    let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" tabindex="0" aria-label="${esc(opts.label || "Return over time")}">`;
+    s += edges.filter((t) => Math.round((t - off) / step) % 2 === 0).map((t) => {
+      const a = X(Math.max(t, x0)), b = X(Math.min(t + step, x1));
+      return `<rect class="band" x="${a.toFixed(1)}" y="${m.t}" width="${(b - a).toFixed(1)}" height="${H - m.t - m.b}"/>`;
+    }).join("");
+    const yt = niceTicks(y0, y1, 7), gap = yt.length > 1 ? (yt[1] - yt[0]) * 100 : 1, nd = gap >= 1 ? 0 : gap >= 0.1 ? 1 : 2;
+    s += `<g class="grid">${yt.map((v) => `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/>`).join("")}</g>`;
+    s += `<line class="zero" x1="${m.l}" x2="${W - m.r}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}"/>`;
+    s += `<g class="axis">${yt.map((v) => `<text x="${W - m.r + 8}" y="${(Y(v) + 4).toFixed(1)}">${fmtPct(v, nd)}</text>`).join("")}`;
+    const day = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const clock = (t) => new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    let lastEnd = -Infinity;
+    for (const t of [x0, ...edges.filter((e) => e > x0)]) {
+      const x = X(t), d = new Date(t), first = t === x0;
+      const label = step >= 24 * HOUR ? day(t) : first ? `${day(t)} ${clock(t)}` : d.getHours() === 0 && d.getMinutes() === 0 ? day(t) : clock(t);
+      const w = label.length * 6.6, left = first ? x : x - w / 2;   // ponytail: estimated caption width; getBBox if labels ever collide
+      if (left < lastEnd + 16 || left + w > W - m.r) continue;
+      s += `<text x="${x.toFixed(1)}" y="${H - 8}" text-anchor="${first ? "start" : "middle"}">${label}</text>`;
+      lastEnd = left + w;
+    }
+    s += `</g>`;
+    const path = (pts) => pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1)).join(" ");
+    s += lines.map((l) => `<path class="cmp-line${l.kind === "own" ? " own" : ""}" style="stroke: ${color(l.slot)}" d="${path(l.pts)}"/>`).join("");
+    s += lines.map((l) => { const p = l.pts[l.pts.length - 1]; return `<circle class="cmp-dot" r="4" cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" style="fill: ${color(l.slot)}"/>`; }).join("");
+    s += `<line class="crosshair" x1="0" x2="0" y1="${m.t}" y2="${H - m.b}" visibility="hidden"/><g class="hover"></g>`;
+    s += `<rect class="hit" x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}"/></svg><div class="tooltip" hidden></div>`;
+    plot.innerHTML = s;
+
+    // hover and keyboard: the crosshair snaps to the nearest snapshot; the tooltip lists every visible line there
+    const times = [...new Set(lines.flatMap((l) => l.pts.map((p) => p[0])))].sort((a, b) => a - b);
+    const valueAt = (pts, t) => { let lo = 0, hi = pts.length - 1, r = -1; while (lo <= hi) { const mid = (lo + hi) >> 1; if (pts[mid][0] <= t) { r = mid; lo = mid + 1; } else hi = mid - 1; } return r < 0 ? null : pts[r][1]; };
+    const nearest = (t) => { let lo = 0, hi = times.length - 1; while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (times[mid] <= t) lo = mid; else hi = mid; } return Math.abs(times[hi] - t) < Math.abs(times[lo] - t) ? hi : lo; };
+    const svg = plot.querySelector("svg"), tip = plot.querySelector(".tooltip"), ch = svg.querySelector(".crosshair"), hov = svg.querySelector(".hover");
+    let cur = -1;
+    const show = (i, cx, cy) => {
+      cur = i;
+      const t = times[i], x = X(t).toFixed(1);
+      ch.setAttribute("x1", x); ch.setAttribute("x2", x); ch.removeAttribute("visibility");
+      const rows = lines.map((l) => ({ l, v: valueAt(l.pts, t) })).filter((r) => r.v !== null).sort((a, b) => b.v - a.v);
+      hov.innerHTML = rows.map((r) => `<circle class="cmp-dot" r="4" cx="${x}" cy="${Y(r.v).toFixed(1)}" style="fill: ${color(r.l.slot)}"/>`).join("");
+      tooltipAt(plot, tip, cx, cy, `<b>${esc(fmtTime(t))}</b>` + rows.map((r) => `<div class="row">${lineKey(r.l.slot, r.l.kind)}<b>${fmtPct(r.v)}</b><span>${esc(r.l.a.label)} · ${r.l.kind === "own" ? "real" : "copy"}</span></div>`).join(""));
+    };
+    const at = (i) => { const r = svg.getBoundingClientRect(); show(i, r.left + X(times[i]) * r.width / W, r.top + (m.t + 24) * r.height / H); };
+    const hide = () => { tip.hidden = true; ch.setAttribute("visibility", "hidden"); hov.innerHTML = ""; };
+    svg.addEventListener("mousemove", (e) => { const r = svg.getBoundingClientRect(), sx = (e.clientX - r.left) * W / r.width; show(nearest(x0 + (sx - m.l) / (W - m.l - m.r) * (x1 - x0)), e.clientX, e.clientY); });
+    svg.addEventListener("mouseleave", hide);
+    svg.addEventListener("focus", () => at(times.length - 1));
+    svg.addEventListener("blur", hide);
+    svg.addEventListener("keydown", (e) => {               // arrows walk the crosshair through time
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      at(Math.max(0, Math.min(times.length - 1, (cur < 0 ? times.length - 1 : cur) + (e.key === "ArrowRight" ? 1 : -1))));
+    });
   }
 
   $("#form-paper").addEventListener("submit", async (e) => {
@@ -703,12 +823,13 @@
 
   // ---------------------------------------------------------------- pump.fun
   const pump = { timer: null };
-  function startPumpPolling() { stopPumpPolling(); loadPump(); pump.timer = setInterval(loadPump, 30000); }
+  function startPumpPolling() { stopPumpPolling(); loadPump(); pump.timer = setInterval(loadPump, 15000); }
   function stopPumpPolling() { clearInterval(pump.timer); pump.timer = null; }
   async function loadPump() {
-    let d;
-    try { d = await api("GET", "/api/pump"); } catch (e) { toast(e.message); return; }
+    let d, pp;
+    try { [d, pp] = await Promise.all([api("GET", "/api/pump"), api("GET", "/api/pump/paper")]); } catch (e) { toast(e.message); return; }
     renderPump(d);
+    renderPumpPaper(pp);
   }
   const solscan = (a) => `<a class="addr" href="https://solscan.io/account/${esc(a)}" target="_blank" rel="noopener" title="${esc(a)}">${shortAddr(a)}</a>`;
   const solAmt = (x) => isNum(x) ? `<span class="${signCls(x)}">${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}</span>` : "n/a";
