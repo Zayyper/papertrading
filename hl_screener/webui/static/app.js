@@ -428,7 +428,7 @@
   }
   const chartWidth = (container) => Math.max(320, (container.clientWidth || 640) - 32);
   let resizeTimer = null;
-  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { redrawCharts(); redrawCompares(); drawRules($("#strat-chart"), lastRules); }, 150); });
+  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { redrawCharts(); redrawCompares(); drawRules($("#strat-chart"), lastRules); drawRules($("#mature-chart"), lastMature, "coin"); }, 150); });
 
   function niceTicks(lo, hi, n) {
     if (!(hi > lo)) return [lo];
@@ -956,21 +956,56 @@
       { key: "pnl_sol", label: "Total, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
       { key: "n", label: "Launches", num: true, render: (r) => fmtInt(r.n) },
     ], rules, { sortKey: "roi", dir: -1, empty: "No comparison yet: it is computed with the ranking, every 30 minutes." });
+    renderMature(s.mature || {});
   }
 
-  function drawRules(container, rules) {
+  // ---------------------------------------------------------------- strategy: mature coins, bought later in their life
+  const MATURE_TRIG = { near: "Curve ~80% full", grad: "Just migrated", mc100k: "Reached ~$100k", aged1h: "Still up 1 h after migrating" };
+  const MATURE_COHORT = { all: "All coins", organic: "Organic", instant: "Instant" };
+  const MATURE_RULE = {
+    "5m": "out after 5 min", "30m": "out after 30 min", "2h": "out after 2 h", "6h": "out after 6 h",
+    tp20_sl10: "+20% or −10%, else out at 6 h", tp50_sl25: "+50% or −25%, else out at 6 h", tp100_sl50: "+100% or −50%, else out at 6 h",
+  };
+  let lastMature = [], matTrig = store.get("mature:trig", "grad"), matCohort = store.get("mature:cohort", "all");
+
+  function renderMature(m) {
+    const trig = m.triggers || {}, counts = m.counts || {}, p = m.params || {};
+    const trigs = Object.keys(MATURE_TRIG).filter((k) => trig[k]);
+    if (!trigs.includes(matTrig)) matTrig = trigs[0] || "grad";
+    const groups = trig[matTrig] || {}, n = counts[matTrig] || {};
+    const cohorts = Object.keys(MATURE_COHORT).filter((k) => (groups[k] || []).length);
+    if (!cohorts.includes(matCohort)) matCohort = cohorts[0] || "all";
+    $("#mature-trig").innerHTML = trigs.map((k) => `<button type="button" data-trig="${k}" class="${k === matTrig ? "active" : ""}">${esc(MATURE_TRIG[k])} <b>${fmtInt((counts[k] || {}).all)}</b></button>`).join("");
+    $("#mature-cohort").innerHTML = cohorts.map((k) => `<button type="button" data-mcohort="${k}" class="${k === matCohort ? "active" : ""}">${esc(MATURE_COHORT[k])} <b>${fmtInt(n[k])}</b></button>`).join("");
+    const rules = lastMature = groups[matCohort] || [];
+    $("#mature-rule").textContent = rules.length
+      ? `${fmtInt(n[matCohort])} coins, each bought with ${p.stake_sol} SOL two slots after the trade it reacts to, then sold by each rule in turn. The fee, priority fee and tip are the launches' own.`
+      : "";
+    drawRules($("#mature-chart"), rules, "coin");
+    sortableTable($("#mature-table"), [
+      { key: "rule", label: "Rule", render: (r) => `<b>${esc(r.rule)}</b> <span class="muted">${esc(MATURE_RULE[r.rule] || "")}</span>` },
+      { key: "roi", label: "Per coin", num: true, title: "profit per SOL put in, after the fee, the priority fee and the tip", render: (r) => pct(r.roi) },
+      { key: "roi_h1", label: "1st half", num: true, render: (r) => pct(r.roi_h1) },
+      { key: "roi_h2", label: "2nd half", num: true, render: (r) => pct(r.roi_h2) },
+      { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
+      { key: "pnl_sol", label: "Total, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
+      { key: "n", label: "Coins", num: true, render: (r) => fmtInt(r.n) },
+    ], rules, { sortKey: "roi", dir: -1, empty: "No coin is old enough yet: each one is looked at 30 hours after launch, then every 5 minutes as more come of age." });
+  }
+
+  function drawRules(container, rules, unit = "launch") {
     if (!rules.length) { container.innerHTML = ""; return; }
     const rowH = 32, W = chartWidth(container), m = { l: 92, r: 64, t: 8, b: 24 }, H = rules.length * rowH + m.t + m.b;
     const vals = rules.map((r) => r.roi || 0), lo = Math.min(0, ...vals), hi = Math.max(0, ...vals), pad = (hi - lo) * 0.15 || 0.01;
     const X = (v) => m.l + (v - lo + pad) / (hi - lo + 2 * pad) * (W - m.l - m.r);
     const ticks = niceTicks(lo - pad, hi + pad, 5);
-    let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Profit per launch by exit rule">`;
+    let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Profit per ${unit} by exit rule">`;
     s += `<g class="grid">${ticks.map((v) => `<line x1="${X(v).toFixed(1)}" x2="${X(v).toFixed(1)}" y1="${m.t}" y2="${H - m.b}"/>`).join("")}</g>`;
     s += `<g class="axis">${ticks.map((v) => `<text x="${X(v).toFixed(1)}" y="${H - 8}" text-anchor="middle">${fmtPct(v, 0)}</text>`).join("")}</g>`;
     rules.forEach((r, i) => {
       const y = m.t + i * rowH + 5, v = r.roi || 0, x0 = X(0), x1 = X(v), left = Math.min(x0, x1), w = Math.max(Math.abs(x1 - x0), 1);
       s += `<text class="cat" x="${m.l - 10}" y="${y + 15}" text-anchor="end">${esc(r.rule)}</text>`;
-      s += `<rect class="bar ${v >= 0 ? "pos" : "neg"}" x="${left.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="22" rx="4"><title>${esc(r.rule)}: ${fmtPct(r.roi)} per launch</title></rect>`;
+      s += `<rect class="bar ${v >= 0 ? "pos" : "neg"}" x="${left.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="22" rx="4"><title>${esc(r.rule)}: ${fmtPct(r.roi)} per ${unit}</title></rect>`;
       s += `<text class="bar-label" x="${(v >= 0 ? x1 + 8 : x1 - 8).toFixed(1)}" y="${y + 15}" text-anchor="${v >= 0 ? "start" : "end"}">${fmtPct(r.roi)}</text>`;
     });
     container.innerHTML = s + `<line class="zero" x1="${X(0).toFixed(1)}" x2="${X(0).toFixed(1)}" y1="${m.t}" y2="${H - m.b}"/></svg>`;
@@ -1042,6 +1077,18 @@
     const b = e.target.closest("[data-cohort]");
     if (!b) return;
     store.set("strat:cohort", cohort = b.dataset.cohort);
+    loadPump();
+  });
+  $("#mature-trig").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-trig]");
+    if (!b) return;
+    store.set("mature:trig", matTrig = b.dataset.trig);
+    loadPump();
+  });
+  $("#mature-cohort").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-mcohort]");
+    if (!b) return;
+    store.set("mature:cohort", matCohort = b.dataset.mcohort);
     loadPump();
   });
   $("#btn-config-save").addEventListener("click", saveConfig);
