@@ -56,6 +56,8 @@ MIN_FREE_GB = 1.0              # below this much free disk, trades are not store
 SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
 SNIPER_EVERY_S = 300           # how often that ranking is redone; it turns over fast
 SNIPER_WINDOW_H = 2.0          # the snipes it is ranked on
+CURVE_START_SOL = 30.0         # a fresh curve's virtual SOL: what is in it beyond this was bought
+LATE_STATES = ("x180", "e20", "e50", "c8", "c8x")   # the later entries' states, see _late_states
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -217,7 +219,9 @@ CREATE TABLE IF NOT EXISTS launches (
   be_vsol INTEGER, be_vtok INTEGER, t20_vsol INTEGER, t20_vtok INTEGER, t50_vsol INTEGER, t50_vtok INTEGER,
   t100_vsol INTEGER, t100_vtok INTEGER, fee_in REAL, fee_out REAL, stake REAL, latency INTEGER,
   buyers TEXT, dev_buy REAL,    -- who sniped it (our own wallet ids) and what the maker put into its own bag
-  s30_vsol INTEGER, s30_vtok INTEGER, s60_vsol INTEGER, s60_vtok INTEGER);   -- the price 30 s and 60 s in
+  s30_vsol INTEGER, s30_vtok INTEGER, s60_vsol INTEGER, s60_vtok INTEGER,    -- the price 30 s and 60 s in
+  x180_vsol INTEGER, x180_vtok INTEGER, e20_vsol INTEGER, e20_vtok INTEGER, e50_vsol INTEGER, e50_vtok INTEGER,
+  c8_vsol INTEGER, c8_vtok INTEGER, c8x_vsol INTEGER, c8x_vtok INTEGER, late INTEGER);   -- the later entries (LATE_STATES)
 CREATE INDEX IF NOT EXISTS ix_launches_creator ON launches(creator, ts);
 CREATE INDEX IF NOT EXISTS ix_launches_ts ON launches(ts);
 """
@@ -235,6 +239,8 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     for ddl in ("ALTER TABLE launches ADD COLUMN buyers TEXT",               # before maker wallets were linked
                 "ALTER TABLE launches ADD COLUMN dev_buy REAL",
                 *(f"ALTER TABLE launches ADD COLUMN s{s}_{v} INTEGER" for s in (30, 60) for v in ("vsol", "vtok")),
+                *(f"ALTER TABLE launches ADD COLUMN {k}_{v} INTEGER" for k in LATE_STATES for v in ("vsol", "vtok")),
+                "ALTER TABLE launches ADD COLUMN late INTEGER",            # 1 once the later entries are computed
                 "ALTER TABLE mints ADD COLUMN pool TEXT",                    # before PumpSwap tracking
                 "ALTER TABLE follow ADD COLUMN golden_ever INTEGER DEFAULT 1",   # before the top snipers were followed too:
                 "ALTER TABLE follow ADD COLUMN sniper_now INTEGER DEFAULT 0",    # everyone already there was followed for being golden
@@ -740,6 +746,10 @@ def prune(db_path: str | Path, retention_s: float) -> int:
         c.close()
 
 
+def _pct(x: float | None, nd: int = 1) -> str:
+    return f"{x:+.{nd}%}" if x is not None else "n/a"
+
+
 def _best(rules: list[dict[str, Any]] | None) -> str:
     """The top rule of one cohort for the log line, e.g. 'tp100 -1.9%'."""
     b = (rules or [{}])[0]
@@ -789,6 +799,9 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                              strat.get("counts", {}).get("launches"), _best(strat.get("rules")),
                              cnt.get("crew", 0), _best(co.get("crew")), cnt.get("crew_2nd", 0), _best(co.get("crew_2nd")),
                              cnt.get("first_coin", 0), _best(co.get("first_coin")))
+                    for name, rules in co.items():                  # the whole Strategy tab, one line per cohort
+                        log.info("strategies %s (%s launches): %s", name, cnt.get(name, 0), ", ".join(
+                            f"{r['rule']} {_pct(r['roi'])} [{_pct(r['roi_h1'], 0)}/{_pct(r['roi_h2'], 0)}] n{r['n']}" for r in rules))
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed")
 
@@ -925,6 +938,33 @@ def strategy_states(c: sqlite3.Connection, mint: int, cslot: int, cts: int, crea
     for secs in (30, 60):                                    # out on the clock, before the maker usually dumps
         i = next((i for i in range(len(path) - 1, -1, -1) if path[i][5] <= cts + secs), None)
         out[f"s{secs}"] = land(i) if i is not None else None
+    out.update(_late_states(path, land, cts, out["s60"], latency_slots, stake_sol, fee_in, fee_out))
+    return out
+
+
+def _late_states(path: list, land, cts: int, entry60: tuple[int, int] | None, latency_slots: int, stake_sol: float,
+                 fee_in: float, fee_out: float, hold_s: float = 120.0, curve_sol: float = 8.0) -> dict[str, Any]:
+    """A later entry, the rhythm of the steadiest wallet we follow (7VsGe3…): in a minute after launch, or once
+    `curve_sol` SOL has been bought into the curve, and out `hold_s` later.
+
+    x180     in at 60 s (the s60 state), out 2 minutes after that
+    e20/e50  that position worth +20 % / +50 % before the 2 minutes are up
+    c8, c8x  in once 8 SOL is in the curve, out 2 minutes after that"""
+    last_by = lambda t: next((i for i in range(len(path) - 1, -1, -1) if path[i][5] <= t), None)   # noqa: E731
+    out: dict[str, Any] = {k: None for k in LATE_STATES}
+    i60 = last_by(cts + 60)
+    if entry60 and i60 is not None and entry60[0] > 0 and entry60[1] > 0:
+        tokens = entry60[1] - entry60[0] * entry60[1] / (entry60[0] + stake_sol * LAMPORTS / (1 + fee_in))
+        k = last_by(cts + 60 + hold_s)
+        out["x180"] = land(k)
+        landed = path[i60][0] + latency_slots                # our buy lands here: only what trades after it is ours
+        for tp, key in ((0.2, "e20"), (0.5, "e50")):
+            j = next((j for j in range(i60 + 1, k + 1) if path[j][0] >= landed
+                      and _value((path[j][1], path[j][2]), tokens, fee_out) >= (1 + tp) * stake_sol), None)
+            out[key] = land(j) if j is not None else None
+    c = next((i for i, r in enumerate(path) if r[1] >= (CURVE_START_SOL + curve_sol) * LAMPORTS), None)
+    if c is not None:
+        out["c8"], out["c8x"] = land(c), land(last_by(path[c][5] + hold_s))
     return out
 
 
@@ -949,6 +989,28 @@ def launch_pnl(st: dict[str, Any], stake_sol: float = 0.1, tx_cost_sol: float = 
         t = back * LAMPORTS / (1 - fee_out)
         sold = min(tokens, state[1] * (state[0] / (state[0] - t) - 1)) if state[0] > t else tokens
         out["breakeven"] = _value(state, sold, fee_out) + _value(st["maker"], tokens - sold, fee_out) - stake_sol - 3 * tx_cost_sol
+    return {**out, **_late_pnl(st, stake_sol, tx_cost_sol)}
+
+
+def _late_pnl(st: dict[str, Any], stake_sol: float, tx_cost_sol: float) -> dict[str, float]:
+    """The later entries (see _late_states), each its own stake bought at its own, later price."""
+    def bought_at(e: tuple[int, int] | None):
+        if not e or e[0] <= 0 or e[1] <= 0:
+            return None
+        tok = e[1] - e[0] * e[1] / (e[0] + stake_sol * LAMPORTS / (1 + st["fee_in"]))
+        return (lambda state: _value(state, tok, st["fee_out"]) - stake_sol - 2 * tx_cost_sol) if tok > 0 else None
+
+    out: dict[str, float] = {}
+    late = bought_at(st.get("s60")) if st.get("x180") else None
+    if late:
+        out["late60_2m"] = late(st["x180"])
+        out["late60_tp20"] = late(st["e20"] or st["x180"])      # +20 % if it comes within the 2 minutes, else out on time
+        out["late60_tp50"] = late(st["e50"] or st["x180"])
+        if st.get("dev_sold_s") is None or st["dev_sold_s"] > 60:
+            out["late60_2m_held"] = out["late60_2m"]            # only coins whose maker had not sold yet: knowable at 60 s
+    sol8 = bought_at(st.get("c8")) if st.get("c8x") else None
+    if sol8:
+        out["sol8_2m"] = sol8(st["c8x"])
     return out
 
 
@@ -962,7 +1024,8 @@ def strategy_sim(c: sqlite3.Connection, mint: int, cslot: int, creator: int, lat
 LAUNCH_COLS = ("mint", "creator", "slot", "ts", "symbol", "graduated", "dev_sold_s", "peak", "n_trades", "n_buyers",
                "entry_vsol", "entry_vtok", "maker_vsol", "maker_vtok", "end_vsol", "end_vtok", "be_vsol", "be_vtok",
                "t20_vsol", "t20_vtok", "t50_vsol", "t50_vtok", "t100_vsol", "t100_vtok", "fee_in", "fee_out", "stake",
-               "latency", "buyers", "dev_buy", "s30_vsol", "s30_vtok", "s60_vsol", "s60_vtok")
+               "latency", "buyers", "dev_buy", "s30_vsol", "s30_vtok", "s60_vsol", "s60_vtok",
+               *(f"{k}_{v}" for k in LATE_STATES for v in ("vsol", "vtok")), "late")
 
 
 def _snipers_of(c: sqlite3.Connection, mint: int, cslot: int, creator: int, slots: int = 2, keep: int = 12) -> tuple[str, float]:
@@ -983,8 +1046,8 @@ def row_states(r: dict[str, Any]) -> dict[str, Any]:
     """A stored launch back into the states `launch_pnl` prices."""
     at = lambda k: (r[k + "_vsol"], r[k + "_vtok"]) if r.get(k + "_vsol") is not None else None   # noqa: E731
     return {"entry": at("entry"), "maker": at("maker"), "end": at("end"), "be": at("be"), "t20": at("t20"),
-            "t50": at("t50"), "t100": at("t100"), "s30": at("s30"), "s60": at("s60"),
-            "fee_in": r["fee_in"], "fee_out": r["fee_out"]}
+            "t50": at("t50"), "t100": at("t100"), "s30": at("s30"), "s60": at("s60"), **{k: at(k) for k in LATE_STATES},
+            "dev_sold_s": r.get("dev_sold_s"), "fee_in": r["fee_in"], "fee_out": r["fee_out"]}
 
 
 def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake_sol: float = 0.1, hold_s: float = 900,
@@ -1010,9 +1073,9 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
                 flat += list(st[k]) if st and st[k] else [None, None]
             flat += [st["fee_in"], st["fee_out"], stake_sol, latency_slots] if st else [None, None, stake_sol, latency_slots]
             flat += list(_snipers_of(c, mid, slot, creator))
-            for k in ("s30", "s60"):
+            for k in ("s30", "s60", *LATE_STATES):
                 flat += list(st[k]) if st and st[k] else [None, None]
-            rows.append(tuple(flat))
+            rows.append((*flat, 1 if st else None))
         if rows:
             c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         # launches settled before the snipers were recorded, while their trades are still here
@@ -1022,9 +1085,25 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
             c.executemany("UPDATE launches SET buyers = ?, dev_buy = ? WHERE mint = ?",
                           [(*_snipers_of(c, mid, slot, creator), addr) for addr, mid, slot, creator in late])
         c.commit()
+        _backfill_late(c, latency_slots, stake_sol, hold_s, limit)
         return len(rows)
     finally:
         c.close()
+
+
+def _backfill_late(c: sqlite3.Connection, latency_slots: int, stake_sol: float, hold_s: float, limit: int) -> int:
+    """The later entries for launches settled before they existed, while their trades are still here. Computed
+    before anything is written, so the collector's own writes never wait on it."""
+    todo = c.execute("""SELECT l.mint, m.id, m.slot, m.ts, m.creator, l.latency, l.stake FROM launches l JOIN mints m ON m.addr = l.mint
+                        WHERE l.late IS NULL AND l.entry_vsol IS NOT NULL LIMIT ?""", (limit,)).fetchall()
+    rows = []
+    for addr, mid, slot, ts, creator, lat, stake in todo:
+        st = strategy_states(c, mid, slot, ts, creator, lat or latency_slots, stake or stake_sol, hold_s)
+        rows.append((*(v for k in LATE_STATES for v in (st[k] if st and st[k] else (None, None))), addr))
+    if rows:
+        c.executemany(f"UPDATE launches SET {', '.join(f'{k}_vsol = ?, {k}_vtok = ?' for k in LATE_STATES)}, late = 1 WHERE mint = ?", rows)
+        c.commit()
+    return len(rows)
 
 
 def read_launches(c: sqlite3.Connection, days: float = 30, limit: int = 200_000) -> list[dict[str, Any]]:

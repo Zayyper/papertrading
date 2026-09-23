@@ -190,9 +190,9 @@ def main(argv: list[str] | None = None) -> int:
         pumpfun.save_meta(db, "strategies", strat)
         if strat.get("rules"):
             print(f"\nexit rules on {strat['counts']['launches']:,} launches by {strat['counts']['makers']:,} repeat makers "
-                  f"(same entry, {strat['params']['hold_s'] / 60:.0f} min window):")
+                  f"({strat['params']['hold_s'] / 60:.0f} min window; late60 and sol8 buy later):")
             for r in strat["rules"]:
-                print(f"  {r['rule']:<10} {r['roi']:+7.1%} per launch  won {r['win_rate']:>4.0%}  total {r['pnl_sol']:+8.2f} SOL")
+                print(f"  {r['rule']:<15} {r['roi']:+7.1%} per launch  won {r['win_rate']:>4.0%}  total {r['pnl_sol']:+8.2f} SOL  n {r['n']:,}")
         return 0
 
     if a.cmd == "copytest":

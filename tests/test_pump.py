@@ -4,8 +4,8 @@ import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, _best, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
-                                 cohorts_of, maker_table, operator_groups, paper_series, parse_amm_trade, parse_create,
-                                 parse_trade, settle_launches, strategy_sim, twins, update_snipers)
+                                 cohorts_of, launch_pnl, maker_table, operator_groups, paper_series, parse_amm_trade, parse_create,
+                                 parse_trade, settle_launches, strategy_sim, strategy_states, twins, update_snipers)
 
 
 def logs(b: bytes, program: str = PUMP_PROGRAM) -> list[str]:
@@ -277,6 +277,55 @@ def test_each_exit_rule_leaves_at_its_own_price(tmp_path):
     assert abs(res["hold"] - out(at_end)) < 1e-9
     assert res["tp50"] > res["tp20"] > res["copy"]       # leaving before the dev did is what pays here
     assert res["copy"] < res["breakeven"] < res["tp50"]  # the stake came back early, the rest rode down with the dev
+    col.c.close()
+
+
+def test_a_later_entry_buys_at_60_s_or_8_sol_and_sells_two_minutes_later(tmp_path):
+    db = tmp_path / "pump.db"
+    col = Collector(db)
+    dev, m, cv, held = bytes([160]) * 32, bytes([161]) * 32, Curve(), {}
+    now = int(time.time()) - 3600                             # an hour ago: its window has closed
+
+    def trade(slot, dt, who, buy, sol=None):
+        if buy:
+            tok = cv.buy(sol)
+            held[who] = held.get(who, 0) + tok
+            b = trade_bytes(m, who, True, sol, tok, cv.vsol, cv.vtok, ts=now + dt)
+        else:
+            tok = held.pop(who)
+            b = trade_bytes(m, who, False, cv.sell(tok), tok, cv.vsol, cv.vtok, ts=now + dt)
+        col.on_logs(slot, logs(b))
+        return cv.vsol, cv.vtok
+
+    X, A, B, C, D, F = (bytes([170 + i]) * 32 for i in range(6))
+    col.on_logs(1000, logs(create_bytes(m, dev, ts=now)))
+    trade(1000, 0, X, True, 10**9)                            # 31 SOL in the virtual curve
+    trade(1100, 40, A, True, 3 * 10**9)                       # 34
+    at_55s = trade(1150, 55, B, True, 5 * 10**9)              # 39: past 8 SOL bought, and the last price before 60 s
+    at_100s = trade(1300, 100, C, True, 5 * 10**9)            # 44: the 60 s position is up a little over 20 %
+    at_120s = trade(1350, 120, D, True, 12 * 10**9)           # 56: and over 50 %
+    at_170s = trade(1500, 170, A, False)                      # the last trade before 60 s + 2 min
+    trade(1700, 300, F, True, 10**8)
+    col.flush()
+    mint, dev_id = (col.c.execute(q, (b58(k),)).fetchone()[0] for q, k in
+                    (("SELECT id FROM mints WHERE addr = ?", m), ("SELECT id FROM wallets WHERE addr = ?", dev)))
+    st = strategy_states(col.c, mint, 1000, now, dev_id, latency_slots=2, stake_sol=0.1, hold_s=900)
+    assert st["s60"] == st["c8"] == at_55s                    # the 60 s entry and the 8 SOL entry land on the same price here
+    assert (st["e20"], st["e50"]) == (at_100s, at_120s)
+    assert st["x180"] == st["c8x"] == at_170s
+    tokens = at_55s[1] - at_55s[0] * at_55s[1] / (at_55s[0] + 0.1 * 1e9 / 1.0125)
+    out = lambda s: (s[0] - s[0] * s[1] / (s[1] + tokens)) * (1 - 0.0125) / 1e9 - 0.1 - 2 * TX_COST_SOL  # noqa: E731
+    res = launch_pnl(st, 0.1, TX_COST_SOL)
+    assert abs(res["late60_2m"] - out(at_170s)) < 1e-9 and abs(res["sol8_2m"] - out(at_170s)) < 1e-9
+    assert abs(res["late60_tp20"] - out(at_100s)) < 1e-9 and abs(res["late60_tp50"] - out(at_120s)) < 1e-9
+    assert res["late60_2m_held"] == res["late60_2m"]         # the maker never sold
+    assert "late60_2m_held" not in launch_pnl({**st, "dev_sold_s": 30}, 0.1, TX_COST_SOL)   # it had dumped by 60 s: no entry
+    # a launch settled before these rules existed gets them while its trades are still here
+    assert settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=900) == 1
+    col.c.execute("UPDATE launches SET late = NULL, x180_vsol = NULL, x180_vtok = NULL")
+    col.c.commit()
+    settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=900)
+    assert col.c.execute("SELECT late, x180_vsol, x180_vtok FROM launches").fetchone() == (1, *at_170s)
     col.c.close()
 
 

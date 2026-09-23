@@ -912,6 +912,9 @@
     copy: "out when the maker sells", breakeven: "stake back early, ride the rest", tp20: "sell everything at +20%",
     tp50: "sell everything at +50%", tp100: "sell everything at +100%", hold: "no rule, out at the end (control)",
     sell30s: "out on the clock, 30 s in", sell60s: "out on the clock, 60 s in",
+    late60_2m: "in at 60 s, out 2 min later (7VsGe3's rhythm)", late60_tp20: "in at 60 s, +20% or out after 2 min",
+    late60_tp50: "in at 60 s, +50% or out after 2 min", late60_2m_held: "in at 60 s only if the maker has not sold, out 2 min later",
+    sol8_2m: "in once 8 SOL is in the curve, out 2 min later",
   };
   const COHORT_LABEL = {
     all: "All launches", crew: "Sniped by a known crew", crew_2nd: "Crew, second coin on", first_coin: "Crew, first coin",
@@ -941,7 +944,7 @@
         tile("Window", `${Math.round((p.hold_s ?? 900) / 60)} min`, `then out at whatever it is worth · ${fmtNum(((s.window || {}).hours || 0) / 24, 1)} days of launches kept`) +
         tile("Updated", s.generated ? ago(d.now - s.generated) : "never", s.build_s ? `took ${s.build_s}s` : "");
     $("#strat-rule").textContent = rules.length
-      ? `${COHORT_NOTE[cohort]}. Each one bought with ${p.stake_sol} SOL ${p.latency_slots} slots after the creation slot — the earliest a watcher of that wallet could land, right behind the crew — then sold by each rule in turn. Same curve prices, fee, priority fee and tip as everywhere else.`
+      ? `${COHORT_NOTE[cohort]}. Each one bought with ${p.stake_sol} SOL ${p.latency_slots} slots after the creation slot — the earliest a watcher of that wallet could land, right behind the crew — then sold by each rule in turn; the late60 and sol8 rules buy later instead, at 60 s or once 8 SOL is in the curve. Same curve prices, fee, priority fee and tip as everywhere else.`
       : "";
     drawRules($("#strat-chart"), rules);
     sortableTable($("#strat-table"), [
