@@ -120,7 +120,14 @@ any of it.
 ```powershell
 python -m hl_screener pump collect     # stream every pump.fun trade into data/pump/pump.db, rank every 30 min
 python -m hl_screener pump report      # rank now from what was collected
+python -m hl_screener pump dossier     # every followed wallet up close (also logged on each collector start)
 ```
+
+A dossier puts a followed wallet's own record (profit per coin, win rate, how concentrated its
+gains are, 12-hour blocks) next to its style (slots after launch, SOL already in the curve, hold
+time, buy sizes), whose coins it buys (repeat makers, known crews, graduations) and what copying it
+made, including what the wallet itself made on the same coins. Tokens a wallet sold beyond what it
+bought came from elsewhere and earn it nothing in these numbers.
 
 - **Data.** The pump.fun program's own `CreateEvent` and `TradeEvent`, and PumpSwap's
   `CreatePoolEvent`, `BuyEvent` and `SellEvent`, read from Solana's public RPC with
