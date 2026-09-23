@@ -8,15 +8,15 @@ SOL = 10**9
 
 class Coin:
     """A coin's trades: the pump.fun curve until its last real token is sold, then its PumpSwap pool. Sells pay
-    1 % on the pool and buys log none, the way PumpSwap's events read."""
+    `fee_pct` and buys log none, the way PumpSwap's events read."""
     def __init__(self, t0: int):
         self.t0, self.vsol, self.vtok, self.rows = t0, 30 * SOL, 1_073_000_000 * 10**6, []
 
-    def to(self, sec: int, vsol: int, vtok: int | None = None) -> int:
+    def to(self, sec: int, vsol: int, vtok: int | None = None, fee_pct: int = 1) -> int:
         """One trade `sec` s after launch that leaves `vsol` in the reserves (constant product)."""
         vtok = vtok or self.vsol * self.vtok // vsol
         buy, sol = vsol > self.vsol, abs(vsol - self.vsol)
-        fee = 0 if buy else sol // 100
+        fee = 0 if buy else sol * fee_pct // 100
         self.rows.append((1000 + sec * 5 // 2, self.t0 + sec, vsol, vtok, int(buy), sol, fee))
         self.vsol, self.vtok = vsol, vtok
         return len(self.rows) - 1
@@ -42,7 +42,7 @@ def graduating_coin(t0: int) -> tuple[Coin, dict[str, int]]:
     at["1610"] = c.to(1610, 80 * SOL)                    # -13 %
     at["3000"] = c.to(3000, 100 * SOL)                   # above the migration price an hour after it: aged1h
     at["5000"] = c.to(5000, 130 * SOL)                   # 961 SOL of market cap: past $100k
-    at["12000"] = c.to(12000, 60 * SOL)                  # and back down 79 %
+    at["12000"] = c.to(12000, 60 * SOL, fee_pct=2)       # and back down 79 %, at a fee no earlier trade knew
     return c, at
 
 
@@ -55,18 +55,18 @@ def test_each_mature_entry_and_exit_lands_on_its_own_price():
     assert near["entry"] == state(at["near"], FEE) and near["5m"] == state(at["180"], FEE)   # on the curve: its fee
     assert near["tp20_sl10"] == state(at["done"], FEE)                  # +32 % on the last curve trade
     assert near["30m"] == state(at["1610"], 0.01)                       # on the pool: what its sells pay
-    assert grad["entry"] == state(at["grad"], 0.01) and found["grad"]["ts"] == 610
-    assert grad["5m"] == grad["tp20_sl10"] == state(at["810"], 0.01)
-    assert grad["30m"] == state(at["1610"], 0.01) and grad["2h"] == state(at["5000"], 0.01)
+    assert grad["entry"] == state(at["grad"], FEE) and found["grad"]["ts"] == 610   # no pool sell yet: the curve's fee
+    assert grad["5m"] == grad["tp20_sl10"] == state(at["810"], FEE)
+    assert grad["30m"] == state(at["1610"], 0.01) and grad["2h"] == state(at["5000"], 0.01)   # not the 2 % paid later
     assert grad["tp50_sl25"] == grad["tp100_sl50"] == state(at["5000"], 0.01)   # -13 % never hit -25 %
-    assert grad["6h"] == state(at["12000"], 0.01)
+    assert grad["6h"] == state(at["12000"], 0.02)
     assert aged["entry"] == state(at["3000"], 0.01) and found["aged1h"]["ts"] == 610 + 3600   # the hour, not the trade
     assert aged["5m"] == state(at["3000"], 0.01) and aged["2h"] == state(at["5000"], 0.01)    # timed from the hour
-    assert mc["entry"] == state(at["5000"], 0.01) and mc["tp20_sl10"] == state(at["12000"], 0.01)   # the stop
+    assert mc["entry"] == state(at["5000"], 0.01) and mc["tp20_sl10"] == state(at["12000"], 0.02)   # the stop
     v, t, _ = grad["entry"]
-    tokens = t - v * t / (v + 0.5 * SOL / 1.01)
+    tokens = t - v * t / (v + 0.5 * SOL / (1 + FEE))
     v2, t2, _ = grad["tp20_sl10"]
-    want = (v2 - v2 * t2 / (t2 + tokens)) * 0.99 / SOL - 0.5 - 2 * TX_COST_SOL
+    want = (v2 - v2 * t2 / (t2 + tokens)) * (1 - FEE) / SOL - 0.5 - 2 * TX_COST_SOL
     assert abs(mature_pnl(grad, 0.5, TX_COST_SOL)["tp20_sl10"] - want) < 1e-9 and want > 0
     thin = Coin(0)                                       # migrates into a pool a 0.5 SOL order would swamp
     thin.to(0, 100 * SOL)

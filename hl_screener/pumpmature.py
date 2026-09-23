@@ -21,7 +21,6 @@ from __future__ import annotations
 import bisect
 import json
 import sqlite3
-import statistics
 import time
 from pathlib import Path
 from typing import Any
@@ -62,12 +61,15 @@ def coin_entries(path: list[tuple], cts: int, latency_slots: int) -> tuple[dict[
         return {}, None
     slots, times = [r[0] for r in path], [r[1] for r in path]
     done = next((i for i, r in enumerate(path) if r[3] <= CURVE_DONE_VTOK), None)
-    sells = [r[6] / r[5] for r in path[done + 1:] if not r[4] and r[5] >= 10**7] if done is not None else []
-    pool_fee = statistics.median(sells) if sells else FEE   # PumpSwap buy events log almost no fee: a buy pays what a sell does
+    fee_at, rate = [], FEE           # what an order landing on each trade pays, known by then: the curve's fee, then
+    for k, r in enumerate(path):     # the last pool sell that paid one (PumpSwap buy events log almost none)
+        if done is not None and k > done and not r[4] and r[5] >= 10**7 and r[6] > 0:
+            rate = r[6] / r[5]
+        fee_at.append(FEE if done is None or k <= done else rate)
 
     def land(i: int) -> list:
         j = bisect.bisect_left(slots, path[i][0] + latency_slots) - 1
-        return [path[j][2], path[j][3], FEE if done is None or j <= done else pool_fee]
+        return [path[j][2], path[j][3], fee_at[j]]
 
     last_by = lambda t: bisect.bisect_right(times, t) - 1   # noqa: E731 - the last trade at or before t
     cap = lambda i: mcap(path[i][2], path[i][3])             # noqa: E731
