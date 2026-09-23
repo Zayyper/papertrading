@@ -184,8 +184,9 @@ def mature_report(db_path: str | Path, stake_sol: float = STAKE_SOL, tx_cost_sol
     for trig in TRIGGERS:
         for name, keep in cohorts.items():
             sub = [r for r in rows if r["trig"] == trig and keep(r)]
-            if sub:
-                triggers.setdefault(trig, {})[name] = _rules_on(sub, stake_sol, tx_cost_sol, (t0 + t1) / 2, price)
+            if sub:                                          # halves at the median: late entries stretch the window
+                mid = sorted(r["ts"] for r in sub)[len(sub) // 2]
+                triggers.setdefault(trig, {})[name] = _rules_on(sub, stake_sol, tx_cost_sol, mid, price)
                 counts.setdefault(trig, {})[name] = len(sub)
     return {"generated": int(time.time()), "params": params, "counts": counts, "triggers": triggers,
             "window": {"start": t0, "end": t1, "hours": (t1 - t0) / 3600}}

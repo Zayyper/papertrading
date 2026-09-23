@@ -1,6 +1,6 @@
 import time
 
-from hl_screener.pumpfun import FEE, TX_COST_SOL, connect
+from hl_screener.pumpfun import FEE, TX_COST_SOL, _rules_line, _rules_on, connect
 from hl_screener.pumpmature import CURVE_DONE_VTOK, LOOK_AT_S, coin_entries, mature_pnl, mature_report, settle_matures
 
 SOL = 10**9
@@ -96,3 +96,12 @@ def test_mature_coins_are_looked_at_once_when_30_h_old_and_reported(tmp_path):
     assert rep["counts"]["grad"] == {"all": 1, "organic": 1}                 # 10 min to migrate: not a bundle
     tp = next(r for r in rep["triggers"]["grad"]["all"] if r["rule"] == "tp20_sl10")
     assert tp["n"] == 1 and tp["roi"] > 0 and tp["win_rate"] == 1
+    assert tp["median"] == tp["roi"] and tp["roi_ex2"] is None             # one coin: no two best to leave out
+
+
+def test_the_log_says_whether_an_average_is_the_typical_trade_or_two_jackpots():
+    rows = [{"ts": t, "p": p} for t, p in ((1, -0.1), (2, 0.05), (3, 0.5), (4, -0.2))]
+    r = _rules_on(rows, 0.5, 0, 3, lambda row: {"x": row["p"]})[0]
+    assert (r["roi_h1"], r["roi_h2"]) == (-0.05 / 1.0, 0.3 / 1.0)            # the halves split at `mid`
+    assert r["median"] == 0.1 and abs(r["roi_ex2"] + 0.3) < 1e-12            # without +0.5 and +0.05: -0.3 per SOL
+    assert _rules_line([r], detail=True) == "x +12.5% [-5%/+30%] n4 won 50% median +10.0% without top 2 -30.0%"

@@ -750,9 +750,13 @@ def _pct(x: float | None, nd: int = 1) -> str:
     return f"{x:+.{nd}%}" if x is not None else "n/a"
 
 
-def _rules_line(rules: list[dict[str, Any]]) -> str:
-    """Every rule of one group for the log: 'tp100 -2.0% [-2%/-2%] n37217, ...', both halves in brackets."""
-    return ", ".join(f"{r['rule']} {_pct(r['roi'])} [{_pct(r['roi_h1'], 0)}/{_pct(r['roi_h2'], 0)}] n{r['n']}" for r in rules)
+def _rules_line(rules: list[dict[str, Any]], detail: bool = False) -> str:
+    """Every rule of one group for the log: 'tp100 -2.0% [-2%/-2%] n37217, ...', both halves in brackets; with
+    `detail`, also the win rate, the median trade and the average without the two best."""
+    def one(r: dict[str, Any]) -> str:
+        s = f"{r['rule']} {_pct(r['roi'])} [{_pct(r['roi_h1'], 0)}/{_pct(r['roi_h2'], 0)}] n{r['n']}"
+        return s + (f" won {r['win_rate']:.0%} median {_pct(r.get('median'))} without top 2 {_pct(r.get('roi_ex2'))}" if detail else "")
+    return ", ".join(one(r) for r in rules)
 
 
 def _best(rules: list[dict[str, Any]] | None) -> str:
@@ -821,7 +825,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                     for trig, groups in (mat.get("triggers") or {}).items():
                         for name, rules in groups.items():
                             log.info("mature %s %s (%s coins, %s SOL each): %s", trig, name, mat["counts"][trig][name],
-                                     mat["params"]["stake_sol"], _rules_line(rules))
+                                     mat["params"]["stake_sol"], _rules_line(rules, detail=True))
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed")
 
@@ -1243,21 +1247,24 @@ def _rules_on(rows: list[dict[str, Any]], stake_sol: float, tx_cost_sol: float, 
               pnl_of=None) -> list[dict[str, Any]]:
     """Each exit rule over one set of launches, or of any rows `pnl_of` prices (pumpmature's entries)."""
     pnl_of = pnl_of or (lambda r: launch_pnl(row_states(r), stake_sol, tx_cost_sol))
-    acc: dict[str, dict[str, float]] = {}
+    acc: dict[str, dict[str, Any]] = {}
     for r in rows:
         half = "h1" if r["ts"] < mid else "h2"
         for name, pnl in pnl_of(r).items():
-            a = acc.setdefault(name, {"n": 0, "pnl": 0.0, "wins": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0})
+            a = acc.setdefault(name, {"n": 0, "pnl": 0.0, "wins": 0, "n_h1": 0, "pnl_h1": 0.0, "n_h2": 0, "pnl_h2": 0.0, "each": []})
             a["n"] += 1
             a["pnl"] += pnl
             a["wins"] += pnl > 0
             a["n_" + half] += 1
             a["pnl_" + half] += pnl
+            a["each"].append(pnl)
     out = []
     for name, a in acc.items():
         roi = {k: (a["pnl" + k] / (a["n" + k] * stake_sol) if a["n" + k] else None) for k in ("", "_h1", "_h2")}
+        xs = sorted(a["each"])                              # is the average a few jackpots, or the typical trade?
         out.append({"rule": name, "n": a["n"], "pnl_sol": a["pnl"], "roi": roi[""], "roi_h1": roi["_h1"],
-                    "roi_h2": roi["_h2"], "win_rate": a["wins"] / a["n"] if a["n"] else None})
+                    "roi_h2": roi["_h2"], "win_rate": a["wins"] / a["n"] if a["n"] else None,
+                    "median": xs[len(xs) // 2] / stake_sol, "roi_ex2": sum(xs[:-2]) / ((len(xs) - 2) * stake_sol) if len(xs) > 2 else None})
     return sorted(out, key=lambda r: r["roi"] if r["roi"] is not None else -9, reverse=True)
 
 

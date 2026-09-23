@@ -988,6 +988,8 @@
       { key: "roi_h1", label: "1st half", num: true, render: (r) => pct(r.roi_h1) },
       { key: "roi_h2", label: "2nd half", num: true, render: (r) => pct(r.roi_h2) },
       { key: "win_rate", label: "Won", num: true, render: (r) => fmtPct(r.win_rate, 0) },
+      { key: "median", label: "Median", num: true, title: "the typical coin, not the average", render: (r) => pct(r.median) },
+      { key: "roi_ex2", label: "Without top 2", num: true, title: "the average once the two best coins are left out: is it a couple of jackpots?", render: (r) => pct(r.roi_ex2) },
       { key: "pnl_sol", label: "Total, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
       { key: "n", label: "Coins", num: true, render: (r) => fmtInt(r.n) },
     ], rules, { sortKey: "roi", dir: -1, empty: "No coin is old enough yet: each one is looked at 30 hours after launch, then every 5 minutes as more come of age." });
