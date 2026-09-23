@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import random
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -40,22 +41,25 @@ class _WeightLimiter:
     def __init__(self, weight_per_minute: int):
         self.cap = weight_per_minute
         self.events: deque[tuple[float, int]] = deque()
+        self.lock = threading.Lock()                  # the copy-test collector calls from several threads at once
 
     def add(self, weight: int) -> None:
         """Charge weight after the fact (e.g. per-item surcharges known only from the response)."""
         if weight > 0:
-            self.events.append((time.monotonic(), weight))
+            with self.lock:
+                self.events.append((time.monotonic(), weight))
 
     def acquire(self, weight: int) -> None:
         while True:
-            now = time.monotonic()
-            while self.events and now - self.events[0][0] > 60.0:
-                self.events.popleft()
-            used = sum(w for _, w in self.events)
-            if used + weight <= self.cap:
-                self.events.append((now, weight))
-                return
-            sleep_for = 60.0 - (now - self.events[0][0]) + 0.05
+            with self.lock:
+                now = time.monotonic()
+                while self.events and now - self.events[0][0] > 60.0:
+                    self.events.popleft()
+                used = sum(w for _, w in self.events)
+                if used + weight <= self.cap:
+                    self.events.append((now, weight))
+                    return
+                sleep_for = 60.0 - (now - self.events[0][0]) + 0.05
             log.debug("rate limit: sleeping %.1fs", sleep_for)
             time.sleep(max(sleep_for, 0.1))
 
@@ -290,6 +294,10 @@ class HyperliquidAPI:
         page = self._post({"type": "userFillsByTime", "user": user, "startTime": start_ms}, 20)
         self.limiter.add(len(page) // 20)
         return sorted(page, key=lambda f: (int(f["time"]), f.get("tid", 0)))
+
+    def funding_since(self, coin: str, start_ms: int) -> list[dict[str, Any]]:
+        """Hourly funding from start_ms to now, one page (500 hours), uncached (the copy-test collector's hourly top-up)."""
+        return self._post({"type": "fundingHistory", "coin": coin, "startTime": start_ms}, 20)
 
     def funding_history(self, coin: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
         """Hourly funding records; paginated (500 per response)."""

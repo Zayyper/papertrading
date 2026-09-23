@@ -89,6 +89,18 @@ def main(argv: list[str] | None = None) -> int:
                                                        "(default: the measured feed delay + 1, at least 2)")
     pf.add_argument("--stake", type=float, default=0.1, help="report: SOL the copier puts into each copied buy")
 
+    ct = sub.add_parser("copytest", help="copy test on Hyperliquid: book captured after every leader trade (Postgres), "
+                                         "copy gap per wallet, delay curve, random-wallet test, holdout judged once")
+    ct.add_argument("action", choices=["collect", "report", "gap", "holdout", "log"])
+    ct.add_argument("address", nargs="?", help="gap: the wallet, every copied order itemised (the hand check)")
+    ct.add_argument("--plan", default="copytest.toml", help="the test plan (frozen in the database on the first collect)")
+    ct.add_argument("--db-url", help="Postgres URL (default HL_DATABASE_URL)")
+    ct.add_argument("--delay", type=float, help="report/gap: one delay in seconds instead of the plan's list")
+    ct.add_argument("--fee-bps", type=float, help="report/gap: taker + builder fee instead of the plan's")
+    ct.add_argument("--leverage", type=float, help="report/gap: follower leverage cap instead of the plan's")
+    ct.add_argument("--slippage-bps", type=float, help="report/gap: fill at the captured mid +/- this many bps instead of walking the book")
+    ct.add_argument("--no-funding", action="store_true", help="report/gap: leave funding out")
+
     u = sub.add_parser("ui", help="local web page: run jobs, watch progress, browse results, edit config")
     u.add_argument("--host", default="127.0.0.1")
     u.add_argument("--port", type=int, default=8765)
@@ -177,6 +189,17 @@ def main(argv: list[str] | None = None) -> int:
             for r in strat["rules"]:
                 print(f"  {r['rule']:<10} {r['roi']:+7.1%} per launch  won {r['win_rate']:>4.0%}  total {r['pnl_sol']:+8.2f} SOL")
         return 0
+
+    if a.cmd == "copytest":
+        url = a.db_url or os.environ.get("HL_DATABASE_URL") or ("" if os.environ.get("PGHOST") else None)   # "": libpq's PG* variables
+        if url is None:
+            print("no database: set HL_DATABASE_URL (or PGHOST, PGUSER, PGPASSWORD, PGDATABASE) or pass --db-url", file=sys.stderr)
+            return 2
+        if a.action == "collect":
+            from .tape import collect
+            return collect(url, Path(a.plan), cfg, Path.cwd())
+        from .copygap import cli as copygap_cli
+        return copygap_cli(a, url)
 
     if a.cmd == "paper":
         from .paper import print_status

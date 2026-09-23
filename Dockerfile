@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.toml README.md ./
+COPY config.toml copytest.toml README.md ./
 COPY hl_screener ./hl_screener
 COPY design ./design
 COPY paper ./paper

@@ -1,0 +1,41 @@
+# The copy test: who is copied, how, and what counts as a pass, written down before the data exists.
+#
+# The collector (`python -m hl_screener copytest collect`) records this file's SHA-256 the first time it starts.
+# From then on the stored copy is the plan: editing this file changes nothing and is logged as a mismatch.
+# The only way to change the plan is a new `id` whose holdout has not started yet (the old one is then abandoned,
+# never evaluated). Everything before `holdout.start` is the development window: look at it as often as you like,
+# every look is logged. The holdout is evaluated once, by the collector, after `holdout.end` + the longest delay,
+# and its result is stored for good.
+
+id = "h1"
+
+[groups]
+shortlist = "paper/leaders.csv"   # the screener's picks (the 9 paper-traded leaders of the 2026-09-17 screen)
+top_n = 5                         # the leaderboard's top 5 by 30-day PnL, as of the first start: the naive copier
+top_window = "month"
+random_n = 40                     # random wallets from the screener's own pool (config.toml [pool]) that traded
+random_seed = 7                   # in the last week: what picking at random would have given
+
+[copy]
+delays_s = [3, 30, 300, 3600]     # the curve: how the copyable edge shrinks with delay
+equity_usd = 1000.0               # each copied wallet gets this much, sized like the paper trader
+max_leverage = 10.0
+taker_fee_bps = 4.5               # HL base-tier taker fee: a copier always takes
+builder_fee_bps = 0.0
+funding = true
+slippage = "book"                 # walk the order book captured at trade time + delay
+
+[holdout]
+start = "2026-10-08"              # UTC dates, start inclusive, end exclusive
+end = "2026-10-29"
+delay_s = 3                       # the copy speed the verdict is judged at
+
+[rules]                           # PASS only if every rule holds, all on the holdout at `holdout.delay_s`
+min_return = 0.0                  # the shortlist copy made money after fees, funding and slippage
+beat_btc_hold = true              # ... more than holding BTC
+beat_risk_matched = true          # ... more than BTC scaled to the copy's own volatility
+beat_top_n = true                 # ... more than copying the leaderboard's top 5
+max_random_p = 0.05               # at most 5% of random portfolios (same size, same pool) did as well
+max_drawdown = 0.30               # of the copy portfolio, hourly marks
+min_actions = 30                  # enough copied trades to judge
+min_coverage = 0.90               # leader orders priced from a book captured on time

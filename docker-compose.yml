@@ -32,6 +32,34 @@ services:
       - hl-data:/app/data
       - hl-out:/app/out
 
+  # the copy test (copytest.toml): the order book after every trade of the tracked wallets, in Postgres.
+  # Coolify generates SERVICE_PASSWORD_COPYTEST on the first deploy; the database is only reachable inside this stack.
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=20"]
+    environment:
+      POSTGRES_USER: hl
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_COPYTEST}
+      POSTGRES_DB: hl
+    volumes:
+      - hl-pg:/var/lib/postgresql/data
+
+  tape:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "hl_screener", "copytest", "collect"]
+    depends_on:
+      - db
+    environment:
+      PGHOST: db
+      PGUSER: hl
+      PGPASSWORD: ${SERVICE_PASSWORD_COPYTEST}
+      PGDATABASE: hl
+    volumes:
+      - hl-data:/app/data
+
 volumes:
   hl-data:
   hl-out:
+  hl-pg:
