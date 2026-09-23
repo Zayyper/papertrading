@@ -297,6 +297,31 @@ def test_a_launch_is_only_in_the_crew_cohort_once_the_crew_was_already_known():
     assert _best(None) == "n/a"                               # an empty cohort still gets its slot in the line
 
 
+def test_a_dossier_puts_a_wallets_own_trades_next_to_its_copies(tmp_path):
+    from hl_screener.pumpdossier import dossiers
+    from hl_screener.pumpfun import connect
+    db, L = tmp_path / "pump.db", 10**9
+    c = connect(db)
+    c.executemany("INSERT INTO wallets(id, addr) VALUES (?, ?)", [(1, "G"), (2, "M")])
+    c.executemany("INSERT INTO mints(id, addr, slot, ts, creator) VALUES (?, ?, ?, ?, 2)", [(1, "coin1", 100, 1000), (2, "coin2", 200, 2000)])
+    c.executemany("INSERT INTO trades(slot, ts, mint, wallet, buy, sol, tok, fee, vsol, vtok) VALUES (?,?,?,?,?,?,?,?,?,?)", [
+        (101, 1000, 1, 1, 1, L, 1000, 0, 32 * L, 1),         # a slot after launch, 1 SOL already in the curve
+        (110, 1004, 1, 1, 0, 2 * L, 1000, 0, 30 * L, 1),     # out 4 s later for 2 SOL: +1
+        (260, 2030, 2, 1, 1, L, 500, 0, 40 * L, 1),          # 60 slots after launch
+        (270, 2040, 2, 1, 0, L // 2, 500, 0, 39 * L, 1)])    # -0.5
+    c.execute("INSERT INTO follow(wallet, added_at, golden_now, golden_ever) VALUES ('G', 0, 1, 1)")
+    c.executemany("INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, sol, slip_bps, pnl, timed_out) VALUES (?,?,?,?,?,?,?,?,?)",
+                  [("G", "coin1", "buy", 101, 103, 0.1, 150.0, None, 0), ("G", "coin1", "sell", 110, 112, 0.18, 80.0, 0.07, 0)])
+    c.commit()
+    c.close()
+    out = "\n".join(dossiers(db))
+    assert "dossier G (golden now)" in out
+    assert "2 closed +0.500 SOL on 2.00 SOL spent (+25.0%), won +50.0%" in out
+    assert "0-1 slots after launch 50%" in out and "11-150 slots after launch 50%" in out
+    assert "1 copies, 1 closed, +0.070 SOL on 0.10 SOL (+70.0%)" in out and "delay p50 2 slots" in out
+    assert "the wallet on those same 1 coins: +1.000 SOL (+100.0%)" in out     # what the copy left on the table
+
+
 def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():
     def launch(creator, buyers, ts=0):
         return {"creator": creator, "buyers": ",".join(buyers), "ts": ts}

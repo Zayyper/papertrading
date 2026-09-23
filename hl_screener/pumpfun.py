@@ -757,6 +757,12 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
     halt = threading.Event()
 
     def maintenance() -> None:                                 # own thread and connection: never stalls the feed
+        try:                                                   # once per start: the followed wallets up close, in the log
+            from .pumpdossier import dossiers
+            for line in dossiers(db_path):
+                log.info("%s", line)
+        except Exception:  # noqa: BLE001
+            log.exception("dossiers failed")
         last_report, last_top = time.time(), []
         while not halt.wait(sniper_every_s):
             try:

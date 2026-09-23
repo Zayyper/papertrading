@@ -81,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--status", action="store_true", help="print the current state of the paper accounts and exit")
 
     pf = sub.add_parser("pump", help="pump.fun on Solana: find snipers and consistently profitable traders, test copyability")
-    pf.add_argument("action", choices=["collect", "report"])
+    pf.add_argument("action", choices=["collect", "report", "dossier"])
+    pf.add_argument("wallets", nargs="*", help="dossier: these wallets (default: every golden wallet and every wallet copied 5+ times)")
     pf.add_argument("--db", help="sqlite file (default <data_dir>/pump/pump.db)")
     pf.add_argument("--ws", help="Solana websocket RPC (default SOLANA_WS_URL, else the public mainnet endpoint)")
     pf.add_argument("--retention-days", type=float, help="keep this many days of tokens (default PUMP_RETENTION_DAYS, else 3)")
@@ -174,6 +175,10 @@ def main(argv: list[str] | None = None) -> int:
         if not db.exists():
             print(f"no data at {db}: run `python -m hl_screener pump collect` first", file=sys.stderr)
             return 1
+        if a.action == "dossier":
+            from .pumpdossier import dossiers
+            print("\n".join(dossiers(db, a.wallets or None)))
+            return 0
         settled = pumpfun.settle_launches(db)
         if settled:
             print(f"settled {settled:,} launches into the permanent history")
