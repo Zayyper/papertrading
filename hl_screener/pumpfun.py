@@ -1075,7 +1075,7 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
             flat += list(_snipers_of(c, mid, slot, creator))
             for k in ("s30", "s60", *LATE_STATES):
                 flat += list(st[k]) if st and st[k] else [None, None]
-            rows.append((*flat, 1 if st else None))
+            rows.append((*flat, LATE_DONE if st else None))
         if rows:
             c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         # launches settled before the snipers were recorded, while their trades are still here
@@ -1091,17 +1091,22 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
         c.close()
 
 
+LATE_DONE = 2                  # `launches.late`: 2 once the clock states (s30, s60) and the later entries are all stored
+
+
 def _backfill_late(c: sqlite3.Connection, latency_slots: int, stake_sol: float, hold_s: float, limit: int) -> int:
-    """The later entries for launches settled before they existed, while their trades are still here. Computed
-    before anything is written, so the collector's own writes never wait on it."""
+    """The clock states and the later entries for launches settled before they existed, while their trades are
+    still here: the 60 s state is also the late60 rules' entry, and launches settled before 276e76c never had it.
+    Computed before anything is written, so the collector's own writes never wait on it."""
+    keys = ("s30", "s60", *LATE_STATES)
     todo = c.execute("""SELECT l.mint, m.id, m.slot, m.ts, m.creator, l.latency, l.stake FROM launches l JOIN mints m ON m.addr = l.mint
-                        WHERE l.late IS NULL AND l.entry_vsol IS NOT NULL LIMIT ?""", (limit,)).fetchall()
+                        WHERE COALESCE(l.late, 0) < ? AND l.entry_vsol IS NOT NULL LIMIT ?""", (LATE_DONE, limit)).fetchall()
     rows = []
     for addr, mid, slot, ts, creator, lat, stake in todo:
         st = strategy_states(c, mid, slot, ts, creator, lat or latency_slots, stake or stake_sol, hold_s)
-        rows.append((*(v for k in LATE_STATES for v in (st[k] if st and st[k] else (None, None))), addr))
+        rows.append((*(v for k in keys for v in (st[k] if st and st[k] else (None, None))), addr))
     if rows:
-        c.executemany(f"UPDATE launches SET {', '.join(f'{k}_vsol = ?, {k}_vtok = ?' for k in LATE_STATES)}, late = 1 WHERE mint = ?", rows)
+        c.executemany(f"UPDATE launches SET {', '.join(f'{k}_vsol = ?, {k}_vtok = ?' for k in keys)}, late = {LATE_DONE} WHERE mint = ?", rows)
         c.commit()
     return len(rows)
 

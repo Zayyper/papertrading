@@ -320,12 +320,13 @@ def test_a_later_entry_buys_at_60_s_or_8_sol_and_sells_two_minutes_later(tmp_pat
     assert abs(res["late60_tp20"] - out(at_100s)) < 1e-9 and abs(res["late60_tp50"] - out(at_120s)) < 1e-9
     assert res["late60_2m_held"] == res["late60_2m"]         # the maker never sold
     assert "late60_2m_held" not in launch_pnl({**st, "dev_sold_s": 30}, 0.1, TX_COST_SOL)   # it had dumped by 60 s: no entry
-    # a launch settled before these rules existed gets them while its trades are still here
+    # a launch settled before these rules (or before the 60 s state, the late60 entry) gets them while its trades are here
     assert settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=900) == 1
-    col.c.execute("UPDATE launches SET late = NULL, x180_vsol = NULL, x180_vtok = NULL")
-    col.c.commit()
-    settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=900)
-    assert col.c.execute("SELECT late, x180_vsol, x180_vtok FROM launches").fetchone() == (1, *at_170s)
+    for late in (None, 1):                                    # never done, and done by the first backfill, without s60
+        col.c.execute("UPDATE launches SET late = ?, s60_vsol = NULL, s60_vtok = NULL, x180_vsol = NULL, x180_vtok = NULL", (late,))
+        col.c.commit()
+        settle_launches(db, latency_slots=2, stake_sol=0.1, hold_s=900)
+        assert col.c.execute("SELECT late, s60_vsol, s60_vtok, x180_vsol, x180_vtok FROM launches").fetchone() == (2, *at_55s, *at_170s)
     col.c.close()
 
 
