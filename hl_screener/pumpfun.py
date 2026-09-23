@@ -740,6 +740,12 @@ def prune(db_path: str | Path, retention_s: float) -> int:
         c.close()
 
 
+def _best(rules: list[dict[str, Any]] | None) -> str:
+    """The top rule of one cohort for the log line, e.g. 'tp100 -1.9%'."""
+    b = (rules or [{}])[0]
+    return f"{b['rule']} {b['roi']:+.1%}" if b.get("roi") is not None else "n/a"
+
+
 def collect(db_path: str | Path, ws_url: str, retention_days: float, report_every_s: float = 1800,
             fallback_url: str | None = None, sniper_every_s: float = SNIPER_EVERY_S, sniper_top: int = SNIPER_TOP) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
@@ -758,8 +764,8 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                 if settled:
                     log.info("settled %d launches", settled)
                 top = update_snipers(db_path, sniper_top)       # cheap: only the first slots of the window's tokens
-                if [a for a, _ in top] != last_top:
-                    log.info("top %d snipers: %s", len(top), ", ".join(f"{a[:4]}…{a[-4:]} ({n})" for a, n in top))
+                if [a for a, _ in top] != last_top:              # full addresses: the page is behind a password, the log is not
+                    log.info("top %d snipers: %s", len(top), ", ".join(f"{a} ({n})" for a, n in top))
                     last_top = [a for a, _ in top]
                 if time.time() - last_report >= report_every_s:
                     n = prune(db_path, col.retention_s)
@@ -769,11 +775,14 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                     strat = strategy_report(db_path)
                     save_meta(db_path, "strategies", strat)
                     last_report = time.time()
-                    best = (strat.get("rules") or [{}])[0]
-                    log.info("report: %s wallets ranked, %d golden (followed from now on), %s tokens pruned | strategies on "
-                             "%s launches, best %s %s", rep.get("counts", {}).get("wallets_ranked"), g, n,
-                             strat.get("counts", {}).get("launches"), best.get("rule"),
-                             f"{best['roi']:+.1%}" if best.get("roi") is not None else "n/a")
+                    gold = [r["addr"] for r in rep.get("traders", []) if r.get("golden")]
+                    co, cnt = strat.get("cohorts") or {}, (strat.get("counts") or {}).get("cohorts") or {}
+                    log.info("report: %s wallets ranked, %d golden (followed from now on)%s, %s tokens pruned | strategies on "
+                             "%s launches, best %s | crew %s launches, best %s; 2nd coin on %s, best %s; first coin %s, best %s",
+                             rep.get("counts", {}).get("wallets_ranked"), g, f": {', '.join(gold)}" if gold else "", n,
+                             strat.get("counts", {}).get("launches"), _best(strat.get("rules")),
+                             cnt.get("crew", 0), _best(co.get("crew")), cnt.get("crew_2nd", 0), _best(co.get("crew_2nd")),
+                             cnt.get("first_coin", 0), _best(co.get("first_coin")))
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed")
 

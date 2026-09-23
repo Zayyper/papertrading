@@ -2,7 +2,7 @@ import base64
 import struct
 import time
 
-from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
+from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, _best, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
                                  BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
                                  cohorts_of, maker_table, operator_groups, paper_series, parse_amm_trade, parse_create,
                                  parse_trade, settle_launches, strategy_sim, twins, update_snipers)
@@ -293,6 +293,8 @@ def test_a_launch_is_only_in_the_crew_cohort_once_the_crew_was_already_known():
     assert not cohorts_of(rows, seen_min=9)["crew"]           # a crew that green does not count yet
     busy = [{"creator": f"X{i}", "buyers": "99,88", "ts": i} for i in range(40)]
     assert not cohorts_of(busy)["crew"]                       # one snipe per maker, forever: never a crew
+    assert _best([{"rule": "tp50", "roi": 0.057}, {"rule": "hold", "roi": -0.1}]) == "tp50 +5.7%"   # the log line
+    assert _best(None) == "n/a"                               # an empty cohort still gets its slot in the line
 
 
 def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():
