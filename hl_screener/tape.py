@@ -81,7 +81,7 @@ def is_perp(coin: str) -> bool:
 # ---------------------------------------------------------------------------
 def connect(url: str):
     import psycopg
-    conn = psycopg.connect(url, autocommit=True)
+    conn = psycopg.connect(url, autocommit=True, connect_timeout=10)
     for stmt in SCHEMA.split(";"):
         if stmt.strip():
             conn.execute(stmt)
@@ -401,7 +401,15 @@ class Tape:
 def collect(db_url: str, plan_path: Path, cfg: Config, root: Path) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
     logging.getLogger("hl_screener.copygap").setLevel(logging.INFO)
-    conn = connect(db_url)
+    for attempt in range(30):                    # on a deploy the database container starts alongside this one
+        try:
+            conn = connect(db_url)
+            break
+        except Exception as e:  # noqa: BLE001
+            if attempt == 29:
+                raise
+            log.info("copytest: database not ready (%s); retrying in 2 s", str(e).splitlines()[0][:120])
+            time.sleep(2)
     frozen = freeze_plan(conn, plan_path)
     plan = plan_of(frozen)
     api = HyperliquidAPI(cfg.api_url, cfg.leaderboard_url, Path(cfg.data_dir) / "cache", 500, cfg.http_timeout_s)   # the paper trader shares the IP
