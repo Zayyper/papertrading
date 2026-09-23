@@ -320,6 +320,12 @@ def test_a_dossier_puts_a_wallets_own_trades_next_to_its_copies(tmp_path):
     assert "0-1 slots after launch 50%" in out and "11-150 slots after launch 50%" in out
     assert "1 copies, 1 closed, +0.070 SOL on 0.10 SOL (+70.0%)" in out and "delay p50 2 slots" in out
     assert "the wallet on those same 1 coins: +1.000 SOL (+100.0%)" in out     # what the copy left on the table
+    c = connect(db)
+    c.execute("INSERT INTO trades(slot, ts, mint, wallet, buy, sol, tok, fee, vsol, vtok) VALUES (280, 2050, 2, 1, 0, ?, 500, 0, 38 * ?, 1)", (L, L))
+    c.commit()
+    c.close()
+    out = "\n".join(dossiers(db))                                                # coin2: 500 more sold than bought
+    assert "+0.750 SOL on 2.00 SOL spent" in out and "1 sold more than it bought" in out   # 1.5 SOL x 500/1000 it bought
 
 
 def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():

@@ -54,7 +54,10 @@ def dossier(c, addr: str, crew: set[str], launches_of: collections.Counter) -> d
     if not bought:
         return {"wallet": addr, "trades": n_trades, "tokens": 0}
     closed = {m: t for m, t in bought.items() if t["tout"] >= 0.98 * t["tin"]}
-    pnl = {m: t["back"] - t["cost"] for m, t in closed.items()}
+    # tokens it sold beyond what it bought came from elsewhere (another of its wallets?): no profit is counted on them
+    pnl = {m: t["back"] * min(1.0, t["tin"] / t["tout"]) - t["cost"] for m, t in closed.items()}
+    oversold = sum(1 for t in closed.values() if t["tout"] > 1.02 * t["tin"])
+    buys = [(sol + fee) / LAMPORTS for sol, fee in c.execute("SELECT sol, fee FROM trades WHERE wallet = ? AND buy = 1", (wid,))]
     gains = sorted((p for p in pnl.values() if p > 0), reverse=True)
     blocks: dict[str, float] = collections.defaultdict(float)
     for m, p in pnl.items():
@@ -72,7 +75,8 @@ def dossier(c, addr: str, crew: set[str], launches_of: collections.Counter) -> d
     same = [m for m in {r[0] for r in cbuys} if m in closed]
     return {
         "wallet": addr, "trades": n_trades, "tokens": len(bought), "span_h": span_h, "per_hour": n_trades / span_h,
-        "closed": len(closed), "open": len(bought) - len(closed), "pnl_sol": sum(pnl.values()),
+        "closed": len(closed), "open": len(bought) - len(closed), "pnl_sol": sum(pnl.values()), "oversold": oversold,
+        "buy_sol": [_q(buys, p) for p in (0.5, 0.9)] + [max(buys) if buys else None],
         "cost_sol": sum(t["cost"] for t in closed.values()), "won": sum(p > 0 for p in pnl.values()) / len(pnl) if pnl else None,
         "median_sol": _q(list(pnl.values()), 0.5), "top3_share": sum(gains[:3]) / sum(gains) if gains else None,
         "blocks": dict(sorted(blocks.items())), "busiest_hours": [h for h, _ in hours.most_common(3)],
@@ -110,7 +114,8 @@ def lines(d: dict[str, Any], status: str = "") -> list[str]:
         f"dossier {a}{status}",
         f"  itself: {d['trades']} trades on {d['tokens']} coins over {d['span_h']:.0f} h ({d['per_hour']:.1f}/h), {d['closed']} closed "
         f"{d['pnl_sol']:+.3f} SOL on {d['cost_sol']:.2f} SOL spent ({_pct(d['pnl_sol'] / d['cost_sol'] if d['cost_sol'] else None)}), "
-        f"won {_pct(d['won'])}, median {d['median_sol']:+.4f} SOL, best 3 coins = {_pct(d['top3_share'])} of its gains, {d['open']} still held",
+        f"won {_pct(d['won'])}, median {d['median_sol']:+.4f} SOL, best 3 coins = {_pct(d['top3_share'])} of its gains, {d['open']} still held, "
+        f"{d['oversold']} sold more than it bought (not counted) | buys p50/p90/max {'/'.join(_num(b, 2) for b in d['buy_sol'])} SOL",
         "  by 12 h: " + ", ".join(f"{k} {v:+.2f}" for k, v in d["blocks"].items()),
         f"  entry: {', '.join(f'{k} slots after launch {v:.0%}' for k, v in d['offset_share'].items())} | SOL already in the curve "
         f"p50 {_num(d['curve_sol_p50'], 2)} | holds p10/p50/p90 {'/'.join(_num(h) + 's' for h in d['hold_s'])} | "
