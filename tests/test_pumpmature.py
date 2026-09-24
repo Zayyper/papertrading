@@ -1,8 +1,9 @@
 import json
 import time
 
-from hl_screener.pumpfun import FEE, TX_COST_SOL, _rules_line, _rules_on, connect
+from hl_screener.pumpfun import FEE, TX_COST_SOL, _rules_line, _rules_on, connect, copy_trade
 from hl_screener.pumpmature import CURVE_DONE_VTOK, LOOK_AT_S, coin_entries, mature_pnl, mature_report, settle_matures
+from hl_screener.pumpspecialists import log_lines, specialists
 
 SOL = 10**9
 
@@ -115,6 +116,41 @@ def test_a_near_entry_is_instant_by_its_own_age_not_by_a_migration_still_to_come
     c.close()
     assert mature_report(db)["counts"] == {"near": {"all": 3, "organic": 1, "instant": 2},
                                            "grad": {"all": 2, "organic": 1, "instant": 1}}
+
+
+def test_a_wallet_is_a_mature_trader_only_on_coins_it_first_bought_past_100k_and_its_copy_is_replayed(tmp_path):
+    db, now = tmp_path / "pump.db", int(time.time())
+    c = connect(db)
+    c.executemany("INSERT INTO wallets (id, addr) VALUES (?, ?)", [(1, "MAKER"), (2, "SPEC"), (3, "SNIPER"), (4, "LATE")])
+    c.execute("INSERT INTO mints (id, addr, slot, ts, creator) VALUES (1, 'M1', 1000, ?, 1)", (now - 7200,))
+    k, pool = 10**25, {"vsol": 60 * SOL}                    # a pool past migration: market cap = vsol^2 / k * 1e6 SOL
+
+    def trade(slot: int, wallet: int, vsol: int) -> None:
+        buy, sol, vt0, vt1 = vsol > pool["vsol"], abs(vsol - pool["vsol"]), k // pool["vsol"], k // vsol
+        c.execute("INSERT INTO trades VALUES (?,?,1,?,?,?,?,?,?,?)",
+                  (slot, now - 7200 + slot // 3, wallet, int(buy), sol, abs(vt0 - vt1), 0 if buy else sol // 100, vsol, vt1))
+        pool["vsol"] = vsol
+
+    trade(1000, 3, 62 * SOL)                                 # the sniper's first buy: 384 SOL of market cap, too early
+    trade(1500, 2, 100 * SOL)                                # SPEC's first buy at 1,000 SOL, about $115k
+    trade(1600, 1, 102 * SOL)                                # the coin's own maker: never counted
+    trade(1750, 4, 150 * SOL)                                # LATE buys at 2,250 SOL, about $260k, and never sells
+    trade(1800, 3, 140 * SOL)                                # the sniper sells some
+    trade(2000, 2, 110 * SOL)                                # SPEC sells part of its bag
+    c.commit()
+    c.close()
+    settle_matures(db, now=now)                              # finds the coin; too young to replay its entries
+    rep = specialists(db, min_coins=1, latency=2)
+    got = {r["addr"]: r for r in rep["wallets"]}
+    assert set(got) == {"SPEC", "LATE"} and [b["bucket"] for b in rep["buckets"]] == ["$100-200k", "$200-500k"]
+    # SPEC's copy lands after its buy and after its sell: no sell had paid a fee when it bought (the curve's rate), the
+    # sniper's 1 % had by the time it sold
+    spec = copy_trade((100 * SOL, k // (100 * SOL)), (110 * SOL, k // (110 * SOL)), 0.5, TX_COST_SOL, FEE, 0.01)
+    late = copy_trade((150 * SOL, k // (150 * SOL)), (110 * SOL, k // (110 * SOL)), 0.5, TX_COST_SOL, FEE, 0.01)
+    assert abs(got["SPEC"]["copy_roi"] - spec / 0.5) < 1e-9 and abs(got["LATE"]["copy_roi"] - late / 0.5) < 1e-9
+    assert got["SPEC"]["hold_med_min"] == (2000 // 3 - 1500 // 3) / 60 and got["LATE"]["hold_med_min"] is None
+    assert (got["SPEC"]["held_share"], got["LATE"]["held_share"]) == (1.0, 1.0)   # SPEC kept most of its bag
+    assert log_lines(rep)[0].startswith("specialists (first buy at $100k+ market cap): 2 positions by 2 wallets")
 
 
 def test_the_log_says_whether_an_average_is_the_typical_trade_or_two_jackpots():

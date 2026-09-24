@@ -222,7 +222,11 @@
     <p class="caption" id="mature-rule" style="margin-top: 8px"></p>
     <div class="panel tight"><div class="chart" id="mature-chart"></div></div>
     <div class="panel tight"><div class="table-wrap" id="mature-table"></div></div>
+    <h3 class="section-title">Wallets that buy past $100k <span class="caption">what they made on coins they first bought at $100k or more, and what copying them would have made</span></h3>
+    <p class="caption" id="mature-spec-note"></p>
+    <div class="panel tight"><div class="table-wrap" id="mature-specialists"></div></div>
     <details class="panel report"><summary>How to read the mature coins</summary><div class="md"><ul>
+      <li><b>Wallets that buy past $100k</b> ranks wallets by the coins they first bought at $100k of market cap or more, not coins they sniped and added to later. <b>Own</b> is what the wallet made itself, counting what it still holds at the last price. <b>Copy</b> replays 0.5 SOL bought two slots after its first buy and sold two slots after its first sell. A wallet <b>passes</b> when it made money in both halves of the window, a copy did too, and its two best coins are under half of its gains. Only coins born in the last three days are in the trade window, so older coins are out of sight.</li>
       <li><b>Curve ~80% full</b> buys once the coin is worth 300 SOL, about 80% of the way up its curve: the way 5K3N1v… buys. <b>Just migrated</b> buys the move to PumpSwap, reacting to the pool's first trade. <b>Reached ~$100k</b> buys the first time the coin is worth 870 SOL, about $100k at SOL $115. <b>Still up 1 h after migrating</b> buys an hour after the migration, if the coin still trades at or above its migration price.</li>
       <li>Each entry is sold on the clock (5 min, 30 min, 2 h, 6 h) or at a take-profit / stop-loss pair: <b>tp20_sl10</b> sells at +20% or −10%, whichever comes first, else at 6 h; the same for +50 / −25 and +100 / −50.</li>
       <li>Each trade is 0.5 SOL: into a pool of about 85 SOL, that keeps both the price impact and the 0.0015 SOL per transaction under 1%. On the pool a buy pays the fee the coin's sells pay, because PumpSwap's buy events log almost none.</li>

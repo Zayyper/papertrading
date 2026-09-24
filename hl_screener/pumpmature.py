@@ -6,7 +6,8 @@ something, and holds it for minutes to hours:
     near    its curve is about 80 % full (300 SOL of market cap), the way 5K3N1v... buys; not a coin that jumped
             straight from launch to migration, there is no curve left to buy
     grad    it has just migrated to PumpSwap: the first pool trade
-    mc100k  it has reached about $100k (870 SOL of market cap), on either venue
+    mc100k  it has reached about $100k of market cap for the first time, on either venue; mc200k, mc500k and mc1m
+            the same at about $200k, $500k and $1M
     aged1h  an hour after migrating, it still trades at or above its migration price
 
 Each entry is sold seven ways: on the clock after 5 min, 30 min, 2 h or 6 h, or at a take-profit / stop-loss pair
@@ -29,7 +30,8 @@ from .pumpfun import FEE, LAMPORTS, TX_COST_SOL, _rules_on, _value, connect, get
 
 CURVE_DONE_VTOK = 279_900_000_000_000   # a curve's virtual tokens once its last real token is sold: it migrates
 NEAR_MCAP = 300.0                        # SOL of market cap: a curve about 80 % of the way up
-MC100K = 870.0                           # SOL of market cap: about $100k at SOL $115 (2026-09-24)
+SOL_USD = 115.0                          # SOL's price on 2026-09-24: the dollar levels below are fixed in SOL from it
+MC_LEVELS = {name: usd / SOL_USD for name, usd in (("mc100k", 1e5), ("mc200k", 2e5), ("mc500k", 5e5), ("mc1m", 1e6))}
 MIN_LIQ_SOL = 20.0                       # no entry into a pool thinner than this: the order would be most of it
 STAKE_SOL = 0.5                          # into a ~85 SOL pool: price impact and the fixed tx cost are both under 1 %
 INSTANT_S = 60                           # migrated within a minute of launch: a bundle buying its own curve out
@@ -38,7 +40,8 @@ HOLDS = {"5m": 300, "30m": 1800, "2h": 7200, "6h": 21600}
 TPSL = {"tp20_sl10": (0.2, 0.1), "tp50_sl25": (0.5, 0.25), "tp100_sl50": (1.0, 0.5)}
 HORIZON_S = max(HOLDS.values())
 LOOK_AT_S = ENTRY_S + HORIZON_S + 1800   # a coin's age when it is looked at: past its last possible exit
-TRIGGERS = ("near", "grad", "mc100k", "aged1h")
+TRIGGERS = ("near", "grad", *MC_LEVELS, "aged1h")
+MATURE_VERSION = 2                       # raise it when the entries change: every coin still stored is looked at again
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS matures (mint TEXT, trig TEXT, ts INTEGER, age_s INTEGER, grad_s INTEGER, mcap REAL,
@@ -84,9 +87,10 @@ def coin_entries(path: list[tuple], cts: int, latency_slots: int) -> tuple[dict[
         t, a = times[g] + 3600, last_by(times[g] + 3600)
         if t <= cts + ENTRY_S and cap(a) >= cap(g):
             trig["aged1h"] = (a, t)                          # decided on the clock, at the last trade's price
-    mc = next((i for i in first_day if cap(i) >= MC100K), None)
-    if mc is not None:
-        trig["mc100k"] = (mc, times[mc])
+    for name, level in MC_LEVELS.items():
+        mc = next((i for i in first_day if cap(i) >= level), None)
+        if mc is not None:
+            trig[name] = (mc, times[mc])
     out: dict[str, dict[str, Any]] = {}
     for name, (i, t0) in trig.items():
         entry = land(i)
@@ -140,6 +144,10 @@ def settle_matures(db_path: str | Path, latency_slots: int | None = None, now: f
             measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")
             latency_slots = max(2, measured + 1) if measured is not None else 2
         _find_candidates(c, chunk)
+        if get_meta(c, "mature_version", 1) < MATURE_VERSION:    # new entries: look again at every coin still stored
+            c.execute("UPDATE mature_cand SET done = 0")
+            set_meta(c, "mature_version", MATURE_VERSION)
+            c.commit()
         todo = c.execute("""SELECT k.mint, m.addr, m.ts FROM mature_cand k JOIN mints m ON m.id = k.mint
                             WHERE k.done = 0 AND m.ts <= ?""", (now - LOOK_AT_S,)).fetchall()
         stored = 0
@@ -149,10 +157,9 @@ def settle_matures(db_path: str | Path, latency_slots: int | None = None, now: f
             found, done = coin_entries(path, cts, latency_slots)
             grad_s = path[done][1] - cts if done is not None else None
             rows = [(addr, k, e["ts"], e["ts"] - cts, grad_s, e["mcap"], json.dumps(e["states"])) for k, e in found.items()]
-            c.executemany("INSERT OR IGNORE INTO matures VALUES (?,?,?,?,?,?,?)", rows)
+            stored += c.executemany("INSERT OR IGNORE INTO matures VALUES (?,?,?,?,?,?,?)", rows).rowcount
             c.execute("UPDATE mature_cand SET done = 1 WHERE mint = ?", (mid,))
             c.commit()
-            stored += len(rows)
         c.execute("DELETE FROM mature_cand WHERE mint < (SELECT MIN(id) FROM mints)")   # their coins were pruned
         c.commit()
         return stored
@@ -163,7 +170,7 @@ def settle_matures(db_path: str | Path, latency_slots: int | None = None, now: f
 def mature_report(db_path: str | Path, stake_sol: float = STAKE_SOL, tx_cost_sol: float = TX_COST_SOL,
                   days: float = 30) -> dict[str, Any]:
     """Every exit on every entry, per trigger, for all coins and split by how fast they migrated."""
-    params = {"stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "near_mcap": NEAR_MCAP, "mc100k": MC100K,
+    params = {"stake_sol": stake_sol, "tx_cost_sol": tx_cost_sol, "near_mcap": NEAR_MCAP, "mc_levels": MC_LEVELS, "sol_usd": SOL_USD,
               "min_liq_sol": MIN_LIQ_SOL, "instant_s": INSTANT_S, "entry_h": ENTRY_S / 3600, "horizon_h": HORIZON_S / 3600}
     c = connect(db_path, readonly=True)
     try:

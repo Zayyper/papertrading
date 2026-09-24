@@ -776,7 +776,8 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
     halt = threading.Event()
 
     def maintenance() -> None:                                 # own thread and connection: never stalls the feed
-        from .pumpmature import mature_report, settle_matures   # here: that module builds on this one
+        from .pumpmature import mature_report, settle_matures   # here: those modules build on this one
+        from .pumpspecialists import log_lines, specialists
         try:                                                   # once per start: the followed wallets up close, in the log
             from .pumpdossier import dossiers
             for line in dossiers(db_path):
@@ -810,6 +811,12 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                     except Exception:  # noqa: BLE001
                         log.exception("mature report failed")
                         mat = {}
+                    try:                                    # the wallets that buy those coins, copied
+                        spec = specialists(db_path)
+                        strat.setdefault("mature", {})["specialists"] = spec
+                    except Exception:  # noqa: BLE001
+                        log.exception("specialists failed")
+                        spec = None
                     save_meta(db_path, "strategies", strat)
                     last_report = time.time()
                     gold = [r["addr"] for r in rep.get("traders", []) if r.get("golden")]
@@ -826,6 +833,8 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                         for name, rules in groups.items():
                             log.info("mature %s %s (%s coins, %s SOL each): %s", trig, name, mat["counts"][trig][name],
                                      mat["params"]["stake_sol"], _rules_line(rules, detail=True))
+                    for line in log_lines(spec) if spec else ():
+                        log.info("%s", line)
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed")
 

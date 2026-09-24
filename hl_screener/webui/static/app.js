@@ -960,7 +960,10 @@
   }
 
   // ---------------------------------------------------------------- strategy: mature coins, bought later in their life
-  const MATURE_TRIG = { near: "Curve ~80% full", grad: "Just migrated", mc100k: "Reached ~$100k", aged1h: "Still up 1 h after migrating" };
+  const MATURE_TRIG = {
+    near: "Curve ~80% full", grad: "Just migrated", mc100k: "Reached ~$100k", mc200k: "Reached ~$200k", mc500k: "Reached ~$500k",
+    mc1m: "Reached ~$1M", aged1h: "Still up 1 h after migrating",
+  };
   const MATURE_COHORT = { all: "All coins", organic: "Organic", instant: "Instant" };
   const MATURE_RULE = {
     "5m": "out after 5 min", "30m": "out after 30 min", "2h": "out after 2 h", "6h": "out after 6 h",
@@ -993,6 +996,27 @@
       { key: "pnl_sol", label: "Total, SOL", num: true, render: (r) => solAmt(r.pnl_sol) },
       { key: "n", label: "Coins", num: true, render: (r) => fmtInt(r.n) },
     ], rules, { sortKey: "roi", dir: -1, empty: "No coin is old enough yet: each one is looked at 30 hours after launch, then every 5 minutes as more come of age." });
+    const sp = m.specialists || {}, sc = sp.counts || {}, sq = sp.params || {};
+    $("#mature-spec-note").textContent = (sp.wallets || []).length
+      ? `${fmtInt(sc.positions)} positions by ${fmtInt(sc.wallets)} wallets that first bought a coin at $${fmtNum((sq.min_mcap_usd || 0) / 1000, 0)}k or more. ` +
+        `Their own result by entry: ${(sp.buckets || []).map((b) => `${b.bucket} ${fmtPct(b.roi)} (${fmtInt(b.n)})`).join(", ")}. ` +
+        `${fmtInt(sc.wallets_min)} wallets bought ${sq.min_coins}+ such coins: ${fmtInt(sc.profitable)} made money, ${fmtInt(sc.both_halves)} in both halves. ` +
+        `Each copy: ${sq.stake_sol} SOL, ${sq.latency_slots} slots behind the wallet.`
+      : "";
+    sortableTable($("#mature-specialists"), [
+      { key: "addr", label: "Wallet", render: (r) => solscan(r.addr) + (r.passes ? ' <span class="badge done">passes</span>' : "") },
+      { key: "n", label: "Coins", num: true, render: (r) => fmtInt(r.n) },
+      { key: "share", label: "Of its coins", num: true, title: "how much of what it buys it bought past $100k", render: (r) => fmtPct(r.share, 0) },
+      { key: "roi", label: "Own", num: true, title: "what it made itself, what it still holds at the last price", render: (r) => pct(r.roi) },
+      { key: "roi_h1", label: "1st half", num: true, render: (r) => pct(r.roi_h1) },
+      { key: "roi_h2", label: "2nd half", num: true, render: (r) => pct(r.roi_h2) },
+      { key: "copy_roi", label: "Copy", num: true, title: "in two slots after its first buy, out two slots after its first sell", render: (r) => pct(r.copy_roi) },
+      { key: "copy_roi_h1", label: "Copy 1st", num: true, render: (r) => pct(r.copy_roi_h1) },
+      { key: "copy_roi_h2", label: "Copy 2nd", num: true, render: (r) => pct(r.copy_roi_h2) },
+      { key: "mcap_med_usd", label: "Buys at", num: true, title: "median market cap at its first buy", render: (r) => fmtUsd(r.mcap_med_usd) },
+      { key: "hold_med_min", label: "Holds", num: true, title: "median time to its first sell", render: (r) => isNum(r.hold_med_min) ? `${fmtNum(r.hold_med_min, 0)} min` : "—" },
+      { key: "bundle_share", label: "Bundles", num: true, title: "coins that migrated within a minute of launch", render: (r) => fmtPct(r.bundle_share, 0) },
+    ], sp.wallets || [], { sortKey: "copy_roi", dir: -1, empty: "No wallet has bought 10 coins past $100k yet: the ranking comes with the 30-minute report." });
   }
 
   function drawRules(container, rules, unit = "launch") {
