@@ -1,3 +1,4 @@
+import json
 import time
 
 from hl_screener.pumpfun import FEE, TX_COST_SOL, _rules_line, _rules_on, connect
@@ -97,6 +98,23 @@ def test_mature_coins_are_looked_at_once_when_30_h_old_and_reported(tmp_path):
     tp = next(r for r in rep["triggers"]["grad"]["all"] if r["rule"] == "tp20_sl10")
     assert tp["n"] == 1 and tp["roi"] > 0 and tp["win_rate"] == 1
     assert tp["median"] == tp["roi"] and tp["roi_ex2"] is None             # one coin: no two best to leave out
+
+
+def test_a_near_entry_is_instant_by_its_own_age_not_by_a_migration_still_to_come(tmp_path):
+    db, now = tmp_path / "pump.db", int(time.time())
+    settle_matures(db, now=now)                                             # makes the tables
+    c = connect(db)
+    st = json.dumps({"entry": [100 * SOL, 3 * 10**14, FEE], "5m": [100 * SOL, 3 * 10**14, FEE]})
+    c.executemany("INSERT INTO matures VALUES (?,?,?,?,?,?,?)", [
+        ("A", "near", now, 30, 400, 300.0, st),      # 300 SOL in 30 s; that it migrates later is not known yet
+        ("B", "near", now, 30, None, 300.0, st),     # just as fast, and never migrates: the same bet when buying
+        ("C", "near", now, 120, 130, 300.0, st),     # took two minutes to get there
+        ("C", "grad", now, 131, 130, 411.0, st),     # migrated after two minutes: organic
+        ("D", "grad", now, 20, 19, 411.0, st)])      # migrated in 19 s: instant, and known when buying
+    c.commit()
+    c.close()
+    assert mature_report(db)["counts"] == {"near": {"all": 3, "organic": 1, "instant": 2},
+                                           "grad": {"all": 2, "organic": 1, "instant": 1}}
 
 
 def test_the_log_says_whether_an_average_is_the_typical_trade_or_two_jackpots():

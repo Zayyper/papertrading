@@ -167,8 +167,8 @@ def mature_report(db_path: str | Path, stake_sol: float = STAKE_SOL, tx_cost_sol
               "min_liq_sol": MIN_LIQ_SOL, "instant_s": INSTANT_S, "entry_h": ENTRY_S / 3600, "horizon_h": HORIZON_S / 3600}
     c = connect(db_path, readonly=True)
     try:
-        cur = c.execute("SELECT trig, ts, grad_s, states FROM matures WHERE ts >= ?", (time.time() - days * 86_400,))
-        rows = [{"trig": t, "ts": ts, "grad_s": g, "states": json.loads(s)} for t, ts, g, s in cur.fetchall()]
+        cur = c.execute("SELECT trig, ts, age_s, grad_s, states FROM matures WHERE ts >= ?", (time.time() - days * 86_400,))
+        rows = [{"trig": t, "ts": ts, "age_s": a, "grad_s": g, "states": json.loads(s)} for t, ts, a, g, s in cur.fetchall()]
     except sqlite3.OperationalError:
         rows = []                                            # before the first settle made the table
     finally:
@@ -176,7 +176,12 @@ def mature_report(db_path: str | Path, stake_sol: float = STAKE_SOL, tx_cost_sol
     if not rows:
         return {"generated": int(time.time()), "empty": True, "params": params}
     t0, t1 = min(r["ts"] for r in rows), max(r["ts"] for r in rows)
-    fast = lambda r: r["grad_s"] is not None and r["grad_s"] < INSTANT_S   # noqa: E731
+    def fast(r: dict[str, Any]) -> bool:
+        """Everything happened in the first minute, as known when buying: a near entry reached 300 SOL in it (whether
+        the coin then migrates is still to come), the others had already migrated in it."""
+        if r["trig"] == "near":
+            return r["age_s"] < INSTANT_S
+        return r["grad_s"] is not None and r["grad_s"] < INSTANT_S and r["grad_s"] <= r["age_s"]
     cohorts = {"all": lambda r: True, "organic": lambda r: not fast(r), "instant": fast}
     price = lambda r: mature_pnl(r["states"], stake_sol, tx_cost_sol)     # noqa: E731
     triggers: dict[str, dict[str, list]] = {}
