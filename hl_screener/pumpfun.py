@@ -202,7 +202,8 @@ CREATE INDEX IF NOT EXISTS ix_trades_wallet ON trades(wallet, mint, slot);
 CREATE INDEX IF NOT EXISTS ix_mints_ts ON mints(ts);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS follow (wallet TEXT PRIMARY KEY, added_at INTEGER, golden_now INTEGER, report_copy_roi REAL,
-                                   golden_ever INTEGER DEFAULT 1, sniper_now INTEGER DEFAULT 0, sniper_rank INTEGER);
+                                   golden_ever INTEGER DEFAULT 1, sniper_now INTEGER DEFAULT 0, sniper_rank INTEGER,
+                                   mature_ever INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS pfills (id INTEGER PRIMARY KEY, wallet TEXT, mint TEXT, side TEXT, trigger_slot INTEGER,
                                    land_slot INTEGER, ts INTEGER, sol REAL, tok REAL, leader_px REAL, px REAL,
                                    slip_bps REAL, pnl REAL, timed_out INTEGER);
@@ -244,7 +245,8 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
                 "ALTER TABLE mints ADD COLUMN pool TEXT",                    # before PumpSwap tracking
                 "ALTER TABLE follow ADD COLUMN golden_ever INTEGER DEFAULT 1",   # before the top snipers were followed too:
                 "ALTER TABLE follow ADD COLUMN sniper_now INTEGER DEFAULT 0",    # everyone already there was followed for being golden
-                "ALTER TABLE follow ADD COLUMN sniper_rank INTEGER"):
+                "ALTER TABLE follow ADD COLUMN sniper_rank INTEGER",
+                "ALTER TABLE follow ADD COLUMN mature_ever INTEGER DEFAULT 0"):  # before the wallets that buy past $100k
         try:
             c.execute(ddl)
         except sqlite3.OperationalError:
@@ -274,8 +276,13 @@ class PaperFollow:
     Nothing is ever sent to Solana."""
 
     def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL):
+        from .pumpmature import MC_LEVELS                      # here: that module builds on this one
         self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
         self.follow: set[str] = set()
+        self.mature_only: set[str] = set()                     # followed only for buying past $100k: only those buys are copied
+        self.mature_mcap = MC_LEVELS["mc100k"]
+        self.skip: set[tuple[str, str]] = set()                # (wallet, mint) such a wallet came to under $100k
+        self.sell_rate: dict[str, float] = {}                  # mint -> the fee its last sell paid: PumpSwap buys log almost none
         self.sniper_cfg = {"top": SNIPER_TOP, "every_s": SNIPER_EVERY_S, "window_h": SNIPER_WINDOW_H}   # shown on the page
         # the followed wallets' own positions, in SOL and tokens: what the copy is compared with
         self.own = {(w, m): [cost, proceeds, tok] for w, m, cost, proceeds, tok in c.execute("SELECT wallet, mint, cost, proceeds, tok FROM opos")}
@@ -292,8 +299,12 @@ class PaperFollow:
                 self.curve[m] = (row[0], row[1], time.time())
 
     def reload(self) -> None:
-        """Who is copied right now: every wallet a report ever called golden, plus the snipers currently in the top set."""
-        follow = dict(self.c.execute("SELECT wallet, added_at FROM follow WHERE golden_ever = 1 OR sniper_now = 1"))
+        """Who is copied right now: every wallet a report ever called golden or found buying past $100k at a profit,
+        plus the snipers currently in the top set."""
+        rows = self.c.execute("""SELECT wallet, added_at, golden_ever = 1 OR sniper_now = 1 FROM follow
+                                 WHERE golden_ever = 1 OR sniper_now = 1 OR mature_ever = 1""").fetchall()
+        follow = {w: added for w, added, _ in rows}
+        self.mature_only = {w for w, _, other in rows if not other}
         for w in follow.keys() - self.follow:                  # newly followed: the minutes between the ranking and this reload
             if not any(k[0] == w for k in self.own):
                 since = max(follow[w] or 0, time.time() - 600)
@@ -332,11 +343,17 @@ class PaperFollow:
         if acts:                                                # copies due: land at the state before this trade
             self._run_due(mint, acts, [slot >= a["land"] for a in acts])
         self.curve[mint] = (e["vsol"], e["vtok"], time.time())
+        if not e["buy"] and e["fee"] > 0 and e["sol"] >= 10**7:
+            self.sell_rate[mint] = e["fee"] / e["sol"]
         key, side = (user, mint), ("buy" if e["buy"] else "sell")
         mine = [a for a in self.pending.get(mint, ()) if a["wallet"] == user]
         following = user in self.follow
         if not e["tok"] or not (following or key in self.pos or mine):
             return
+        if user in self.mature_only and key not in self.own and key not in self.pos and not mine:
+            if key in self.skip or not e["buy"] or e["vsol"] * 1e6 < self.mature_mcap * e["vtok"]:
+                self.skip.add(key)                              # it came to this coin under $100k: not what it is followed for
+                return
         if following:
             self._own(key, e["buy"], e["sol"], e["tok"], e["fee"])
         elif e["buy"]:
@@ -350,8 +367,11 @@ class PaperFollow:
         if side == "buy":
             self.copied.add(key)
         leader_px = ((e["sol"] + e["fee"]) if e["buy"] else (e["sol"] - e["fee"])) / e["tok"]
+        rate = e["fee"] / e["sol"] if e["sol"] else FEE
+        if e["buy"] and e["fee"] == 0:                          # a PumpSwap buy logs no fee: it pays what the coin's sells pay
+            rate = self.sell_rate.get(mint, FEE)
         self.pending.setdefault(mint, []).append({"wallet": user, "side": side, "trigger": slot, "land": max(slot + self.L, self.tip + 1),
-                                                  "rate": e["fee"] / e["sol"] if e["sol"] else FEE, "leader_px": leader_px, "t": time.time()})
+                                                  "rate": rate, "leader_px": leader_px, "t": time.time()})
 
     def _run_due(self, mint: str, acts: list[dict[str, Any]], due: list[bool], timed_out: bool = False) -> None:
         """Run the queue up to its last due action, in order, so a copied sell never runs before its buy."""
@@ -404,11 +424,11 @@ class PaperFollow:
 
     def summary(self) -> dict[str, Any]:
         rows = {w: {"wallet": w, "added_at": added, "golden_now": bool(g), "golden_ever": bool(ge), "sniper_now": bool(sn),
-                    "sniper_rank": rank, "report_copy_roi": roi, "copied": 0, "closed": 0,
+                    "sniper_rank": rank, "mature_ever": bool(me), "report_copy_roi": roi, "copied": 0, "closed": 0,
                     "open": 0, "realized": 0.0, "unrealized": 0.0, "wins": 0, "delay_slots": None, "slip_bps": None,
                     "own_cost": 0.0, "own_pnl": 0.0}
-                for w, added, g, ge, sn, rank, roi in self.c.execute(
-                    "SELECT wallet, added_at, golden_now, golden_ever, sniper_now, sniper_rank, report_copy_roi FROM follow")}
+                for w, added, g, ge, sn, rank, me, roi in self.c.execute(
+                    "SELECT wallet, added_at, golden_now, golden_ever, sniper_now, sniper_rank, mature_ever, report_copy_roi FROM follow")}
         for (w, m), (cost, proceeds, tok) in self.own.items():   # the wallet itself, held tokens at the live curve (0 if never priced)
             if w in rows:
                 rows[w]["own_cost"] += cost
@@ -647,7 +667,7 @@ class Collector:
             if now - self.last_snap >= 300:                       # the chart: copy and wallet, every 5 min
                 self.c.executemany("INSERT INTO psnap VALUES (?,?,?,?,?,?)", [
                     (int(now), r["wallet"], r["total"], r["copied"] * self.paper.stake, r["own_pnl"], r["own_cost"])
-                    for r in summ["wallets"] if r["copied"] or r["golden_ever"] or r["sniper_now"]])   # a sniper that never traded needs no line
+                    for r in summ["wallets"] if r["copied"] or r["golden_ever"] or r["sniper_now"] or r["mature_ever"]])   # a sniper that never traded needs no line
                 self.last_snap = now
             if self.lags:
                 s = sorted(self.lags)
@@ -777,7 +797,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
 
     def maintenance() -> None:                                 # own thread and connection: never stalls the feed
         from .pumpmature import mature_report, settle_matures   # here: those modules build on this one
-        from .pumpspecialists import log_lines, specialists
+        from .pumpspecialists import follow_specialists, log_lines, specialists
         try:                                                   # once per start: the followed wallets up close, in the log
             from .pumpdossier import dossiers
             for line in dossiers(db_path):
@@ -811,9 +831,12 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                     except Exception:  # noqa: BLE001
                         log.exception("mature report failed")
                         mat = {}
-                    try:                                    # the wallets that buy those coins, copied
+                    try:                                    # the wallets that buy those coins, copied, and the best followed
                         spec = specialists(db_path)
                         strat.setdefault("mature", {})["specialists"] = spec
+                        new = follow_specialists(db_path, spec)
+                        if new:
+                            log.info("paper-following %d more wallets that buy past $100k, from now on: %s", len(new), ", ".join(new))
                     except Exception:  # noqa: BLE001
                         log.exception("specialists failed")
                         spec = None

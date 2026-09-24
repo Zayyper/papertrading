@@ -3,7 +3,7 @@ import time
 
 from hl_screener.pumpfun import FEE, TX_COST_SOL, _rules_line, _rules_on, connect, copy_trade
 from hl_screener.pumpmature import CURVE_DONE_VTOK, LOOK_AT_S, coin_entries, mature_pnl, mature_report, settle_matures
-from hl_screener.pumpspecialists import log_lines, specialists
+from hl_screener.pumpspecialists import follow_specialists, log_lines, specialists
 
 SOL = 10**9
 
@@ -151,6 +151,52 @@ def test_a_wallet_is_a_mature_trader_only_on_coins_it_first_bought_past_100k_and
     assert got["SPEC"]["hold_med_min"] == (2000 // 3 - 1500 // 3) / 60 and got["LATE"]["hold_med_min"] is None
     assert (got["SPEC"]["held_share"], got["LATE"]["held_share"]) == (1.0, 1.0)   # SPEC kept most of its bag
     assert log_lines(rep)[0].startswith("specialists (first buy at $100k+ market cap): 2 positions by 2 wallets")
+
+
+def test_new_exits_replay_every_coin_still_stored_once(tmp_path):
+    db, now = tmp_path / "pump.db", time.time()
+    c = connect(db)
+    coin, at = graduating_coin(int(now - LOOK_AT_S - 600))
+    c.execute("INSERT INTO mints (id, addr, slot, ts, creator) VALUES (1, 'M1', 1000, ?, 1)", (coin.t0,))
+    c.executemany("INSERT INTO trades VALUES (?,?,1,1,?,?,0,?,?,?)", [(s, ts, b, sol, fee, v, t) for s, ts, v, t, b, sol, fee in coin.rows])
+    c.commit()
+    assert settle_matures(db, latency_slots=2, now=now) == 4 and settle_matures(db, latency_slots=2, now=now) == 0
+    c.execute("UPDATE meta SET value = '2' WHERE key = 'mature_version'")   # stored before the 1 and 2 minute exits
+    c.execute("UPDATE matures SET states = '{}'")
+    c.commit()
+    assert settle_matures(db, latency_slots=2, now=now) == 4                  # replayed again, once
+    grad = json.loads(c.execute("SELECT states FROM matures WHERE trig = 'grad'").fetchone()[0])
+    assert grad["1m"] == grad["2m"] == [coin.rows[at["grad"]][2], coin.rows[at["grad"]][3], FEE]   # nothing traded in 2 min
+    c.close()
+
+
+def test_a_wallet_followed_for_buying_past_100k_is_copied_only_there_at_the_fee_sells_pay(tmp_path):
+    from hl_screener.pumpfun import PaperFollow
+    c = connect(tmp_path / "pump.db")
+    c.execute("INSERT INTO follow (wallet, added_at, golden_now, golden_ever, sniper_now, mature_ever) VALUES ('SPEC', 0, 0, 0, 0, 1)")
+    c.commit()
+    pf = PaperFollow(c)
+    assert pf.follow == pf.mature_only == {"SPEC"}
+    cheap = {"buy": True, "sol": 10**8, "tok": 10**11, "fee": 0, "vsol": 60 * SOL, "vtok": 15 * 10**13}    # 400 SOL of market cap
+    dear = {"buy": True, "sol": 10**8, "tok": 10**11, "fee": 0, "vsol": 100 * SOL, "vtok": 10**14}         # 1,000 SOL, about $115k
+    pf.on_trade(100, "A", "SPEC", cheap)                   # it came to A under $100k ...
+    pf.on_trade(110, "A", "SPEC", dear)                    # ... so adding to it later is not a mature buy either
+    pf.on_trade(120, "B", "X", {**dear, "buy": False, "fee": 10**6})     # someone sells B and pays 1 %
+    pf.on_trade(130, "B", "SPEC", dear)                    # its first buy of B, past $100k: copied
+    assert list(pf.pending) == ["B"] and pf.pending["B"][0]["rate"] == 0.01   # not the 0 its PumpSwap buy logged
+    assert ("SPEC", "A") in pf.skip and ("SPEC", "A") not in pf.own and ("SPEC", "B") in pf.own
+    assert pf.summary()["wallets"][0]["mature_ever"] is True
+    c.close()
+
+
+def test_the_best_wallets_past_100k_are_paper_followed_once(tmp_path):
+    db = tmp_path / "pump.db"
+    connect(db).close()
+    rep = {"wallets": [{"addr": "GOOD", "follow": True}, {"addr": "LUCKY", "follow": False}]}
+    assert follow_specialists(db, rep) == ["GOOD"] and follow_specialists(db, rep) == []   # followed once, for good
+    c = connect(db)
+    assert c.execute("SELECT wallet, golden_ever, sniper_now, mature_ever FROM follow").fetchall() == [("GOOD", 0, 0, 1)]
+    c.close()
 
 
 def test_the_log_says_whether_an_average_is_the_typical_trade_or_two_jackpots():

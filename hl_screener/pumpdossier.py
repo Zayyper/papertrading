@@ -135,10 +135,11 @@ def dossiers(db_path: str | Path, wallets: list[str] | None = None, min_copies: 
     """Lines for the given wallets, or for every golden wallet and every wallet copied `min_copies`+ times."""
     c = connect(db_path, readonly=True)
     try:
-        follow = {w: (g, ge, sn) for w, g, ge, sn in c.execute("SELECT wallet, golden_now, golden_ever, sniper_now FROM follow")}
+        follow = {w: (g, ge, sn, me) for w, g, ge, sn, me in
+                  c.execute("SELECT wallet, golden_now, golden_ever, sniper_now, mature_ever FROM follow")}
         if not wallets:
             counts = dict(c.execute("SELECT wallet, COUNT(*) FROM pfills WHERE side = 'buy' GROUP BY wallet"))
-            wallets = sorted(w for w, (_, ge, _) in follow.items() if ge or counts.get(w, 0) >= min_copies)
+            wallets = sorted(w for w, (_, ge, _, me) in follow.items() if ge or me or counts.get(w, 0) >= min_copies)
         rows = read_launches(c)
         crew = {r["mint"] for r in cohorts_of(rows)["crew"]}
         launches_of = collections.Counter(r["creator"] for r in rows)
@@ -147,8 +148,9 @@ def dossiers(db_path: str | Path, wallets: list[str] | None = None, min_copies: 
         c.close()
     out: list[str] = []
     for d in found:
-        g, ge, sn = follow.get(d["wallet"], (0, 0, 0))
-        status = " (golden now)" if g else " (was golden, still followed)" if ge else " (a top sniper now)" if sn else " (was a top sniper)"
+        g, ge, sn, me = follow.get(d["wallet"], (0, 0, 0, 0))
+        status = (" (golden now)" if g else " (was golden, still followed)" if ge else " (a top sniper now)" if sn
+                  else " (buys past $100k)" if me else " (was a top sniper)")
         out += lines(d, status)
         shared = sorted(((o["wallet"], len(d["mints"] & o["mints"])) for o in found
                          if o is not d and d.get("mints") and o.get("mints")), key=lambda x: -x[1])

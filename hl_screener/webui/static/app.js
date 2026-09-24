@@ -571,7 +571,8 @@
     sortableTable($("#pp-wallets"), [
       { key: "wallet", label: "Wallet", render: (r) => solscan(r.wallet) +
         (r.golden_now ? ' <span class="badge done">golden now</span>' : r.golden_ever ? ' <span class="badge">no longer golden, still followed</span>' : "") +
-        (r.sniper_now ? ` <span class="badge done">top sniper #${r.sniper_rank}</span>` : r.golden_ever ? "" : ' <span class="badge">out of the top snipers</span>') },
+        (r.sniper_now ? ` <span class="badge done">top sniper #${r.sniper_rank}</span>` : r.golden_ever || r.mature_ever ? "" : ' <span class="badge">out of the top snipers</span>') +
+        (r.mature_ever ? ' <span class="badge done" title="made money on coins it first bought past $100k, itself and copied, in both halves: only those buys are copied">buys past $100k</span>' : "") },
       { key: "added_at", label: "Followed since", render: (r) => `<span class="muted">${fmtTime((r.added_at || 0) * 1000)}</span>` },
       { key: "copied", label: "Copied", num: true, render: (r) => fmtInt(r.copied) },
       { key: "open", label: "Open", num: true, render: (r) => fmtInt(r.open) },
@@ -597,8 +598,8 @@
     ], p.recent || [], { sortKey: "ts", dir: -1, empty: "No copy yet. They appear when a followed wallet trades." });
     const ser = d.series || {};
     const pts = (rows, i) => rows.map((r) => [r[0] * 1000, r[i]]);
-    drawCompare($("#pump-compare"), "pump", W.filter((w) => w.copied || w.golden_ever || w.sniper_now).map((w) => {
-      const rows = ser[w.wallet] || [], tag = w.golden_ever ? "golden" : w.sniper_now ? `sniper #${w.sniper_rank}` : "past sniper";
+    drawCompare($("#pump-compare"), "pump", W.filter((w) => w.copied || w.golden_ever || w.sniper_now || w.mature_ever).map((w) => {
+      const rows = ser[w.wallet] || [], tag = w.golden_ever ? "golden" : w.sniper_now ? `sniper #${w.sniper_rank}` : w.mature_ever ? "past $100k" : "past sniper";
       return { id: w.wallet, label: `${shortAddr(w.wallet)} · ${tag}`, title: w.wallet, copy: pts(rows, 1), own: pts(rows, 2) };
     }), { label: "Return of each copy and of each followed wallet itself since it was followed", empty });
   }
@@ -966,7 +967,7 @@
   };
   const MATURE_COHORT = { all: "All coins", organic: "Organic", instant: "Instant" };
   const MATURE_RULE = {
-    "5m": "out after 5 min", "30m": "out after 30 min", "2h": "out after 2 h", "6h": "out after 6 h",
+    "1m": "out after 1 min", "2m": "out after 2 min", "5m": "out after 5 min", "30m": "out after 30 min", "2h": "out after 2 h", "6h": "out after 6 h",
     tp20_sl10: "+20% or −10%, else out at 6 h", tp50_sl25: "+50% or −25%, else out at 6 h", tp100_sl50: "+100% or −50%, else out at 6 h",
   };
   let lastMature = [], matTrig = store.get("mature:trig", "grad"), matCohort = store.get("mature:cohort", "all");

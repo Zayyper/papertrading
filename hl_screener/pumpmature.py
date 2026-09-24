@@ -10,7 +10,7 @@ something, and holds it for minutes to hours:
             the same at about $200k, $500k and $1M
     aged1h  an hour after migrating, it still trades at or above its migration price
 
-Each entry is sold seven ways: on the clock after 5 min, 30 min, 2 h or 6 h, or at a take-profit / stop-loss pair
+Each entry is sold nine ways: on the clock after 1, 2, 5 or 30 min, 2 h or 6 h, or at a take-profit / stop-loss pair
 (+20 / -10 %, +50 / -25 %, +100 / -50 %, else out at 6 h). Market cap is the price times a billion tokens.
 
 A coin is looked at once, 30 h after it was created (trades are kept 72 h): what it did in its first 24 h can be an
@@ -36,12 +36,12 @@ MIN_LIQ_SOL = 20.0                       # no entry into a pool thinner than thi
 STAKE_SOL = 0.5                          # into a ~85 SOL pool: price impact and the fixed tx cost are both under 1 %
 INSTANT_S = 60                           # migrated within a minute of launch: a bundle buying its own curve out
 ENTRY_S = 86_400                         # entries within a coin's first day
-HOLDS = {"5m": 300, "30m": 1800, "2h": 7200, "6h": 21600}
+HOLDS = {"1m": 60, "2m": 120, "5m": 300, "30m": 1800, "2h": 7200, "6h": 21600}   # 1m, 2m: how fast the best of these coins' buyers sell
 TPSL = {"tp20_sl10": (0.2, 0.1), "tp50_sl25": (0.5, 0.25), "tp100_sl50": (1.0, 0.5)}
 HORIZON_S = max(HOLDS.values())
 LOOK_AT_S = ENTRY_S + HORIZON_S + 1800   # a coin's age when it is looked at: past its last possible exit
 TRIGGERS = ("near", "grad", *MC_LEVELS, "aged1h")
-MATURE_VERSION = 2                       # raise it when the entries change: every coin still stored is looked at again
+MATURE_VERSION = 3                       # raise it when the entries or exits change: every coin still stored is replayed again
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS matures (mint TEXT, trig TEXT, ts INTEGER, age_s INTEGER, grad_s INTEGER, mcap REAL,
@@ -157,7 +157,7 @@ def settle_matures(db_path: str | Path, latency_slots: int | None = None, now: f
             found, done = coin_entries(path, cts, latency_slots)
             grad_s = path[done][1] - cts if done is not None else None
             rows = [(addr, k, e["ts"], e["ts"] - cts, grad_s, e["mcap"], json.dumps(e["states"])) for k, e in found.items()]
-            stored += c.executemany("INSERT OR IGNORE INTO matures VALUES (?,?,?,?,?,?,?)", rows).rowcount
+            stored += c.executemany("INSERT OR REPLACE INTO matures VALUES (?,?,?,?,?,?,?)", rows).rowcount
             c.execute("UPDATE mature_cand SET done = 1 WHERE mint = ?", (mid,))
             c.commit()
         c.execute("DELETE FROM mature_cand WHERE mint < (SELECT MIN(id) FROM mints)")   # their coins were pruned
