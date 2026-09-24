@@ -181,8 +181,8 @@ bought came from elsewhere and earn it nothing in these numbers.
   life: buy once its curve is ~80% full, at its migration to PumpSwap, at ~$100k, or an hour after
   migrating if it still holds its migration price; sell after 5 min to 6 h or at a take-profit / stop-loss
   pair. Each coin is looked at once, 30 h after launch, so every exit is inside its trade window; the
-  entries are kept for good in `matures`, 0.5 SOL a trade, split by coins that migrated within a minute
-  of launch (bundles) and the rest.
+  entries are kept for good in `matures`, 0.5 SOL a trade, split by coins that got there within a minute
+  of launch (mostly bundles buying out their own curve) and the rest, using only what is known when buying.
 - **Operators** group maker wallets that are probably one hand. A maker that rotates to a fresh wallet
   every few launches still needs its own other wallets to snipe its launches, so the same early buyers
   turn up again: three shared snipers group two wallets, and a buyer that appears for more than 20
