@@ -723,6 +723,9 @@ class Collector:
         stable = lived_s >= STABLE_S
         self.fails = 1 if stable else self.fails + 1
         self.backoff = 2.0 if stable else min(self.backoff * 2, 60.0)
+        if on_fallback and lived_s < 10:                      # the fallback refuses us (Helius answered 429 on 2026-09-25):
+            self.fallback_until = 0.0                          # back to the main feed, which at least lets some through
+            return self.backoff
         day = time.strftime("%Y-%m-%d", time.gmtime())
         if day != self.fallback_day:
             self.fallback_day, self.fallback_used = day, 0

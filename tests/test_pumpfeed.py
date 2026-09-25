@@ -9,6 +9,9 @@ def test_a_feed_that_keeps_dropping_waits_longer_and_borrows_the_fallback_twice_
     assert waits == [2, 4, 8, 16, 32]                                 # not back in 2 s every time: that is what gets throttled
     assert col.fallback_used == FALLBACK_PER_DAY == 2                 # the fallback, but only twice a day
     assert col._dropped(600, on_fallback=False) == 2 and col.fails == 1   # a connection that held is a fresh start
+    col.fallback_until = 1e12
+    col._dropped(0, on_fallback=True)                                  # the fallback turns us away at the door ...
+    assert col.fallback_until == 0.0                                   # ... so its window ends and the main feed is tried
     col.c.close()
 
 
