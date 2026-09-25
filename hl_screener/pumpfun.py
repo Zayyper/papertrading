@@ -570,6 +570,16 @@ class Collector:
         self.fails, self.backoff, self.fallback_until = 0, 1.0, 0.0     # the feed's recent failures (see _dropped)
         self.fallback_day, self.fallback_used = "", 0
         self.last_db_error = 0.0
+        from .pumppools import PoolFeed                         # our pools only, one subscription each (see pumppools)
+        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=self._pinned_pools)
+        for pool, last in self.c.execute("""SELECT m.pool, (SELECT t.ts FROM trades t WHERE t.mint = m.id ORDER BY t.slot DESC LIMIT 1)
+                                             FROM mints m WHERE m.pool IS NOT NULL AND m.ts >= ?""", (cutoff,)):
+            self.pool_feed.add(pool, last or 0.0)
+
+    def _pinned_pools(self) -> set[str]:
+        """Pools where a paper copy is open or on its way: their leader's sell must still reach us."""
+        open_ = {m for (_, m) in self.paper.pos} | set(self.paper.pending)
+        return {p for p, m in self.pools.items() if m in open_}
 
     def wallet_id(self, addr: str) -> int:
         i = self.wallets.get(addr)
@@ -614,9 +624,11 @@ class Collector:
                 if e is None:
                     self.stats["parse_errors"] += 1
                     continue
-                mint = self.pools.get(b58(e["pool"]))
+                pool = b58(e["pool"])
+                mint = self.pools.get(pool)
                 if mint is not None:                       # a pool of a token we track, after its graduation
                     self.stats["amm_trades"] += 1
+                    self.pool_feed.touch(pool)
                     self._trade(slot, mint, b58(e["user"]), e)
             elif b[:8] == D_POOL:
                 e = parse_create_pool(b)
@@ -628,6 +640,7 @@ class Collector:
                 mint, pool = b58(e["base_mint"]), b58(e["pool"])
                 if mint in self.mints and pool not in self.pools:
                     self.pools[pool] = mint
+                    self.pool_feed.add(pool)               # its trades come on a pool subscription from now on
                     self.c.execute("UPDATE mints SET pool = ? WHERE addr = ?", (pool, mint))
                     self.stats["graduated"] += 1
             elif b[:8] == D_CREATE:
@@ -704,7 +717,7 @@ class Collector:
             if self.lags:
                 s = sorted(self.lags)
                 self.stats.update({f"lag_p{p}": s[min(len(s) - 1, len(s) * p // 100)] for p in (50, 90, 99)})
-            self.stats.update(host_resources(self.db_path.parent))
+            self.stats.update(host_resources(self.db_path.parent), **self.pool_feed.stats)
             self.last_paper = now
         self.stats["heartbeat"] = int(now)
         set_meta(self.c, "stats", self.stats)
@@ -743,16 +756,16 @@ class Collector:
         last_flush, last_line, last_forget = time.time(), time.time(), time.time()
         gap_from = None
         seen = (self.stats["trades"], self.stats["mints"])
+        pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
         while not stop.is_set():
             on_fallback = bool(self.fallback_url) and time.time() < self.fallback_until
             url = self.fallback_url if on_fallback else self.ws_url
             opened = time.time()
             try:
                 async with websockets.connect(url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30) as ws:
-                    for i, program in enumerate((PUMP_PROGRAM, AMM_PROGRAM), 1):
-                        await ws.send(json.dumps({"jsonrpc": "2.0", "id": i, "method": "logsSubscribe",
-                                                  "params": [{"mentions": [program]}, {"commitment": "confirmed"}]}))
-                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "slotSubscribe"}))
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",   # not all of PumpSwap:
+                                              "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "confirmed"}]}))
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "slotSubscribe"}))   # our pools, in pumppools
                     self.stats["ws"] = ("fallback: " if on_fallback else "") + url.split("?")[0]
                     log.info("connected to %s", self.stats["ws"])
                     opened = time.time()
@@ -776,10 +789,13 @@ class Collector:
                             self.flush()
                             last_flush = now
                         if now - last_line >= 60:
-                            log.info("last minute: %d trades, %d new tokens (total %d / %d) | delay %s slot(s) | disk %s of %s GB free, "
-                                     "memory %s of %s GB free%s", self.stats["trades"] - seen[0], self.stats["mints"] - seen[1],
-                                     self.stats["trades"], self.stats["mints"], self.stats.get("lag_p50"), self.stats.get("disk_free_gb"),
-                                     self.stats.get("disk_total_gb"), self.stats.get("mem_avail_gb", "?"), self.stats.get("mem_total_gb", "?"),
+                            pf = self.pool_feed.stats
+                            log.info("last minute: %d trades, %d new tokens (total %d / %d) | delay %s slot(s) | pools %s of %s followed on "
+                                     "%s connections, %s drops | disk %s of %s GB free, memory %s of %s GB free%s",
+                                     self.stats["trades"] - seen[0], self.stats["mints"] - seen[1], self.stats["trades"], self.stats["mints"],
+                                     self.stats.get("lag_p50"), pf.get("pools_followed"), pf.get("pools_wanted"), pf.get("pool_conns"),
+                                     pf.get("pool_drops"), self.stats.get("disk_free_gb"), self.stats.get("disk_total_gb"),
+                                     self.stats.get("mem_avail_gb", "?"), self.stats.get("mem_total_gb", "?"),
                                      f" | NOT STORING trades: under {MIN_FREE_GB:g} GB of disk free" if self.stats.get("paused_low_disk") else "")
                             seen, last_line = (self.stats["trades"], self.stats["mints"]), now
                         if now - last_forget >= 3600:
@@ -796,6 +812,7 @@ class Collector:
                 wait = self._dropped(lived, on_fallback)
                 log.warning("feed error after %.0fs connected (%s); reconnecting in %.0fs", lived, self.stats["last_error"], wait)
                 await asyncio.sleep(wait)
+        pools.cancel()
         self.flush()
 
 

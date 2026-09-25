@@ -474,6 +474,7 @@ def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
     col.on_logs(400, logs(create_bytes(mint, dev)), "sig-create")
     col.on_logs(500, logs(pool_bytes(pool, mint, b58decode(WSOL)), AMM_PROGRAM), "sig-migrate")
     assert col.pools == {b58(pool): b58(mint)} and col.stats["graduated"] == 1
+    assert b58(pool) in col.pool_feed.seen               # subscribed on its own from now on, not all of PumpSwap
     B, Q = 10**15, 85 * 10**9
     w_buy = logs(amm_bytes(True, pool, W, 10**12, B, Q, 10**8, 2 * 10**5, 10**8 + 2 * 10**5, 10**8 + 5 * 10**5), AMM_PROGRAM)
     col.on_logs(510, w_buy, "sig-w")
@@ -486,6 +487,7 @@ def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
     assert rows[0] == (510, 10**8, 10**12, 5 * 10**5, Q2, B2) and len(rows) == 2 and col.stats["amm_trades"] == 2
     copy = col.c.execute("SELECT side, trigger_slot, land_slot FROM pfills").fetchall()
     assert copy == [("buy", 510, 512)]                   # W's PumpSwap buy was copied at the pool's reserves
+    assert col._pinned_pools() == {b58(pool)}            # a pool with an open copy keeps its subscription
     col.c.close()
 
 

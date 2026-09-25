@@ -76,6 +76,27 @@ def test_a_golden_wallet_is_copied_again_at_every_stake(tmp_path):
     assert want[1.0] < want[0.25]                            # ... until the copy moves the curve itself
 
 
+def test_a_pool_is_followed_while_it_trades_or_holds_a_copy():
+    from hl_screener.pumppools import PoolFeed
+    pf, now = PoolFeed("wss://public.example", lambda *a: None, pinned=lambda: {"P_OPEN"}), 1_000_000.0
+    pf.seen = {"P_NEW": now, "P_OLD": now - 7200, "P_OPEN": now - 7200, "P_MID": now - 60}
+    assert pf.wanted(now) == ["P_OPEN", "P_NEW", "P_MID"]            # quiet for 2 h: dropped, unless a copy is open
+
+
+def test_pools_fill_connections_and_the_least_useful_is_retired(monkeypatch):
+    from hl_screener import pumppools
+    monkeypatch.setattr(pumppools, "POOL_PER_CONN", 3)             # the public RPC's 100 attempts, scaled down
+    monkeypatch.setattr(pumppools, "POOL_CONNS", 2)
+    pf = pumppools.PoolFeed("wss://public.example", lambda *a: None)
+    pf.place(list("abcde"), pumppools._Conn)
+    assert [sorted(c.pools) for c in pf.conns] == [list("abc"), list("de")]
+    pf.place(list("cdef"), pumppools._Conn)                         # a and b went quiet; f fits on the second
+    pf.place(list("cdefg"), pumppools._Conn)                        # g: every attempt used, so the first connection,
+    pf.place(list("cdefg"), pumppools._Conn)                        # with one pool still wanted, is retired for a new one
+    assert [sorted(c.pools) for c in pf.conns] == [list("def"), list("cg")]
+    assert pf.stats["pools_followed"] == 5 and all(c.attempts <= 3 for c in pf.conns)
+
+
 def test_the_log_carries_the_forward_results_by_why_each_wallet_is_followed(tmp_path):
     db = tmp_path / "pump.db"
     c = connect(db)
