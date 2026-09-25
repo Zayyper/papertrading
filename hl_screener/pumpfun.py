@@ -53,6 +53,12 @@ TIP_SOL = 0.001                # Jito tip: what buys a place at the top of the b
 TX_COST_SOL = BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL   # charged on the copy's buy and again on its sell
 LAMPORTS = 1e9
 MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
+LOW_DISK_GB = 3.0              # below this much, prune down to LOW_DISK_KEEP_S of history instead of the full retention
+LOW_DISK_KEEP_S = 2 * 86_400
+WAL_LIMIT = 64 * 2**20         # bytes the write-ahead log keeps after a checkpoint resets it
+STABLE_S = 300                 # a feed connection that lived this long was healthy; one that died sooner counts as a failure
+FALLBACK_S = 900               # one stretch on the fallback feed
+FALLBACK_PER_DAY = 2           # at most this many a UTC day: Helius's free credits cover ~10 h of this stream
 SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
 SNIPER_EVERY_S = 300           # how often that ranking is redone; it turns over fast
 SNIPER_WINDOW_H = 2.0          # the snipes it is ranked on
@@ -236,6 +242,7 @@ def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
     c = sqlite3.connect(p, timeout=30, check_same_thread=False)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
+    c.execute(f"PRAGMA journal_size_limit={WAL_LIMIT}")   # a reset log shrinks back: pruning once left gigabytes of it
     c.executescript(SCHEMA)
     for ddl in ("ALTER TABLE launches ADD COLUMN buyers TEXT",               # before maker wallets were linked
                 "ALTER TABLE launches ADD COLUMN dev_buy REAL",
@@ -560,6 +567,9 @@ class Collector:
         self.lags: collections.deque[int] = collections.deque(maxlen=20_000)
         self.sigs: collections.deque[str] = collections.deque(maxlen=20_000)
         self.sig_set: set[str] = set()
+        self.fails, self.backoff, self.fallback_until = 0, 1.0, 0.0     # the feed's recent failures (see _dropped)
+        self.fallback_day, self.fallback_used = "", 0
+        self.last_db_error = 0.0
 
     def wallet_id(self, addr: str) -> int:
         i = self.wallets.get(addr)
@@ -641,8 +651,16 @@ class Collector:
                 if e["sol_quote"]:
                     self._trade(slot, b58(e["mint"]), b58(e["user"]), e)
 
+    def _db_error(self, e: sqlite3.OperationalError) -> None:
+        if time.time() - self.last_db_error >= 60:                # once a minute: a full disk fails every write
+            log.warning("database write failed (%s): skipped, still following the feed", e)
+            self.last_db_error = time.time()
+
     def _trade(self, slot: int, mint: str, user: str, e: dict[str, Any]) -> None:
-        self.paper.on_trade(slot, mint, user, e)                  # followed wallets are copied on any token
+        try:
+            self.paper.on_trade(slot, mint, user, e)              # followed wallets are copied on any token
+        except sqlite3.OperationalError as err:                  # its fills are written here: a full disk must not stop the feed
+            self._db_error(err)
         m = self.mints.get(mint)
         if m is None:
             return                                                # born before we started watching: not stored
@@ -650,6 +668,20 @@ class Collector:
                          e["sol"], e["tok"], e["fee"], e["vsol"], e["vtok"]))
 
     def flush(self) -> None:
+        """Write the buffered trades and the paper follower's state. A write that fails (a full disk did, 17 restarts in
+        a row) drops that batch and keeps the feed going: the collector must outlive its own storage."""
+        try:
+            self._flush()
+        except sqlite3.OperationalError as e:
+            try:
+                self.c.rollback()
+            except sqlite3.Error:
+                pass
+            self.stats["skipped_low_disk"] = self.stats.get("skipped_low_disk", 0) + len(self.buf)
+            self.buf.clear()
+            self._db_error(e)
+
+    def _flush(self) -> None:
         if self.buf:
             self.stats["paused_low_disk"] = self.stats.get("disk_free_gb", MIN_FREE_GB) < MIN_FREE_GB
             if self.stats["paused_low_disk"]:                     # a full disk takes the whole server down: skip, keep following
@@ -683,15 +715,35 @@ class Collector:
         self.mints = {a: v for a, v in self.mints.items() if v[1] >= cutoff}
         self.paper.forget()
 
+    def _dropped(self, lived_s: float, on_fallback: bool) -> float:
+        """A feed connection ended after `lived_s` seconds: returns how long to wait before the next one. A connection
+        that dies within STABLE_S is a failure even though it connected: the public RPC throttles a client that
+        reconnects in a loop (on 2026-09-25 it dropped us every 30-60 s and let ~15 % of trades through), so the wait
+        grows, and after two such failures in a row the fallback takes over for FALLBACK_S, FALLBACK_PER_DAY times a day."""
+        stable = lived_s >= STABLE_S
+        self.fails = 1 if stable else self.fails + 1
+        self.backoff = 2.0 if stable else min(self.backoff * 2, 60.0)
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        if day != self.fallback_day:
+            self.fallback_day, self.fallback_used = day, 0
+        if self.fallback_url and not on_fallback and self.fails >= 2 and self.fallback_used < FALLBACK_PER_DAY:
+            self.fallback_until = time.time() + FALLBACK_S
+            self.fallback_used += 1
+            log.warning("main feed failed %d times in a row: using the fallback for %.0f min (%d of %d today)",
+                        self.fails, FALLBACK_S / 60, self.fallback_used, FALLBACK_PER_DAY)
+        self.stats["fallback_used_today"] = self.fallback_used
+        return self.backoff
+
     async def run(self, stop: asyncio.Event | None = None) -> None:
         import websockets  # here so `pump report` works without the package
         stop = stop or asyncio.Event()
-        backoff, last_flush, last_line, last_forget = 2.0, time.time(), time.time(), time.time()
-        fails, fallback_until, gap_from = 0, 0.0, None
+        last_flush, last_line, last_forget = time.time(), time.time(), time.time()
+        gap_from = None
         seen = (self.stats["trades"], self.stats["mints"])
         while not stop.is_set():
-            on_fallback = bool(self.fallback_url) and time.time() < fallback_until
+            on_fallback = bool(self.fallback_url) and time.time() < self.fallback_until
             url = self.fallback_url if on_fallback else self.ws_url
+            opened = time.time()
             try:
                 async with websockets.connect(url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30) as ws:
                     for i, program in enumerate((PUMP_PROGRAM, AMM_PROGRAM), 1):
@@ -700,7 +752,7 @@ class Collector:
                     await ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "slotSubscribe"}))
                     self.stats["ws"] = ("fallback: " if on_fallback else "") + url.split("?")[0]
                     log.info("connected to %s", self.stats["ws"])
-                    backoff, fails = 2.0, 0
+                    opened = time.time()
                     if gap_from is not None:
                         self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + time.time() - gap_from, 1)
                         gap_from = None
@@ -714,7 +766,7 @@ class Collector:
                             if not res["value"].get("err"):
                                 self.on_logs(res["context"]["slot"], res["value"]["logs"], res["value"].get("signature"))
                         now = time.time()
-                        if on_fallback and now >= fallback_until:
+                        if on_fallback and now >= self.fallback_until:
                             log.info("fallback window over: back to the main feed")
                             break
                         if now - last_flush >= 1:
@@ -735,15 +787,12 @@ class Collector:
             except Exception as e:  # noqa: BLE001 - any feed failure: keep what we have, reconnect
                 gap_from = gap_from or time.time()
                 self.flush()
-                fails += 1
                 self.stats["reconnects"] += 1
                 self.stats["last_error"] = _no_key(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(e).__name__}: {e}")[:300]
-                if self.fallback_url and not on_fallback and fails >= 2:
-                    fallback_until = time.time() + 900     # the main feed keeps failing: 15 min on the fallback
-                    log.warning("main feed failed %d times in a row: using the fallback for 15 min", fails)
-                log.warning("feed error (%s); reconnecting in %.0fs", self.stats["last_error"], backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
+                lived = time.time() - opened
+                wait = self._dropped(lived, on_fallback)
+                log.warning("feed error after %.0fs connected (%s); reconnecting in %.0fs", lived, self.stats["last_error"], wait)
+                await asyncio.sleep(wait)
         self.flush()
 
 
@@ -766,8 +815,47 @@ def prune(db_path: str | Path, retention_s: float) -> int:
         c.close()
 
 
+def checkpoint(db_path: str | Path) -> tuple[int, int, int] | None:
+    """Fold the write-ahead log into the database and cut the file back. Prunes delete in bulk and the report's long
+    reads keep the log from resetting meanwhile; on 2026-09-25 the disk filled right after pruning began."""
+    c = connect(db_path)
+    try:
+        return c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    finally:
+        c.close()
+
+
 def _pct(x: float | None, nd: int = 1) -> str:
     return f"{x:+.{nd}%}" if x is not None else "n/a"
+
+
+def paper_lines(db_path: str | Path) -> list[str]:
+    """The paper follower's forward results for the log, by why each wallet is followed: the page is behind a password,
+    and these numbers are what tests every ranking on the trades that came after it."""
+    c = connect(db_path, readonly=True)
+    try:
+        summ = get_meta(c, "paper") or {}
+    finally:
+        c.close()
+    ws, stake = summ.get("wallets") or [], summ.get("stake_sol") or 0.1
+    rate = lambda won, n: f"{won / n:.0%}" if n else "n/a"      # noqa: E731
+    groups = {"bought past $100k": lambda r: r.get("mature_ever"), "golden": lambda r: r.get("golden_ever"),
+              "snipers": lambda r: not r.get("golden_ever") and not r.get("mature_ever")}
+    out = []
+    for name, keep in groups.items():
+        g = [r for r in ws if keep(r)]
+        copied, closed = sum(r["copied"] or 0 for r in g), sum(r["closed"] or 0 for r in g)
+        if not copied:
+            continue
+        total, own_cost = sum(r["total"] for r in g), sum(r["own_cost"] for r in g)
+        out.append(f"paper {name}: {len(g)} wallets, {copied} copies ({closed} closed), {total:+.3f} SOL = "
+                   f"{_pct(total / (copied * stake))} per copy, won {rate(sum(r['wins'] or 0 for r in g), closed)}; "
+                   f"the wallets themselves {_pct(sum(r['own_pnl'] for r in g) / own_cost if own_cost else None)}")
+    for r in ws:
+        if r.get("mature_ever") and r["copied"]:
+            out.append(f"paper bought past $100k {r['wallet']}: {r['copied']} copies ({r['closed']} closed), {r['total']:+.3f} SOL "
+                       f"= {_pct(r['roi'])} per copy, won {rate(r['wins'] or 0, r['closed'])}; itself {_pct(r['own_roi'])}")
+    return out
 
 
 def _rules_line(rules: list[dict[str, Any]], detail: bool = False) -> str:
@@ -804,8 +892,14 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                 log.info("%s", line)
         except Exception:  # noqa: BLE001
             log.exception("dossiers failed")
-        last_report, last_top = time.time(), []
+        last_report, last_top, pruned = time.time(), [], 0
         while not halt.wait(sniper_every_s):
+            try:                                               # small steps, folded each time: bulk deletes swell the log
+                low = (col.stats.get("disk_free_gb") or LOW_DISK_GB) < LOW_DISK_GB
+                pruned += prune(db_path, min(col.retention_s, LOW_DISK_KEEP_S) if low else col.retention_s)
+                checkpoint(db_path)
+            except Exception:  # noqa: BLE001
+                log.exception("prune failed")
             try:                                               # coins 30 h old, before their trades are pruned
                 stored = settle_matures(db_path)
                 if stored:
@@ -821,7 +915,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                     log.info("top %d snipers: %s", len(top), ", ".join(f"{a} ({n})" for a, n in top))
                     last_top = [a for a, _ in top]
                 if time.time() - last_report >= report_every_s:
-                    n = prune(db_path, col.retention_s)
+                    n, pruned = pruned, 0
                     rep = build_report(db_path)
                     save_report(db_path, rep)
                     g = update_follow(db_path, rep)
@@ -858,6 +952,9 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                                      mat["params"]["stake_sol"], _rules_line(rules, detail=True))
                     for line in log_lines(spec) if spec else ():
                         log.info("%s", line)
+                    for line in paper_lines(db_path):               # the forward test of every ranking
+                        log.info("%s", line)
+                    checkpoint(db_path)                              # the long reads are over: let the log reset
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed")
 
