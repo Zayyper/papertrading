@@ -20,12 +20,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .pumpfun import FEE, TX_COST_SOL, _state_before, connect, copy_trade, get_meta
+from .pumpfun import TX_COST_SOL, _fee_known, _state_before, connect, copy_trade, get_meta
 from .pumpmature import CURVE_DONE_VTOK, INSTANT_S, MC_LEVELS, SOL_USD, STAKE_SOL
 
 BUCKETS = (("$100-200k", MC_LEVELS["mc100k"]), ("$200-500k", MC_LEVELS["mc200k"]), ("$500k-1M", MC_LEVELS["mc500k"]),
            ("$1M+", MC_LEVELS["mc1m"]))
-MIN_SELL = 10**7                         # a sell under 0.01 SOL rounds its fee too coarsely to read the rate from
 DETAIL_MAX = 300                         # a wallet's latest positions looked at up close (ponytail: a bot with thousands
                                          # gets its copy measured on its latest 300; raise it if the report has time)
 
@@ -44,14 +43,6 @@ SELECT p.wallet, p.mint, f.slot, f.ts, f.vsol * 1e6 / f.vtok AS mcap, p.cost / 1
 FROM pos p JOIN trades f ON f.rowid = p.fbr JOIN mints m ON m.id = p.mint JOIN mlast l ON l.mint = p.mint
 WHERE f.vsol * 1e6 >= ? * f.vtok AND p.wallet != m.creator
 """     # a coin's tokens sold beyond what was bought came from elsewhere: only the bought share of the proceeds counts
-
-
-def _fee_known(c: sqlite3.Connection, mint: int, slot: int | None) -> float:
-    """The fee a trade in this coin paid at `slot` (None: now), from the last sell that paid one: PumpSwap buy events
-    log almost none, and the rate moves with the coin's market cap."""
-    row = c.execute("""SELECT fee * 1.0 / sol FROM trades WHERE mint = ? AND slot <= ? AND buy = 0 AND sol >= ? AND fee > 0
-                       ORDER BY slot DESC LIMIT 1""", (mint, 2**62 if slot is None else slot, MIN_SELL)).fetchone()
-    return row[0] if row else FEE
 
 
 def _build(c: sqlite3.Connection, min_mcap: float) -> int:

@@ -891,7 +891,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
         from .pumpspecialists import follow_specialists, log_lines, specialists
         try:                                                   # once per start: the followed wallets up close, in the log
             from .pumpdossier import dossiers
-            for line in dossiers(db_path):
+            for line in dossiers(db_path) + stake_sweep(db_path):
                 log.info("%s", line)
         except Exception:  # noqa: BLE001
             log.exception("dossiers failed")
@@ -955,7 +955,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                                      mat["params"]["stake_sol"], _rules_line(rules, detail=True))
                     for line in log_lines(spec) if spec else ():
                         log.info("%s", line)
-                    for line in paper_lines(db_path):               # the forward test of every ranking
+                    for line in paper_lines(db_path) + stake_sweep(db_path):   # the forward test, and the copy by size
                         log.info("%s", line)
                     checkpoint(db_path)                              # the long reads are over: let the log reset
             except Exception:  # noqa: BLE001
@@ -1025,6 +1025,14 @@ def copy_trade(entry: tuple[int, int], exit_: tuple[int, int], stake_sol: float,
     vsol2, vtok2 = exit_
     out = (vsol2 - vsol2 * vtok2 / (vtok2 + tokens)) * (1 - fee_out) if vtok2 > 0 else 0.0
     return out / LAMPORTS - stake_sol - 2 * tx_cost_sol
+
+
+def _fee_known(c: sqlite3.Connection, mint: int, slot: int | None) -> float:
+    """The fee a trade in this coin paid at `slot` (None: now), from the last sell that paid one: PumpSwap buy events
+    log almost none, and the rate moves with the coin's market cap."""
+    row = c.execute("""SELECT fee * 1.0 / sol FROM trades WHERE mint = ? AND slot <= ? AND buy = 0 AND sol >= ? AND fee > 0
+                       ORDER BY slot DESC LIMIT 1""", (mint, 2**62 if slot is None else slot, 10**7)).fetchone()
+    return row[0] if row else FEE
 
 
 def _fee_rate(c: sqlite3.Connection, wallet: int, mint: int, buy: int, slot: int | None) -> float:
@@ -1472,7 +1480,8 @@ def copy_sim(c: sqlite3.Connection, wallet: int, mid: float, latency_slots: int,
             continue
         fs = c.execute("SELECT MIN(slot) FROM trades WHERE wallet=? AND mint=? AND buy=0 AND slot >= ?", (wallet, mint, fb)).fetchone()[0]
         exit_ = _state_before(c, mint, fs + latency_slots) if fs is not None else _state_before(c, mint, None)
-        p = copy_trade(entry, exit_, stake_sol, tx_cost_sol, _fee_rate(c, wallet, mint, 1, fb), _fee_rate(c, wallet, mint, 0, fs))
+        fee_in = _fee_rate(c, wallet, mint, 1, fb) or _fee_known(c, mint, fb + latency_slots)   # a PumpSwap buy logs ~0
+        p = copy_trade(entry, exit_, stake_sol, tx_cost_sol, fee_in, _fee_rate(c, wallet, mint, 0, fs))
         half = "h1" if mts < mid else "h2"
         out["n"] += 1
         out["pnl"] += p
@@ -1483,6 +1492,31 @@ def copy_sim(c: sqlite3.Connection, wallet: int, mid: float, latency_slots: int,
         n = out["n" + k]
         out["roi" + k] = out["pnl" + k] / (n * stake_sol) if n else None
     return out
+
+
+SWEEP_STAKES = (0.1, 0.25, 0.5, 1.0)
+
+
+def stake_sweep(db_path: str | Path, stakes: tuple[float, ...] = SWEEP_STAKES, latency_slots: int | None = None) -> list[str]:
+    """Every golden wallet's copy replayed at each stake on the trades still stored. A bigger copy pays the same fixed
+    0.0015 SOL a transaction on more money, 3 % of a 0.1 SOL round trip, but moves the curve more going in and out."""
+    c = connect(db_path, readonly=True)
+    try:
+        if latency_slots is None:
+            measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")
+            latency_slots = max(2, measured + 1) if measured is not None else 2
+        t0, t1 = c.execute("SELECT MIN(ts), MAX(ts) FROM mints").fetchone()
+        out = []
+        for addr, wid in c.execute("""SELECT f.wallet, w.id FROM follow f JOIN wallets w ON w.addr = f.wallet
+                                      WHERE f.golden_ever = 1 ORDER BY f.wallet""").fetchall():
+            runs = [(s, copy_sim(c, wid, (t0 + t1) / 2, latency_slots, s, TX_COST_SOL, 1000)) for s in stakes]
+            if runs[0][1]["n"]:
+                out.append(f"stake sweep {addr} ({runs[0][1]['n']} copies on the stored trades): " + ", ".join(
+                    f"{s:g} SOL {_pct(r['roi'])} [{_pct(r['roi_h1'], 0)}/{_pct(r['roi_h2'], 0)}] won {r['wins'] / r['n']:.0%}"
+                    for s, r in runs))
+        return out
+    finally:
+        c.close()
 
 
 def twins(c: sqlite3.Connection, wallet: int, max_positions: int = 1000) -> int:

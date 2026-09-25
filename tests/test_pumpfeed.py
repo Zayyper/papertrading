@@ -46,6 +46,36 @@ def test_the_write_ahead_log_is_capped_and_folded(tmp_path):
     c.close()
 
 
+def test_a_golden_wallet_is_copied_again_at_every_stake(tmp_path):
+    import time
+    from hl_screener.pumpfun import SWEEP_STAKES, TX_COST_SOL, _pct, copy_trade, stake_sweep
+    db, k, sol = tmp_path / "pump.db", 30 * 10**9 * 1_073_000_000 * 10**6, 10**9
+    c = connect(db)
+    c.executemany("INSERT INTO wallets (id, addr) VALUES (?, ?)", [(1, "MAKER"), (2, "G"), (3, "X")])
+    c.execute("INSERT INTO mints (id, addr, slot, ts, creator) VALUES (1, 'M1', 100, ?, 1)", (int(time.time()) - 3600,))
+    c.execute("INSERT INTO follow (wallet, added_at, golden_ever) VALUES ('G', 0, 1)")
+    state = {"v": 30 * sol}
+
+    def trade(slot: int, wallet: int, v: int) -> None:
+        amount = abs(v - state["v"])
+        c.execute("INSERT INTO trades VALUES (?, 0, 1, ?, ?, ?, ?, ?, ?, ?)",
+                  (slot, wallet, int(v > state["v"]), amount, abs(k // state["v"] - k // v), amount // 80, v, k // v))
+        state["v"] = v
+
+    trade(100, 3, 35 * sol)
+    trade(110, 2, 36 * sol)                                  # G buys ...
+    trade(200, 3, 45 * sol)
+    trade(300, 2, 44 * sol)                                  # ... and sells into the move
+    c.commit()
+    c.close()
+    want = {s: copy_trade((36 * sol, k // (36 * sol)), (44 * sol, k // (44 * sol)), s, TX_COST_SOL, 1 / 80, 1 / 80) / s
+            for s in SWEEP_STAKES}
+    assert stake_sweep(db, latency_slots=2) == ["stake sweep G (1 copies on the stored trades): " + ", ".join(
+        f"{s:g} SOL {_pct(want[s])} [n/a/{_pct(want[s], 0)}] won 100%" for s in SWEEP_STAKES)]
+    assert want[0.25] > want[0.1]                            # the fixed cost weighs less on a bigger copy ...
+    assert want[1.0] < want[0.25]                            # ... until the copy moves the curve itself
+
+
 def test_the_log_carries_the_forward_results_by_why_each_wallet_is_followed(tmp_path):
     db = tmp_path / "pump.db"
     c = connect(db)
