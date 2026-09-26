@@ -564,7 +564,7 @@
     const W = p.wallets || [];
     const sn = p.snipers || {};
     $("#pp-caption").textContent = p.at
-      ? `every wallet the ranking below has called golden, from that moment on, plus the top ${sn.top ?? 5} snipers of the last ${sn.window_h ?? 2} h, re-ranked every ${Math.round((sn.every_s ?? 300) / 60)} min: the wallet's first buy of a token copied with ${p.stake_sol} SOL landing ${p.latency_slots} slots behind it, sold when it first sells, at live curve prices, pump.fun's fee and ${fmtNum(p.tx_cost_sol, 4)} SOL a transaction (signature, priority fee, tip), no real orders · ${fmtInt(p.pending)} waiting to land`
+      ? `every wallet the ranking below has called golden, from that moment on, plus the top ${sn.top ?? 5} snipers of the last ${sn.window_h ?? 2} h, re-ranked every ${Math.round((sn.every_s ?? 300) / 60)} min: the wallet's first buy of a token copied with ${p.stake_sol} SOL (0.1 SOL before 2026-09-26; Per copy is over the SOL put in) landing ${p.latency_slots} slots behind it, sold when it first sells, at live curve prices, pump.fun's fee and ${fmtNum(p.tx_cost_sol, 4)} SOL a transaction (signature, priority fee, tip), no real orders · ${fmtInt(p.pending)} waiting to land`
       : "";
     const empty = !d.exists ? "The pump.fun collector is not running yet." :
       `No wallet followed yet. The top ${sn.top ?? 5} snipers of the moment join within ${Math.round((sn.every_s ?? 300) / 60)} minutes of the collector starting; a golden wallet needs 12+ hours of data, 10+ tokens, profit in both halves of the window for itself and its copier, no dominant token, no launches and no cluster.`;

@@ -51,6 +51,7 @@ BASE_FEE_SOL = 0.000005        # Solana's signature fee, 5,000 lamports
 PRIORITY_SOL = 0.0005          # compute-unit price a fill that cannot wait has to pay
 TIP_SOL = 0.001                # Jito tip: what buys a place at the top of the block
 TX_COST_SOL = BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL   # charged on the copy's buy and again on its sell
+PAPER_STAKE_SOL = 0.25         # each live paper copy (0.1 until 2026-09-26): the size stake_sweep found best for every golden wallet
 LAMPORTS = 1e9
 MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
 LOW_DISK_GB = 3.0              # below this much, prune down to LOW_DISK_KEEP_S of history instead of the full retention
@@ -282,7 +283,7 @@ class PaperFollow:
     so the two compare directly.
     Nothing is ever sent to Solana."""
 
-    def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = 0.1, tx_cost_sol: float = TX_COST_SOL):
+    def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = PAPER_STAKE_SOL, tx_cost_sol: float = TX_COST_SOL):
         from .pumpmature import MC_LEVELS                      # here: that module builds on this one
         self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
         self.follow: set[str] = set()
@@ -433,18 +434,20 @@ class PaperFollow:
         rows = {w: {"wallet": w, "added_at": added, "golden_now": bool(g), "golden_ever": bool(ge), "sniper_now": bool(sn),
                     "sniper_rank": rank, "mature_ever": bool(me), "report_copy_roi": roi, "copied": 0, "closed": 0,
                     "open": 0, "realized": 0.0, "unrealized": 0.0, "wins": 0, "delay_slots": None, "slip_bps": None,
-                    "own_cost": 0.0, "own_pnl": 0.0}
+                    "own_cost": 0.0, "own_pnl": 0.0, "invested": 0.0}
                 for w, added, g, ge, sn, rank, me, roi in self.c.execute(
                     "SELECT wallet, added_at, golden_now, golden_ever, sniper_now, sniper_rank, mature_ever, report_copy_roi FROM follow")}
         for (w, m), (cost, proceeds, tok) in self.own.items():   # the wallet itself, held tokens at the live curve (0 if never priced)
             if w in rows:
                 rows[w]["own_cost"] += cost
                 rows[w]["own_pnl"] += proceeds - cost + ((self._worth(m, tok) or 0.0) if tok > 0 else 0.0)
-        for w, copied, closed, realized, wins, delay, slip in self.c.execute(
+        for w, copied, closed, realized, wins, delay, slip, invested in self.c.execute(
                 """SELECT wallet, SUM(side = 'buy'), SUM(side = 'sell'), COALESCE(SUM(pnl), 0), SUM(pnl > 0),
-                          AVG(land_slot - trigger_slot), AVG(slip_bps) FROM pfills GROUP BY wallet"""):
+                          AVG(land_slot - trigger_slot), AVG(slip_bps), SUM(CASE WHEN side = 'buy' THEN sol ELSE 0 END)
+                   FROM pfills GROUP BY wallet"""):
             if w in rows:
-                rows[w].update(copied=copied, closed=closed, realized=realized, wins=wins, delay_slots=delay, slip_bps=slip)
+                rows[w].update(copied=copied, closed=closed, realized=realized, wins=wins, delay_slots=delay, slip_bps=slip,
+                               invested=invested)
         open_ = []
         for (w, m), (tok, cost, opened) in self.pos.items():
             value = self._worth(m, tok)
@@ -455,7 +458,7 @@ class PaperFollow:
             open_.append({"wallet": w, "mint": m, "cost": cost, "value": value, "pnl": pnl, "opened": opened})
         for r in rows.values():
             r["total"] = r["realized"] + r["unrealized"]
-            r["roi"] = r["total"] / (r["copied"] * self.stake) if r["copied"] else None
+            r["roi"] = r["total"] / r["invested"] if r["invested"] else None   # over the SOL put in: the stake changed once
             r["own_roi"] = r["own_pnl"] / r["own_cost"] if r["own_cost"] else None
             r["win_rate"] = r["wins"] / r["closed"] if r["closed"] else None
         cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
@@ -711,7 +714,7 @@ class Collector:
             set_meta(self.c, "paper", summ)
             if now - self.last_snap >= 300:                       # the chart: copy and wallet, every 5 min
                 self.c.executemany("INSERT INTO psnap VALUES (?,?,?,?,?,?)", [
-                    (int(now), r["wallet"], r["total"], r["copied"] * self.paper.stake, r["own_pnl"], r["own_cost"])
+                    (int(now), r["wallet"], r["total"], r["invested"], r["own_pnl"], r["own_cost"])
                     for r in summ["wallets"] if r["copied"] or r["golden_ever"] or r["sniper_now"] or r["mature_ever"]])   # a sniper that never traded needs no line
                 self.last_snap = now
             if self.lags:
@@ -855,9 +858,15 @@ def paper_lines(db_path: str | Path) -> list[str]:
     c = connect(db_path, readonly=True)
     try:
         summ = get_meta(c, "paper") or {}
+        stake = summ.get("stake_sol") or PAPER_STAKE_SOL
+        # each golden wallet's copies at today's size alone: the go-live call is made on these, not on the 0.1 SOL ones
+        at_stake = c.execute("""SELECT b.wallet, COUNT(*), COUNT(s.pnl), COALESCE(SUM(s.pnl), 0), COALESCE(SUM(s.pnl > 0), 0)
+                                FROM pfills b JOIN follow f ON f.wallet = b.wallet AND f.golden_ever = 1
+                                LEFT JOIN pfills s ON s.wallet = b.wallet AND s.mint = b.mint AND s.side = 'sell'
+                                WHERE b.side = 'buy' AND ABS(b.sol - ?) < 1e-9 GROUP BY b.wallet ORDER BY b.wallet""", (stake,)).fetchall()
     finally:
         c.close()
-    ws, stake = summ.get("wallets") or [], summ.get("stake_sol") or 0.1
+    ws = summ.get("wallets") or []
     rate = lambda won, n: f"{won / n:.0%}" if n else "n/a"      # noqa: E731
     groups = {"bought past $100k": lambda r: r.get("mature_ever"), "golden": lambda r: r.get("golden_ever"),
               "snipers": lambda r: not r.get("golden_ever") and not r.get("mature_ever")}
@@ -867,14 +876,17 @@ def paper_lines(db_path: str | Path) -> list[str]:
         copied, closed = sum(r["copied"] or 0 for r in g), sum(r["closed"] or 0 for r in g)
         if not copied:
             continue
-        total, own_cost = sum(r["total"] for r in g), sum(r["own_cost"] for r in g)
+        total, own_cost, invested = (sum(r.get(k, 0.0) for r in g) for k in ("total", "own_cost", "invested"))
         out.append(f"paper {name}: {len(g)} wallets, {copied} copies ({closed} closed), {total:+.3f} SOL = "
-                   f"{_pct(total / (copied * stake))} per copy, won {rate(sum(r['wins'] or 0 for r in g), closed)}; "
+                   f"{_pct(total / invested if invested else None)} per copy, won {rate(sum(r['wins'] or 0 for r in g), closed)}; "
                    f"the wallets themselves {_pct(sum(r['own_pnl'] for r in g) / own_cost if own_cost else None)}")
     for r in ws:
         if r.get("mature_ever") and r["copied"]:
             out.append(f"paper bought past $100k {r['wallet']}: {r['copied']} copies ({r['closed']} closed), {r['total']:+.3f} SOL "
                        f"= {_pct(r['roi'])} per copy, won {rate(r['wins'] or 0, r['closed'])}; itself {_pct(r['own_roi'])}")
+    for w, n, closed, pnl, won in at_stake:
+        out.append(f"paper golden {w} at {stake:g} SOL: {n} copies ({closed} closed), {pnl:+.3f} SOL = "
+                   f"{_pct(pnl / (closed * stake) if closed else None)} per closed copy, won {rate(won, closed)}")
     return out
 
 

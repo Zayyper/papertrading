@@ -103,13 +103,33 @@ def test_the_log_carries_the_forward_results_by_why_each_wallet_is_followed(tmp_
     row = {"golden_ever": False, "sniper_now": False, "mature_ever": False, "wins": 0, "closed": 0, "roi": None, "own_roi": None}
     set_meta(c, "paper", {"stake_sol": 0.1, "wallets": [
         {**row, "wallet": "M1", "mature_ever": True, "copied": 4, "closed": 3, "total": -0.05, "wins": 1, "own_cost": 10.0,
-         "own_pnl": 1.0, "roi": -0.125, "own_roi": 0.1},
-        {**row, "wallet": "M2", "mature_ever": True, "copied": 0, "total": 0.0, "own_cost": 0.0, "own_pnl": 0.0},
+         "own_pnl": 1.0, "roi": -0.125, "own_roi": 0.1, "invested": 0.4},
+        {**row, "wallet": "M2", "mature_ever": True, "copied": 0, "total": 0.0, "own_cost": 0.0, "own_pnl": 0.0, "invested": 0.0},
         {**row, "wallet": "S1", "sniper_now": True, "copied": 10, "closed": 10, "total": 0.02, "wins": 5, "own_cost": 5.0,
-         "own_pnl": -0.5, "roi": 0.02, "own_roi": -0.1}]})
+         "own_pnl": -0.5, "roi": 0.02, "own_roi": -0.1, "invested": 1.0}]})
     c.commit()
     c.close()
     assert paper_lines(db) == [
         "paper bought past $100k: 2 wallets, 4 copies (3 closed), -0.050 SOL = -12.5% per copy, won 33%; the wallets themselves +10.0%",
         "paper snipers: 1 wallets, 10 copies (10 closed), +0.020 SOL = +2.0% per copy, won 50%; the wallets themselves -10.0%",
         "paper bought past $100k M1: 4 copies (3 closed), -0.050 SOL = -12.5% per copy, won 33%; itself +10.0%"]
+
+
+def test_copies_of_two_sizes_count_by_the_sol_put_in_and_the_new_size_is_logged_alone(tmp_path):
+    from hl_screener.pumpfun import PAPER_STAKE_SOL, PaperFollow
+    db = tmp_path / "pump.db"
+    c = connect(db)
+    c.execute("INSERT INTO follow (wallet, added_at, golden_ever) VALUES ('G', 0, 1)")
+    c.executemany("INSERT INTO pfills (wallet, mint, side, sol, pnl) VALUES ('G', ?, ?, ?, ?)", [
+        ("A", "buy", 0.1, None), ("A", "sell", 0.12, 0.017),                   # a copy from before the switch
+        ("B", "buy", PAPER_STAKE_SOL, None), ("B", "sell", 0.2, -0.053),      # two after it, one still open
+        ("C", "buy", PAPER_STAKE_SOL, None)])
+    pf = PaperFollow(c)
+    w = pf.summary()["wallets"][0]
+    assert abs(w["roi"] - (0.017 - 0.053) / (0.1 + 2 * PAPER_STAKE_SOL)) < 1e-12   # not over 3 copies at today's size
+    set_meta(c, "paper", pf.summary())
+    c.commit()
+    c.close()
+    assert paper_lines(db) == [
+        "paper golden: 1 wallets, 3 copies (2 closed), -0.036 SOL = -6.0% per copy, won 50%; the wallets themselves n/a",
+        "paper golden G at 0.25 SOL: 2 copies (1 closed), -0.053 SOL = -21.2% per closed copy, won 0%"]

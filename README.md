@@ -159,7 +159,7 @@ bought came from elsewhere and earn it nothing in these numbers.
   two best tokens under half its winnings, it launches no tokens, it is not in a cluster, and the
   window spans 12 hours or more.
 - **Golden wallets are paper-followed live**, inside the collector, from the moment a report flags
-  them and for good after that: each first buy of a token copied with 0.1 SOL landing 2 slots
+  them and for good after that: each first buy of a token copied with 0.25 SOL (0.1 until 2026-09-26) landing 2 slots
   behind the wallet (later if the feed lags), sold when it first sells, on the live curve with
   its fees. The wallet's own trades in the tokens it buys from then on are tracked too, so the
   Pump tab charts each copy against the wallet itself (a point every 5 minutes, each line shown or

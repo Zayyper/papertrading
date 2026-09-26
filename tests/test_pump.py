@@ -3,7 +3,7 @@ import struct
 import time
 
 from hl_screener.pumpfun import (_B58, AMM_PROGRAM, D_BUY, _best, D_CREATE, D_POOL, D_SELL, D_TRADE, FEE, PUMP_PROGRAM, WSOL, Collector,
-                                 BASE_FEE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
+                                 BASE_FEE_SOL, PAPER_STAKE_SOL, PRIORITY_SOL, TIP_SOL, TX_COST_SOL, b58, build_report, copy_trade,
                                  cohorts_of, launch_pnl, maker_table, operator_groups, paper_series, parse_amm_trade, parse_create,
                                  parse_trade, settle_launches, strategy_sim, strategy_states, twins, update_snipers)
 
@@ -155,7 +155,7 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
     trade(125, Z, True, 10**9)            # due: the copy sells at the state G's sell left
     fills = col.c.execute("SELECT side, trigger_slot, land_slot, pnl, timed_out FROM pfills ORDER BY id").fetchall()
     assert [f[:3] for f in fills] == [("buy", 100, 102), ("sell", 120, 122)]
-    assert abs(fills[1][3] - copy_trade(states[(mint, 101)], states[(mint, 120)], 0.1, TX_COST_SOL)) < 1e-6
+    assert abs(fills[1][3] - copy_trade(states[(mint, 101)], states[(mint, 120)], PAPER_STAKE_SOL, TX_COST_SOL)) < 1e-6
 
     quiet, cv2 = bytes([10]) * 32, Curve()
     trade(200, G, True, 10**9, m=quiet, cv=cv2)   # nothing trades after this: the timeout lands the copy
@@ -196,7 +196,7 @@ def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     assert abs(w["own_pnl"] - ((sold - fee(sold)) / 1e9 - w["own_cost"] + held)) < 1e-12
     series = paper_series(col.c)[b58(G)]
     assert series[0] == [1_790_000_100, 0.0, 0.0] and len(series) == 2      # 0 when followed, then the 5-minute point
-    assert abs(series[1][2] - w["own_roi"]) < 1e-12 and series[1][1] == (w["total"] / 0.1 if w["copied"] else 0.0)
+    assert abs(series[1][2] - w["own_roi"]) < 1e-12 and series[1][1] == (w["total"] / PAPER_STAKE_SOL if w["copied"] else 0.0)
     col.c.close()
 
 
