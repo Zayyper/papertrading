@@ -378,6 +378,21 @@ def test_a_dossier_puts_a_wallets_own_trades_next_to_its_copies(tmp_path):
     assert "+0.750 SOL on 2.00 SOL spent" in out and "1 sold more than it bought" in out   # 1.5 SOL x 500/1000 it bought
 
 
+def test_a_dossier_of_a_wallet_that_closed_nothing_yet_still_prints(tmp_path):
+    from hl_screener.pumpdossier import dossiers
+    from hl_screener.pumpfun import connect
+    db, L = tmp_path / "pump.db", 10**9
+    c = connect(db)
+    c.executemany("INSERT INTO wallets(id, addr) VALUES (?, ?)", [(1, "G"), (2, "M")])
+    c.execute("INSERT INTO mints(id, addr, slot, ts, creator) VALUES (1, 'coin1', 100, 1000, 2)")
+    c.execute("INSERT INTO trades(slot, ts, mint, wallet, buy, sol, tok, fee, vsol, vtok) VALUES (101, 1000, 1, 1, 1, ?, 1000, 0, ?, 1)",
+              (L, 31 * L))
+    c.execute("INSERT INTO follow(wallet, added_at, golden_now, golden_ever) VALUES ('G', 0, 1, 1)")
+    c.commit()
+    c.close()
+    assert "0 closed +0.000 SOL on 0.00 SOL spent (n/a), won n/a, median n/a SOL" in "\n".join(dossiers(db))   # 2026-09-26: it crashed the startup log
+
+
 def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():
     def launch(creator, buyers, ts=0):
         return {"creator": creator, "buyers": ",".join(buyers), "ts": ts}

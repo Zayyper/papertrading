@@ -114,7 +114,7 @@ def lines(d: dict[str, Any], status: str = "") -> list[str]:
         f"dossier {a}{status}",
         f"  itself: {d['trades']} trades on {d['tokens']} coins over {d['span_h']:.0f} h ({d['per_hour']:.1f}/h), {d['closed']} closed "
         f"{d['pnl_sol']:+.3f} SOL on {d['cost_sol']:.2f} SOL spent ({_pct(d['pnl_sol'] / d['cost_sol'] if d['cost_sol'] else None)}), "
-        f"won {_pct(d['won'])}, median {d['median_sol']:+.4f} SOL, best 3 coins = {_pct(d['top3_share'])} of its gains, {d['open']} still held, "
+        f"won {_pct(d['won'])}, median {'n/a' if d['median_sol'] is None else format(d['median_sol'], '+.4f')} SOL, best 3 coins = {_pct(d['top3_share'])} of its gains, {d['open']} still held, "
         f"{d['oversold']} sold more than it bought (not counted) | buys p50/p90/max {'/'.join(_num(b, 2) for b in d['buy_sol'])} SOL",
         "  by 12 h: " + ", ".join(f"{k} {v:+.2f}" for k, v in d["blocks"].items()),
         f"  entry: {', '.join(f'{k} slots after launch {v:.0%}' for k, v in d['offset_share'].items())} | SOL already in the curve "
