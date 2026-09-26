@@ -165,6 +165,16 @@ bought came from elsewhere and earn it nothing in these numbers.
   Pump tab charts each copy against the wallet itself (a point every 5 minutes, each line shown or
   hidden on its own) and lists the copies next to the copier return the report measured before
   following it. That comparison is the out-of-sample test.
+- **Live copies (`hl_screener/pumplive.py`), dry by default.** With `PUMP_LIVE=dry` each copy's buy is
+  built as the real pump.fun or PumpSwap transaction the moment it would be sent and simulated by the
+  RPC on the chain's newest state: no key, nothing sent. The 30-minute log says how many would have gone
+  through, what they would have bought next to the paper copy, and how fast they were ready.
+  `PUMP_LIVE=live` signs with `PUMP_LIVE_KEY` (a wallet used for nothing else, put in the server's
+  environment by its owner, never in git) and sends through Helius Sender and Jito. It copies only
+  `PUMP_LIVE_WALLETS`, at most `PUMP_LIVE_MAX_OPEN` (3) at once, stops new copies for the UTC day after
+  `PUMP_LIVE_DAY_LOSS_SOL` (0.5) is lost, and gives each sell three tries, the last at any price; a coin
+  that still will not sell is left in the log for its owner. The transactions are pinned to real mainnet
+  ones in `tests/test_pumptx.py` and simulated on mainnet by `checks/pumplive_simulate.py`.
 - **The top `SNIPER_TOP` (5) snipers are followed as well**, re-ranked every 5 minutes because that list
   turns over fast: the wallets that bought the most tokens within two slots of creation over the last
   2 hours, launchers excluded. A sniper is copied only while it is in that set (a copy already open

@@ -19,7 +19,8 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 POOL_PER_CONN = 95              # subscription attempts a connection may make: the public RPC closes it at the 101st
-POOL_CONNS = 8                  # connections for pools, on top of the pump.fun one (the public RPC allows 40 per IP)
+POOL_CONNS = 8                  # connections for pools, on top of the pump.fun one: the public RPC allows 10 websockets per IP
+                                # (x-ratelimit pubsub-limit, 2026-09-26), so a restart's overlap with the old container goes over
 POOL_IDLE_S = 3600              # a pool that has not traded for this long is dropped at the next retirement
 SUB_PER_S = 8.0                 # subscribe requests a second over all connections (the public RPC: 100 per 10 s per IP)
 

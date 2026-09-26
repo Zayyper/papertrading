@@ -112,13 +112,17 @@ def parse_trade(b: bytes) -> dict[str, Any] | None:
         user = r.pk()
         ts = r.take("<q")
         vsol, vtok = r.take("<QQ")
-        r.skip(16 + 32 + 8)                       # real reserves, fee_recipient, fee_basis_points
+        r.skip(16)                                # real reserves
+        fee_recipient = r.pk()
+        r.skip(8)                                 # fee_basis_points
         fee = r.take("<Q")
-        r.skip(32 + 8)                            # creator, creator_fee_basis_points
+        creator = r.pk()
+        r.skip(8)                                 # creator_fee_basis_points
         fee += r.take("<Q")                       # creator_fee
         r.skip(1 + 8 * 4)                         # track_volume, (un)claimed tokens, current_sol_volume, last_update
-        r.string()                                # ix_name
-        r.skip(1 + 8 * 4)                         # mayhem_mode, cashback and buyback bps/amounts
+        ix = r.string()                           # ix_name
+        mayhem = r.take("<?")
+        r.skip(8 * 4)                             # cashback and buyback bps/amounts
         r.skip(34 * r.take("<I"))                 # shareholders: vec<(pubkey, u16)>
         quote = r.pk()
         r.skip(8 * 5)                             # quote amount/reserves, holder rewards
@@ -127,7 +131,8 @@ def parse_trade(b: bytes) -> dict[str, Any] | None:
     if r.o != len(b):
         return None
     return {"mint": mint, "user": user, "buy": is_buy, "sol": sol, "tok": tok, "fee": fee, "ts": ts,
-            "vsol": vsol, "vtok": vtok, "sol_quote": quote == SOL_QUOTE}
+            "vsol": vsol, "vtok": vtok, "sol_quote": quote == SOL_QUOTE,
+            "fee_recipient": fee_recipient, "creator": creator, "mayhem": mayhem, "ix": ix}   # what a live copy's transaction needs
 
 
 def parse_create(b: bytes) -> dict[str, Any] | None:
@@ -140,14 +145,17 @@ def parse_create(b: bytes) -> dict[str, Any] | None:
         user = r.pk()                             # the wallet that launched it (its buys are the dev's)
         r.skip(32)                                # creator (fee recipient)
         ts = r.take("<q")
-        r.skip(8 * 4 + 32 + 2)                    # reserves, supply, token_program, mayhem, cashback
+        r.skip(8 * 4)                             # reserves, supply
+        token_program = r.pk()
+        r.skip(2)                                 # mayhem, cashback
         quote = r.pk()
         r.skip(8 + 8 + 1)                         # virtual_quote_reserves, creator_fee_bps, is_holder_reward
     except (struct.error, ValueError):
         return None
     if r.o != len(b):
         return None
-    return {"mint": mint, "user": user, "name": name[:64], "symbol": symbol[:32], "ts": ts, "sol_quote": quote == SOL_QUOTE}
+    return {"mint": mint, "user": user, "name": name[:64], "symbol": symbol[:32], "ts": ts, "sol_quote": quote == SOL_QUOTE,
+            "token_program": token_program}
 
 
 def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
@@ -161,7 +169,11 @@ def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
         ts = r.take("<q")
         v = r.take("<13Q")
         pool, user = r.pk(), r.pk()
-        r.skip(32 * 5 + 16)                       # token accounts, fee recipients, coin creator, creator fee bps/amount
+        r.skip(32 * 2)                            # the user's token accounts
+        fee_recipient = r.pk()                    # protocol_fee_recipient
+        r.skip(32)                                # its token account
+        creator = r.pk()                          # coin_creator
+        r.skip(16)                                # creator fee bps/amount
         if buy:
             r.skip(1 + 8 * 4 + 8)                 # track_volume, volume totals, min_base_amount_out
             r.string()                            # ix_name
@@ -177,7 +189,8 @@ def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
         vtok, vsol, fee = B - base, Q + q_net + vq, user_q - q
     else:
         vtok, vsol, fee = B + base, Q - q_net + vq, q - user_q
-    return {"pool": pool, "user": user, "buy": buy, "sol": q, "tok": base, "fee": max(fee, 0), "ts": ts, "vsol": vsol, "vtok": vtok}
+    return {"pool": pool, "user": user, "buy": buy, "sol": q, "tok": base, "fee": max(fee, 0), "ts": ts, "vsol": vsol, "vtok": vtok,
+            "fee_recipient": fee_recipient, "creator": creator}
 
 
 def parse_create_pool(b: bytes) -> dict[str, Any] | None:
@@ -565,6 +578,7 @@ class Collector:
         self.stats["ws"] = ws_url.split("?")[0]              # never store an API key that may sit in the query string
         self.stats["fallback"] = bool(self.fallback_url)
         self.paper = PaperFollow(self.c)
+        self.live = None                                      # live copies, simulated or sent (pumplive), set by collect()
         self.last_paper = self.last_snap = 0.0
         self.tip = 0                                          # the chain's newest slot (processed), from slotSubscribe
         self.lags: collections.deque[int] = collections.deque(maxlen=20_000)
@@ -659,6 +673,11 @@ class Collector:
                     if cur.rowcount:
                         self.mints[addr] = (cur.lastrowid, e["ts"])
                         self.stats["mints"] += 1
+                    if self.live is not None:
+                        try:
+                            self.live.on_create(addr, e["token_program"])
+                        except Exception:  # noqa: BLE001 - the live copies must never stop the feed
+                            log.exception("live copies failed on the creation of %s", addr)
             elif b[:8] == D_TRADE:
                 e = parse_trade(b)
                 if e is None:
@@ -677,6 +696,13 @@ class Collector:
             self.paper.on_trade(slot, mint, user, e)              # followed wallets are copied on any token
         except sqlite3.OperationalError as err:                  # its fills are written here: a full disk must not stop the feed
             self._db_error(err)
+        if self.live is not None:
+            try:
+                self.live.on_trade(slot, mint, user, e)
+            except sqlite3.OperationalError as err:
+                self._db_error(err)
+            except Exception:  # noqa: BLE001 - the live copies must never stop the feed
+                log.exception("live copies failed on a trade of %s", mint)
         m = self.mints.get(mint)
         if m is None:
             return                                                # born before we started watching: not stored
@@ -707,6 +733,13 @@ class Collector:
                 self.stats["trades"] += len(self.buf)
             self.buf.clear()
         self.paper.tick()
+        if self.live is not None:
+            try:
+                self.live.tick()
+            except sqlite3.OperationalError:
+                raise                                             # flush() handles a full disk
+            except Exception:  # noqa: BLE001 - the live copies must never stop the feed
+                log.exception("live copies failed")
         now = time.time()
         if now - self.last_paper >= 10:
             self.paper.reload()                                   # the report thread adds golden wallets
@@ -910,6 +943,17 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
     logging.getLogger(__name__).setLevel(logging.INFO)
     col = Collector(db_path, ws_url, retention_days, fallback_url)
     col.paper.sniper_cfg = {"top": sniper_top, "every_s": sniper_every_s, "window_h": SNIPER_WINDOW_H}
+    from .pumplive import LiveCfg, LiveFollow, live_lines, load_keypair   # here: that module builds on this one
+    try:
+        live = LiveCfg.from_env()
+        if live.mode != "off":
+            col.live = LiveFollow(col.c, live, keypair=load_keypair() if live.mode == "live" else None)
+            who = ", ".join(sorted(live.wallets)) or "the golden wallets"
+            print(f"live copies: {live.mode}{f' from {col.live.me}' if col.live.me else ''}, copying {who} with "
+                  f"{live.stake_sol:g} SOL" + (f", at most {live.max_open} open, new copies stop after {live.day_loss_sol:g} SOL "
+                  f"lost in a day" if live.mode == "live" else ", simulated, nothing sent"), flush=True)
+    except Exception as e:  # noqa: BLE001 - a bad setting must not stop the collector; the key never reaches the message
+        log.error("live copies off: %s", e)
     print(f"pump collector: {col.stats['ws']}{' (fallback feed set)' if fallback_url else ''}, keeping {retention_days:g} days, "
           f"db {db_path}, ranking wallets every {report_every_s / 60:.0f} min, top {sniper_top} snipers every "
           f"{sniper_every_s / 60:.0f} min. Ctrl+C to stop.", flush=True)
@@ -984,7 +1028,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                                      mat["params"]["stake_sol"], _rules_line(rules, detail=True))
                     for line in log_lines(spec) if spec else ():
                         log.info("%s", line)
-                    for line in paper_lines(db_path) + stake_sweep(db_path):   # the forward test, and the copy by size
+                    for line in paper_lines(db_path) + live_lines(db_path) + stake_sweep(db_path):   # forward test, live copies, sizes
                         log.info("%s", line)
                     checkpoint(db_path)                              # the long reads are over: let the log reset
             except Exception:  # noqa: BLE001

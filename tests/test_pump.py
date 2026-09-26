@@ -37,18 +37,19 @@ def s(x: str) -> bytes:
     return struct.pack("<I", len(x)) + x.encode()
 
 
-def trade_bytes(mint, user, buy, sol, tok, vsol, vtok, ts=1_790_000_000, quote=bytes(32), ix="buy", shareholders=0):
+def trade_bytes(mint, user, buy, sol, tok, vsol, vtok, ts=1_790_000_000, quote=bytes(32), ix="buy", shareholders=0,
+                fee_recipient=bytes(32), creator=bytes(32), mayhem=False):
     fee, cfee = int(sol * 0.0095), int(sol * 0.003)
     b = D_TRADE + mint + struct.pack("<QQ?", sol, tok, buy) + user + struct.pack("<qQQ", ts, vsol, vtok)
-    b += struct.pack("<QQ", 0, 0) + bytes(32) + struct.pack("<QQ", 95, fee) + bytes(32) + struct.pack("<QQ", 30, cfee)
+    b += struct.pack("<QQ", 0, 0) + fee_recipient + struct.pack("<QQ", 95, fee) + creator + struct.pack("<QQ", 30, cfee)
     b += struct.pack("<?QQQq", True, 0, 0, 0, 0) + s(ix)
-    b += struct.pack("<?QQQQ", False, 0, 0, 0, 0) + struct.pack("<I", shareholders) + bytes(34 * shareholders)
+    b += struct.pack("<?QQQQ", mayhem, 0, 0, 0, 0) + struct.pack("<I", shareholders) + bytes(34 * shareholders)
     return b + quote + struct.pack("<5Q", 0, 0, 0, 0, 0)
 
 
-def create_bytes(mint, user, ts=1_790_000_000, quote=bytes(32)):
+def create_bytes(mint, user, ts=1_790_000_000, quote=bytes(32), token_program=bytes(32)):
     b = D_CREATE + s("Cat") + s("CAT") + s("https://x") + mint + bytes(32) + user + bytes(32) + struct.pack("<q", ts)
-    return b + struct.pack("<4Q", 0, 0, 0, 0) + bytes(32) + struct.pack("<??", False, False) + quote + struct.pack("<QQ?", 0, 0, False)
+    return b + struct.pack("<4Q", 0, 0, 0, 0) + token_program + struct.pack("<??", False, False) + quote + struct.pack("<QQ?", 0, 0, False)
 
 
 def test_parse_exact_layout_or_nothing():
