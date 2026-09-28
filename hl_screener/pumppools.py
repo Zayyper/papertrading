@@ -101,9 +101,10 @@ class PoolFeed:
                 except asyncio.TimeoutError:
                     pass
         finally:
-            for c in self.conns:
-                if c.task is not None:
-                    c.task.cancel()
+            tasks = [c.task for c in self.conns if c.task is not None]
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)   # each closes its socket properly before we return
 
     def _open(self, websockets) -> _Conn:
         c = _Conn()
@@ -113,7 +114,8 @@ class PoolFeed:
     async def _conn(self, c: _Conn, websockets) -> None:
         why = "closed by the server"
         try:
-            async with websockets.connect(self.url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30) as ws:
+            async with websockets.connect(self.url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30,
+                                          close_timeout=5) as ws:     # 5 s for a closing handshake: a stop fits its 15 s grace
                 sender = asyncio.create_task(self._send(c, ws))
                 try:
                     async for raw in ws:

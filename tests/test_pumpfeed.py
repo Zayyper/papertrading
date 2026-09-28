@@ -1,6 +1,35 @@
+import asyncio
 import sqlite3
+import sys
+import time
+import types
 
 from hl_screener.pumpfun import FALLBACK_PER_DAY, WAL_LIMIT, Collector, checkpoint, connect, paper_lines, set_meta
+
+
+class Silent:
+    """A websocket that connects and never says a word; its close takes a moment, like a closing handshake."""
+    def __init__(self, events):
+        self.events = events
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await asyncio.sleep(0.05)
+        self.events.append("closed")
+
+    async def send(self, msg):
+        self.events.append("sent")
+
+    async def recv(self):
+        await asyncio.Event().wait()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.recv()
 
 
 def test_a_feed_that_keeps_dropping_waits_longer_and_borrows_the_fallback_twice_a_day(tmp_path):
@@ -33,6 +62,83 @@ def test_a_full_disk_drops_the_batch_but_never_stops_the_collector(tmp_path):
     col.flush()                                                       # 17 restarts in a row on 2026-09-25: never again
     assert col.buf == [] and col.stats["skipped_low_disk"] == 3
     real.close()
+
+
+def test_the_log_warns_hourly_before_the_disk_fills_and_errs_at_once_when_pruning_starts(tmp_path, monkeypatch, caplog):
+    from hl_screener import pumpfun
+    disk = {"disk_free_gb": 8.0, "disk_total_gb": 40.0}
+    monkeypatch.setattr(pumpfun, "host_resources", lambda path: dict(disk))
+    col = Collector(tmp_path / "pump.db")
+
+    def flush(free):
+        disk["disk_free_gb"], col.last_paper = free, 0.0             # the next flush reads the disk again
+        col.flush()
+        return [(r.levelname, r.getMessage()) for r in caplog.records if r.getMessage().startswith("disk ")]
+
+    assert flush(8.0) == []                                           # room enough: quiet
+    warned = [("WARNING", "disk 5.2 of 40 GB free: under 3 GB the collector keeps 36 h of trades, under 1 GB it stops storing them")]
+    assert flush(5.2) == warned
+    assert flush(5.1) == warned                                       # once an hour, not every 10 s
+    assert [level for level, _ in flush(2.9)] == ["WARNING", "ERROR"]   # the prune to 36 h begins: said at once, louder
+    assert len(flush(2.8)) == 2
+    col.disk_alarm = (col.disk_alarm[0] - 3600, col.disk_alarm[1])    # an hour later, still short
+    assert [level for level, _ in flush(2.7)] == ["WARNING", "ERROR", "ERROR"]
+    col.c.close()
+
+
+def test_a_cancelled_pool_feed_returns_only_once_its_sockets_are_closed(monkeypatch):
+    from hl_screener.pumppools import PoolFeed
+    events, opened = [], []
+
+    def connect(*args, **kwargs):
+        opened.append(kwargs)
+        return Silent(events)
+
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace(connect=connect))
+
+    async def main():
+        pf = PoolFeed("wss://public.example", lambda *a: None)
+        pf.add("POOL")
+        task = asyncio.create_task(pf.run(asyncio.Event()))
+        await asyncio.sleep(0.1)                                      # connected and subscribed
+        task.cancel()                                                 # what the collector does on its way out
+        await asyncio.gather(task, return_exceptions=True)
+        return list(events)                                           # before asyncio.run cancels whatever is left
+
+    assert asyncio.run(main()) == ["sent", "closed"]                  # a close frame, not a socket cut by the kill
+    assert opened[0]["close_timeout"] == 5                            # and a close that fits the 15 s grace period
+
+
+def test_a_stop_ends_the_collector_within_seconds_with_its_feed_closed_properly(tmp_path, monkeypatch):
+    events, gaps, opened = [], [], []
+    conns = iter([OSError("HTTP 429"), Silent(events)])              # refused once, then a feed that never speaks
+
+    def connect(*args, **kwargs):
+        opened.append(kwargs)
+        c = next(conns)
+        if isinstance(c, Exception):
+            raise c
+        return c
+
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace(connect=connect))
+    col = Collector(tmp_path / "pump.db")
+    col._dropped = lambda lived, on_fallback: 0.01                    # reconnect at once
+    col.check_gap = gaps.append
+
+    async def main():
+        stop = asyncio.Event()
+        task = asyncio.create_task(col.run(stop))
+        await asyncio.sleep(0.3)
+        stop.set()                                                    # what SIGTERM does
+        t0 = time.time()
+        await asyncio.wait_for(task, timeout=5)
+        return time.time() - t0
+
+    assert asyncio.run(main()) < 2                                    # not the 60 s a redeploy used to wait for its kill
+    assert events == ["sent", "sent", "closed"]                       # both subscriptions, then a proper close
+    assert [k["close_timeout"] for k in opened] == [5, 5]             # within the 15 s grace period even if the server stalls
+    assert gaps == ["restart", "reconnect"]                           # the copies are checked after each gap
+    col.c.close()
 
 
 def test_the_write_ahead_log_is_capped_and_folded(tmp_path):

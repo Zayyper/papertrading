@@ -4,7 +4,7 @@ gets in, whose coins it buys, and what copying it has really made next to what i
     python -m hl_screener pump dossier [<wallet> ...]    # default: every golden wallet and every wallet copied 5+ times
 
 The collector logs the same lines once on every start: the page is behind a password, the container log is not.
-Everything comes from the trade window the collector keeps (3 days), so a wallet's older history is not in it.
+Everything comes from the trade window the collector keeps (2 days), so a wallet's older history is not in it.
 """
 from __future__ import annotations
 

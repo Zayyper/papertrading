@@ -25,12 +25,18 @@ import hashlib
 import itertools
 import json
 import logging
+import os
+import queue
+import signal
 import sqlite3
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+
+from .pumptx import PUBLIC_RPC, Rpc, fresh_coin
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +61,13 @@ PAPER_STAKE_SOL = 0.25         # each live paper copy (0.1 until 2026-09-26): th
 LAMPORTS = 1e9
 MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
 LOW_DISK_GB = 3.0              # below this much, prune down to LOW_DISK_KEEP_S of history instead of the full retention
-LOW_DISK_KEEP_S = 2 * 86_400
+LOW_DISK_KEEP_S = 36 * 3600    # not less than 31 h: mature coins are settled ~30.5 h after creation (pumpmature.LOOK_AT_S)
+DISK_WARN_GB = 6.0             # below this much, the log warns once an hour, while there is still time to act
+GAP_PACE_S = 0.5               # between two reads after a feed gap (a sold copy costs a few more, paced too): the public RPC
+                               # allows 40 per 10 s per method and 100 per 10 s in all, shared with the live copies' calls
+                               # allows an IP in all, which a live send's blockhash and balance calls need too
+GAP_LOOK_BACK_S = 3 * 86_400   # copies opened longer ago are not checked: a wallet that never sells a dead coin would be read on every reconnect
+GAP_KEPT = 0.99                # a leader holding less than this share of the tokens we saw it buy sold while we were blind
 WAL_LIMIT = 64 * 2**20         # bytes the write-ahead log keeps after a checkpoint resets it
 STABLE_S = 300                 # a feed connection that lived this long was healthy; one that died sooner counts as a failure
 FALLBACK_S = 900               # one stretch on the fallback feed
@@ -231,6 +243,7 @@ CREATE TABLE IF NOT EXISTS ppos (wallet TEXT, mint TEXT, tok REAL, cost REAL, op
 CREATE TABLE IF NOT EXISTS opos (wallet TEXT, mint TEXT, cost REAL, proceeds REAL, tok REAL, PRIMARY KEY (wallet, mint));
 CREATE TABLE IF NOT EXISTS psnap (ts INTEGER, wallet TEXT, copy_pnl REAL, copy_cost REAL, own_pnl REAL, own_cost REAL);
 CREATE INDEX IF NOT EXISTS ix_psnap ON psnap(wallet, ts);
+CREATE INDEX IF NOT EXISTS ix_pfills ON pfills(wallet, mint);   -- the dry run and the go-live rule join each copy to its paper fill
 -- one small permanent row per launch: trades are pruned after a few days, this is what keeps a maker's history.
 -- It stores the curve state each exit rule reached, not a profit, so the cost assumptions stay changeable.
 CREATE TABLE IF NOT EXISTS launches (
@@ -412,6 +425,20 @@ class PaperFollow:
         for mint, acts in list(self.pending.items()):
             self._run_due(mint, acts, [now - a["t"] > (a["land"] - a["trigger"]) * 0.4 + 2 for a in acts], timed_out=True)
 
+    def sell_now(self, wallet: str, mint: str) -> bool:
+        """Sell a copy whose wallet sold unseen (while the feed was down): at the coin's next trade, or at its last known
+        state if it stays quiet. No slippage is measured: there is no leader price to measure it against. False when
+        there is nothing left to sell."""
+        st = self.curve.get(mint)
+        if not st or st[0] <= 0 or st[1] <= 0:
+            return False                                        # no price to sell at: _execute would drop the action
+        if (wallet, mint) not in self.pos or any(a["wallet"] == wallet and a["side"] == "sell" for a in self.pending.get(mint, ())):
+            return False
+        slot = max(self.tip, 1)
+        self.pending.setdefault(mint, []).append({"wallet": wallet, "side": "sell", "trigger": slot, "land": slot + 1,
+                                                  "rate": self.sell_rate.get(mint, FEE), "leader_px": 0.0, "t": time.time()})
+        return True
+
     def _execute(self, a: dict[str, Any], mint: str, timed_out: bool = False) -> None:
         st, key = self.curve.get(mint), (a["wallet"], mint)
         if not st or st[0] <= 0 or st[1] <= 0:
@@ -562,7 +589,8 @@ def _no_key(text: str) -> str:
 
 
 class Collector:
-    def __init__(self, db_path: str | Path, ws_url: str = PUBLIC_WS, retention_days: float = 3.0, fallback_url: str | None = None):
+    def __init__(self, db_path: str | Path, ws_url: str = PUBLIC_WS, retention_days: float = 2.0, fallback_url: str | None = None,
+                 rpc_url: str = PUBLIC_RPC):
         self.db_path = Path(db_path)
         self.c = connect(self.db_path)
         self.ws_url, self.fallback_url = ws_url, fallback_url or None
@@ -573,7 +601,8 @@ class Collector:
         self.pools: dict[str, str] = {p: a for a, p in self.c.execute("SELECT addr, pool FROM mints WHERE pool IS NOT NULL AND ts >= ?", (cutoff,))}
         self.buf: list[tuple] = []
         self.stats: dict[str, Any] = {"since": int(time.time()), "trades": 0, "amm_trades": 0, "mints": 0, "graduated": 0, "non_sol": 0,
-                                      "parse_errors": 0, "reconnects": 0, "gap_s": 0.0, **(get_meta(self.c, "stats") or {})}
+                                      "parse_errors": 0, "reconnects": 0, "gap_s": 0.0, "gap_checks": 0, "gap_sold": 0,
+                                      **(get_meta(self.c, "stats") or {})}
         self.stats["started"] = int(time.time())
         self.stats["ws"] = ws_url.split("?")[0]              # never store an API key that may sit in the query string
         self.stats["fallback"] = bool(self.fallback_url)
@@ -587,6 +616,12 @@ class Collector:
         self.fails, self.backoff, self.fallback_until = 0, 1.0, 0.0     # the feed's recent failures (see _dropped)
         self.fallback_day, self.fallback_used = "", 0
         self.last_db_error = 0.0
+        self.disk_alarm = (0.0, logging.NOTSET)                 # when the log last warned about the disk, and how loudly
+        self.halt = threading.Event()                           # set on the way out: the background work stops
+        self.rpc = Rpc(rpc_url)                                 # reads only: what a copied wallet holds after a feed gap
+        self.gap_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gapcheck")
+        self.gap_job = None                                     # the newest gap check, running or waiting
+        self.gap_out: queue.SimpleQueue = queue.SimpleQueue()   # (kind, wallet, mint, coin now) whose wallet sold, to the feed's thread
         from .pumppools import PoolFeed                         # our pools only, one subscription each (see pumppools)
         self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=self._pinned_pools)
         for pool, last in self.c.execute("""SELECT m.pool, (SELECT t.ts FROM trades t WHERE t.mint = m.id ORDER BY t.slot DESC LIMIT 1)
@@ -732,6 +767,8 @@ class Collector:
                 self.c.executemany("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)", self.buf)
                 self.stats["trades"] += len(self.buf)
             self.buf.clear()
+        while not self.halt.is_set() and not self.gap_out.empty():   # what a gap check found, acted on here, where the state lives;
+            self._gap_close(*self.gap_out.get_nowait())                 # not on the way out: a sell sent then would never be settled
         self.paper.tick()
         if self.live is not None:
             try:
@@ -754,10 +791,97 @@ class Collector:
                 s = sorted(self.lags)
                 self.stats.update({f"lag_p{p}": s[min(len(s) - 1, len(s) * p // 100)] for p in (50, 90, 99)})
             self.stats.update(host_resources(self.db_path.parent), **self.pool_feed.stats)
+            self._warn_disk()
             self.last_paper = now
         self.stats["heartbeat"] = int(now)
         set_meta(self.c, "stats", self.stats)
         self.c.commit()
+
+    def _warn_disk(self) -> None:
+        """Say it in the log before the disk fills: a warning an hour under DISK_WARN_GB, an error an hour under
+        LOW_DISK_GB, the first error at once."""
+        free = self.stats.get("disk_free_gb")
+        if free is None or free >= DISK_WARN_GB:
+            return
+        level = logging.ERROR if free < LOW_DISK_GB else logging.WARNING
+        if time.time() - self.disk_alarm[0] < 3600 and level <= self.disk_alarm[1]:
+            return
+        self.disk_alarm = (time.time(), level)
+        log.log(level, "disk %g of %g GB free: under %g GB the collector keeps %g h of trades, under %g GB it stops storing them",
+                free, self.stats.get("disk_total_gb") or 0, LOW_DISK_GB, LOW_DISK_KEEP_S / 3600, MIN_FREE_GB)
+
+    def check_gap(self, why: str) -> None:
+        """A copy exits on its wallet's first sell, and a sell made while the feed was down (a reconnect, a restart) is
+        never seen: that copy would stay open. So after each gap one job reads what every copied wallet holds now, off
+        the feed's thread, and _flush closes the copies whose wallet sold. Copies older than GAP_LOOK_BACK_S are left alone."""
+        since = time.time() - GAP_LOOK_BACK_S
+        live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None else ())
+                if not p.get("stuck") and p["opened"] >= since]
+        paper = [("paper", w, m) for (w, m), (_, _, opened) in self.paper.pos.items() if opened >= since]
+        todo = [(kind, w, m, self.paper.own[(w, m)][2] if (w, m) in self.paper.own else 0.0)   # what we saw it buy
+                for kind, w, m in live + paper]
+        if not todo:
+            return
+        if self.gap_job is not None:
+            self.gap_job.cancel()                                 # one still waiting is replaced by this newer list
+        self.gap_job = self.gap_pool.submit(self._gap_job, todo, why)
+        self.stats["gap_checks"] += 1
+        log.info("gap check after the %s: reading what the wallets of %d open copies hold", why, len(todo))
+
+    def _gap_job(self, todo: list[tuple[str, str, str, float]], why: str) -> None:
+        """On the worker thread: each wallet's balance of the coin, one read every GAP_PACE_S, real money first, and for
+        a paper copy whose wallet sold, the coin as the chain has it now, to price the exit (a few more reads, rare; a
+        live sell reads it itself). It touches the RPC and the queue only. A wallet that cannot be read keeps its copy."""
+        failed = []
+        for kind, wallet, mint, bought in todo:
+            if self.halt.wait(GAP_PACE_S):
+                return                                            # the collector is stopping
+            try:
+                accounts = self.rpc.call("getTokenAccountsByOwner", [wallet, {"mint": mint},
+                                                                     {"encoding": "jsonParsed", "commitment": "confirmed"}])["value"]
+                held = sum(int(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) for a in accounts)
+            except Exception as e:  # noqa: BLE001 - one unreadable wallet must not end the check
+                failed.append(f"{type(e).__name__}: {e}")
+                continue
+            if held == 0 or held < GAP_KEPT * bought:
+                if kind == "paper" and self.halt.wait(GAP_PACE_S):
+                    return
+                self.gap_out.put((kind, wallet, mint, self._coin_now(mint) if kind == "paper" else None))
+        if failed:
+            log.warning("gap check after the %s: %d of %d wallets could not be read (%s): their copies stay open",
+                        why, len(failed), len(todo), _no_key(failed[0])[:200])
+
+    def _coin_now(self, mint: str) -> dict[str, Any] | None:
+        """On the worker thread: the coin's curve or pool as the chain has it now, or None when it cannot be read."""
+        try:
+            return fresh_coin(self.rpc, mint, self.rpc.account(mint)[0])      # the mint's owner is its token program
+        except Exception as e:  # noqa: BLE001 - the copy still sells, at the last state the feed saw
+            log.info("gap check: could not read %s from the chain (%s): its copy sells at the last state seen",
+                     mint, _no_key(f"{type(e).__name__}: {e}")[:200])
+            return None
+
+    def _gap_close(self, kind: str, wallet: str, mint: str, coin: dict[str, Any] | None) -> None:
+        if kind == "paper":
+            if coin is not None:                                  # priced at the curve now, not at the one before the gap
+                self.paper.curve[mint] = (coin["vsol"], coin["vtok"], time.time())
+            if not self.paper.sell_now(wallet, mint):
+                if (wallet, mint) in self.paper.pos and not self.paper.curve.get(mint):
+                    log.info("gap check: %s sold %s, but the coin has no known price yet: the copy waits for its next trade", wallet, mint)
+                return                                            # closed meanwhile, its sell on its way, or nothing to price it at
+        else:
+            p = self.live.pos.get(mint) if self.live is not None else None
+            if p is None or p["wallet"] != wallet or p.get("stuck") or self.live._busy(mint):
+                return                                            # closed meanwhile, left to its owner, or its sell is out
+            self.live.coins.pop(mint, None)                       # so the sell reads the coin from the chain, not from before the gap
+            try:
+                self.live._sell(mint, None, "its wallet sold while the feed was down")
+            except sqlite3.OperationalError:
+                raise                                             # flush() handles a full disk
+            except Exception:  # noqa: BLE001 - the live copies must never stop the feed
+                log.exception("live copies failed to sell %s", mint)
+                return
+        log.warning("gap check: %s sold %s while the feed was down: closing the %s copy", wallet, mint, kind)
+        self.stats["gap_sold"] += 1
 
     def forget_old_mints(self) -> None:
         cutoff = time.time() - self.retention_s
@@ -789,16 +913,23 @@ class Collector:
     async def run(self, stop: asyncio.Event | None = None) -> None:
         import websockets  # here so `pump report` works without the package
         stop = stop or asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):   # PID 1 in the container ignored a redeploy's SIGTERM until the kill, and the
+            try:                                       # RPC went on counting the sockets never closed: it refused the next container
+                asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+            except (NotImplementedError, RuntimeError):   # Windows, or not the main thread: Ctrl+C still ends it
+                pass
         last_flush, last_line, last_forget = time.time(), time.time(), time.time()
         gap_from = None
         seen = (self.stats["trades"], self.stats["mints"])
         pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
+        self.check_gap("restart")                               # the copies loaded from the database: were they sold meanwhile?
         while not stop.is_set():
             on_fallback = bool(self.fallback_url) and time.time() < self.fallback_until
             url = self.fallback_url if on_fallback else self.ws_url
             opened = time.time()
             try:
-                async with websockets.connect(url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30) as ws:
+                async with websockets.connect(url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30,
+                                              close_timeout=5) as ws:     # 5 s for a closing handshake: a stop fits its 15 s grace
                     await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",   # not all of PumpSwap:
                                               "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "confirmed"}]}))
                     await ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "slotSubscribe"}))   # our pools, in pumppools
@@ -808,8 +939,17 @@ class Collector:
                     if gap_from is not None:
                         self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + time.time() - gap_from, 1)
                         gap_from = None
+                        self.check_gap("reconnect")
+                    heard = time.time()
                     while not stop.is_set():
-                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))   # 30 s of silence = a stalled feed
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1)   # a second at most: a stop is seen at once
+                        except asyncio.TimeoutError:
+                            if time.time() - heard >= 30:
+                                raise                                          # 30 s of silence = a stalled feed
+                            continue
+                        heard = time.time()
+                        msg = json.loads(raw)
                         method = msg.get("method")
                         if method == "slotNotification":
                             self.tip = max(self.tip, msg["params"]["result"]["slot"])
@@ -847,9 +987,15 @@ class Collector:
                 lived = time.time() - opened
                 wait = self._dropped(lived, on_fallback)
                 log.warning("feed error after %.0fs connected (%s); reconnecting in %.0fs", lived, self.stats["last_error"], wait)
-                await asyncio.sleep(wait)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=wait)   # a stop cuts the wait short
+                except asyncio.TimeoutError:
+                    pass
+        self.halt.set()                                          # the gap worker stops reading: its findings wait for the next start
         pools.cancel()
+        await asyncio.gather(pools, return_exceptions=True)      # its sockets close properly too (PoolFeed.run)
         self.flush()
+        log.info("stopped: the feeds are closed and what they brought is written")
 
 
 def prune(db_path: str | Path, retention_s: float) -> int:
@@ -941,9 +1087,10 @@ def _best(rules: list[dict[str, Any]] | None) -> str:
 def collect(db_path: str | Path, ws_url: str, retention_days: float, report_every_s: float = 1800,
             fallback_url: str | None = None, sniper_every_s: float = SNIPER_EVERY_S, sniper_top: int = SNIPER_TOP) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
-    col = Collector(db_path, ws_url, retention_days, fallback_url)
+    col = Collector(db_path, ws_url, retention_days, fallback_url, rpc_url=os.environ.get("PUMP_LIVE_RPC") or PUBLIC_RPC)
     col.paper.sniper_cfg = {"top": sniper_top, "every_s": sniper_every_s, "window_h": SNIPER_WINDOW_H}
-    from .pumplive import LiveCfg, LiveFollow, live_lines, load_keypair   # here: that module builds on this one
+    from .pumplive import LiveCfg, LiveFollow, live_lines, load_keypair   # here: those modules build on this one
+    from .pumpgo import go_lines
     try:
         live = LiveCfg.from_env()
         if live.mode != "off":
@@ -957,7 +1104,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
     print(f"pump collector: {col.stats['ws']}{' (fallback feed set)' if fallback_url else ''}, keeping {retention_days:g} days, "
           f"db {db_path}, ranking wallets every {report_every_s / 60:.0f} min, top {sniper_top} snipers every "
           f"{sniper_every_s / 60:.0f} min. Ctrl+C to stop.", flush=True)
-    halt = threading.Event()
+    halt = col.halt                                            # set on the way out: this thread and a gap check still reading stop
 
     def maintenance() -> None:                                 # own thread and connection: never stalls the feed
         from .pumpmature import mature_report, settle_matures   # here: those modules build on this one
@@ -1028,7 +1175,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                                      mat["params"]["stake_sol"], _rules_line(rules, detail=True))
                     for line in log_lines(spec) if spec else ():
                         log.info("%s", line)
-                    for line in paper_lines(db_path) + live_lines(db_path) + stake_sweep(db_path):   # forward test, live copies, sizes
+                    for line in paper_lines(db_path) + live_lines(db_path) + go_lines(db_path) + stake_sweep(db_path):   # forward test, live copies, the go-live rule, sizes
                         log.info("%s", line)
                     checkpoint(db_path)                              # the long reads are over: let the log reset
             except Exception:  # noqa: BLE001
@@ -1036,8 +1183,8 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
 
     threading.Thread(target=maintenance, daemon=True).start()
     try:
-        asyncio.run(col.run())
-    except KeyboardInterrupt:
+        asyncio.run(col.run())                                 # returns on SIGTERM (a redeploy) with its sockets closed: exit 0
+    except KeyboardInterrupt:                                  # Ctrl+C on Windows, where the loop takes no signal handlers
         col.flush()
     finally:
         halt.set()
@@ -1290,7 +1437,7 @@ def row_states(r: dict[str, Any]) -> dict[str, Any]:
 def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake_sol: float = 0.1, hold_s: float = 900,
                     limit: int = 20_000) -> int:
     """Freeze every launch whose window has closed into `launches`, before its trades are pruned. This is what
-    turns three days of trades into a maker history that keeps growing."""
+    turns two days of trades into a maker history that keeps growing."""
     c = connect(db_path)
     try:
         measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")

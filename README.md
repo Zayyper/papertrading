@@ -138,7 +138,8 @@ bought came from elsewhere and earn it nothing in these numbers.
   from its first buy. A token that graduates keeps being tracked on its PumpSwap pool: pool trades
   are stored like curve trades, with the pool's effective reserves after the trade (the events
   carry the reserves before it, checked on 13,379 consecutive live trades), so prices, profits and
-  copies run straight through graduation. Kept `PUMP_RETENTION_DAYS` (3).
+  copies run straight through graduation. Kept `PUMP_RETENTION_DAYS` (2, 3 until 2026-09-29), so the
+  wallet ranking now sees two days of trades.
 - **Feed delay** is measured on every trade against the chain's own slot clock (`slotSubscribe`):
   on the public endpoint, 1 slot (0.4 s) at the median, 90th and 99th percentile. The report's
   copier lands one slot after the measured median (at least 2 slots after the wallet); the paper
@@ -175,6 +176,12 @@ bought came from elsewhere and earn it nothing in these numbers.
   `PUMP_LIVE_DAY_LOSS_SOL` (0.5) is lost, and gives each sell three tries, the last at any price; a coin
   that still will not sell is left in the log for its owner. The transactions are pinned to real mainnet
   ones in `tests/test_pumptx.py` and simulated on mainnet by `checks/pumplive_simulate.py`.
+- **Going live: the rule (`hl_screener/pumpgo.py`), fixed on 2026-09-28 before the results were seen.** A golden
+  wallet is copied live only when all four hold, on its 0.25 SOL paper copies alone (the 0.1 SOL ones do not count):
+  at least 100 closed copies; at least +3% profit per closed copy after fees; at least 80% of its dry-run buys, out
+  of 20 or more, would have gone through; and the dry run's median tokens are at most 5% below the paper copy's of
+  the same buy (more is fine). The 30-minute report prints the verdict as `go-live ...` lines: the rule, each wallet
+  with what passes and what it still needs, and which wallets qualify.
 - **The top `SNIPER_TOP` (5) snipers are followed as well**, re-ranked every 5 minutes because that list
   turns over fast: the wallets that bought the most tokens within two slots of creation over the last
   2 hours, launchers excluded. A sniper is copied only while it is in that set (a copy already open
@@ -212,6 +219,19 @@ bought came from elsewhere and earn it nothing in these numbers.
 - The page's **Pump** tab shows the collector status, base rates, the followed golden wallets, copy
   candidates and snipers. The **Paper** tab charts each Hyperliquid copy account against the
   leader's own account the same way.
+- **On the server** (the `pump` service). Two days of trades are about 2.4 GB of the 40 GB disk. The log
+  warns once an hour under 6 GB free, and logs an error once an hour under 3 GB, where the prune keeps only
+  36 h (never less: mature coins are looked at 30.5 h after launch); under 1 GB trades stop being stored and
+  the feed goes on. A redeploy's SIGTERM closes every feed socket properly within seconds
+  (`stop_grace_period: 15s`): until 2026-09-29 the container ignored it and was killed a minute later, and
+  the public RPC kept counting its dead sockets and refused the new container (HTTP 413/429) for about two
+  minutes. After every gap, a restart or a reconnect, a check asks the chain (`PUMP_LIVE_RPC`, else the public
+  endpoint) what each wallet with an open copy, paper or live, still holds of that coin, one read every 0.5 s
+  to leave room in the RPC's 100 calls per 10 s: a wallet holding nothing, or under 99% of what it was seen
+  buying, sold while we were not listening, and its copy is sold now, priced on the coin as the chain has it
+  (`gap check: ...` in the log, `gap_checks` and `gap_sold` in the stats). A wallet the RPC will not read
+  keeps its copy, and copies older than three days are left alone: a wallet that never sells a dead coin
+  would otherwise be read again on every reconnect.
 
 ## Running on a server (Coolify)
 

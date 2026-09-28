@@ -10,9 +10,9 @@ from solders.hash import Hash  # noqa: E402
 from solders.keypair import Keypair  # noqa: E402
 from test_pump import Curve, b58decode, create_bytes, logs, trade_bytes  # noqa: E402
 
-from hl_screener.pumpfun import TX_COST_SOL, Collector, b58  # noqa: E402
+from hl_screener.pumpfun import FEE, GAP_LOOK_BACK_S, TX_COST_SOL, Collector, b58  # noqa: E402
 from hl_screener.pumplive import SELL_TRIES, LiveCfg, LiveFollow, live_lines, load_keypair  # noqa: E402
-from hl_screener.pumptx import AMM_GLOBAL_CONFIG, PUMP_GLOBAL, PUMP_PROGRAM, TOKEN_2022_PROGRAM  # noqa: E402
+from hl_screener.pumptx import AMM_GLOBAL_CONFIG, PUMP_GLOBAL, PUMP_PROGRAM, TOKEN_2022_PROGRAM, sol_for  # noqa: E402
 
 G, X, MINT, MINT2 = bytes([80]) * 32, bytes([81]) * 32, bytes([9]) * 32, bytes([10]) * 32
 CREATOR, FEE_TO = bytes([7]) * 32, bytes([6]) * 32
@@ -160,7 +160,7 @@ def test_a_wallet_that_sells_before_our_buy_lands_is_followed_out_and_a_quiet_fi
     col.c.close()
 
 
-def test_live_copies_stop_at_the_limits_and_a_sell_that_keeps_failing_is_left_to_the_owner(tmp_path):
+def test_live_copies_stop_at_the_limits_and_a_sell_that_keeps_failing_is_left_to_the_owner(tmp_path, monkeypatch):
     kp = Keypair()
     me = bytes(kp.pubkey())
     col, chain = setup(tmp_path, "live", wallets=frozenset({b58(G)}), keypair=kp, max_open=1)
@@ -171,6 +171,7 @@ def test_live_copies_stop_at_the_limits_and_a_sell_that_keeps_failing_is_left_to
     trade(col, 13, MINT2, G, True, Curve())             # one copy open already
     assert col.c.execute("SELECT status, err FROM lorders WHERE mint = ?", (b58(MINT2),)).fetchone() == ("skipped", "1 copies open already")
     chain.fail_send = True
+    monkeypatch.setattr("hl_screener.pumplive.RETRY_WAIT_S", 0)   # the tries are two seconds apart in life
     trade(col, 20, MINT, G, False, cv, tok=10**12)
     for _ in range(SELL_TRIES + 1):
         col.flush()
@@ -196,6 +197,101 @@ def test_a_day_of_losses_or_a_thin_wallet_stops_new_copies(tmp_path):
     trade(col, 13, MINT2, G, True, Curve())             # ... and leaves 0.25 for the next, short of stake and reserve
     assert len(chain.sent) == 1
     assert col.c.execute("SELECT err FROM lorders WHERE mint = ? AND status = 'skipped'", (b58(MINT2),)).fetchone() == ("balance 0.250 SOL",)
+    col.c.close()
+
+
+class Holdings:
+    """getTokenAccountsByOwner, faked: what each wallet holds of each coin, over two token accounts; a pair it does
+    not know is answered like a rate-limited RPC. Accounts are Chain's: every coin's curve now at 40 SOL / 1e15."""
+    account = Chain.account
+
+    def __init__(self, held):
+        self.held, self.asked = held, []
+
+    def call(self, method, params, url=None):
+        assert method == "getTokenAccountsByOwner" and params[2] == {"encoding": "jsonParsed", "commitment": "confirmed"}
+        key = (params[0], params[1]["mint"])
+        self.asked.append(key)
+        if key not in self.held:
+            raise RuntimeError("getTokenAccountsByOwner: HTTP 429")
+        n = self.held[key]
+        return {"context": {"slot": 1}, "value": [{"pubkey": "A", "account": {"data": {"parsed": {"info": {"tokenAmount": {"amount": str(a)}}}}}}
+                                                  for a in (n // 2, n - n // 2) if a]}
+
+
+def copied(tmp_path, monkeypatch):
+    """The wallet's buy of MINT, copied on paper and live, both open; gap checks run at once, without pauses."""
+    from hl_screener import pumpfun
+    monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0)
+    kp = Keypair()
+    me = bytes(kp.pubkey())
+    col, chain = setup(tmp_path, "live", wallets=frozenset({b58(G)}), keypair=kp)
+    col.gap_pool = Now()
+    cv = Curve()
+    bought = trade(col, 11, MINT, G, True, cv)
+    trade(col, 12, MINT, me, True, cv, sol=246_913_580)    # our live buy lands
+    trade(col, 14, MINT, X, True, cv)                      # and so does the paper copy
+    col.flush()
+    assert (b58(G), b58(MINT)) in col.paper.pos and b58(MINT) in col.live.pos and len(chain.sent) == 1
+    return col, chain, bought
+
+
+@pytest.mark.parametrize("left", [0.0, 0.98])
+def test_a_wallet_that_sold_while_the_feed_was_down_is_followed_out_on_paper_and_live(tmp_path, monkeypatch, left):
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    paper_tok, live_tok = col.paper.pos[(b58(G), b58(MINT))][0], col.live.pos[b58(MINT)]["tok"]
+    col.rpc = Holdings({(b58(G), b58(MINT)): int(bought * left)})   # all of it, or 2 %: either way it sold unseen
+    col.check_gap("reconnect")
+    col.flush()
+    assert col.rpc.asked == [(b58(G), b58(MINT))] * 2               # live first, then paper
+    assert len(chain.sent) == 2                                     # the live copy's sell is out
+    assert col.c.execute("SELECT side, status, trigger_slot FROM lorders ORDER BY id DESC LIMIT 1").fetchone() == ("sell", "sent", None)
+    col.check_gap("reconnect")                                      # another gap before either sell is done: nothing twice
+    col.flush()
+    assert len(chain.sent) == 2 and col.stats["gap_sold"] == 2
+    for a in col.paper.pending[b58(MINT)]:
+        a["t"] -= 10                                                # a quiet coin: the paper copy sells at its last state
+    col.flush()
+    assert col.c.execute("SELECT side, leader_px, slip_bps, timed_out FROM pfills ORDER BY id DESC LIMIT 1").fetchone() == ("sell", 0.0, None, 1)
+    assert (b58(G), b58(MINT)) not in col.paper.pos
+    assert (col.stats["gap_checks"], col.stats["gap_sold"]) == (2, 2)
+    vsol, vtok = 40 * 10**9, 10**15                                 # the coin as the chain has it now, not as it was before the gap
+    ((paper_sol,),) = col.c.execute("SELECT sol FROM pfills WHERE side = 'sell'").fetchall()
+    assert abs(paper_sol - (vsol - vsol * vtok / (vtok + paper_tok)) * (1 - FEE) / 1e9) < 1e-12
+    ((live_want,),) = col.c.execute("SELECT want FROM lorders WHERE side = 'sell'").fetchall()
+    assert live_want == sol_for({"vsol": vsol, "vtok": vtok, "fee": FEE}, live_tok)
+    col.c.close()
+
+
+def test_a_paper_copy_of_a_coin_without_a_price_is_not_sold_by_a_gap_check(tmp_path, monkeypatch, caplog):
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    col.paper.curve.pop(b58(MINT))                                  # no trade stored, and the chain read fails too
+    col.rpc = Holdings({(b58(G), b58(MINT)): 0})
+    col.rpc.account = lambda addr: None
+    caplog.set_level("INFO", logger="hl_screener.pumpfun")
+    col.check_gap("restart")
+    col.flush()
+    assert (b58(G), b58(MINT)) in col.paper.pos and not col.paper.pending and col.stats["gap_sold"] == 1   # the live copy alone
+    assert "the copy waits for its next trade" in caplog.text
+    col.c.close()
+
+
+def test_a_wallet_still_holding_after_a_gap_keeps_its_copies_and_so_does_one_the_rpc_will_not_read(tmp_path, monkeypatch, caplog):
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    col.rpc = Holdings({(b58(G), b58(MINT)): bought})               # every token it bought, still there
+    col.check_gap("restart")
+    col.rpc = Holdings({})                                          # the RPC turns us away
+    col.check_gap("reconnect")
+    col.flush()
+    assert len(chain.sent) == 1 and not col.paper.pending
+    assert (b58(G), b58(MINT)) in col.paper.pos and b58(MINT) in col.live.pos
+    assert (col.stats["gap_checks"], col.stats["gap_sold"]) == (2, 0)
+    assert "2 of 2 wallets could not be read (RuntimeError: getTokenAccountsByOwner: HTTP 429): their copies stay open" in caplog.text
+    col.paper.pos[(b58(G), b58(MINT))][2] -= GAP_LOOK_BACK_S        # both copies opened over three days ago: left alone,
+    col.live.pos[b58(MINT)]["opened"] -= GAP_LOOK_BACK_S            # not read again on every reconnect
+    col.rpc = Holdings({})
+    col.check_gap("reconnect")
+    assert col.rpc.asked == [] and col.stats["gap_checks"] == 2
     col.c.close()
 
 

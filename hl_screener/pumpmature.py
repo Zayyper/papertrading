@@ -13,7 +13,7 @@ something, and holds it for minutes to hours:
 Each entry is sold nine ways: on the clock after 1, 2, 5 or 30 min, 2 h or 6 h, or at a take-profit / stop-loss pair
 (+20 / -10 %, +50 / -25 %, +100 / -50 %, else out at 6 h). Market cap is the price times a billion tokens.
 
-A coin is looked at once, 30 h after it was created (trades are kept 72 h): what it did in its first 24 h can be an
+A coin is looked at once, 30 h after it was created (trades are kept 48 h): what it did in its first 24 h can be an
 entry, and every exit falls inside the 6 h after that, so no result is cut short. Stored as prices (reserves), not
 profits, like `launches`, so the costs stay changeable.
 """

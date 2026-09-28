@@ -43,6 +43,7 @@ FILL_WAIT_S = 15         # a sent transaction the feed has not shown by then is 
 LOOK_EVERY_S = 5         # and again this often (getTransaction: 10 calls per 10 s on the public RPC)
 EXPIRE_S = 90            # a blockhash lasts 60-90 s: a transaction still unknown after this never landed
 SELL_TRIES = 3           # the last try takes whatever the coin pays and leaves the token account open
+RETRY_WAIT_S = 2.0       # between a failed sell and its next try: three tries within a second would meet the same rate limit
 MAX_HOLD_S = 12 * 3600   # a copy whose wallet never sells (it moved its tokens?) is sold after this long
 RESERVE_SOL = 0.02       # left in the wallet for fees and new token accounts' rent
 LISTS_TTL_S = 3600       # fee and buyback recipient lists, re-read this often
@@ -124,6 +125,7 @@ class LiveFollow:
         self.token_programs: dict[str, str] = {}       # mint -> its token program, from its creation event
         self.lists: dict[bool, tuple[float, dict[str, list[str]]]] = {}
         self.balance: float | None = None
+        self.retries: list[tuple[float, str, int]] = []   # (not before, mint, try) of the sells to send again
         self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0}
 
     # --- from the feed -------------------------------------------------------
@@ -275,9 +277,14 @@ class LiveFollow:
             try:
                 res = fut.result()
             except Exception as e:  # noqa: BLE001 - an RPC or build failure is this order's result, not the feed's
-                res = {"status": "sim_err" if self.cfg.mode == "dry" else "failed", "err": f"{type(e).__name__}: {e}"[:300]}
+                from .pumpfun import _no_key                  # a requests error names the URL, and PUMP_LIVE_RPC may carry a key
+                res = {"status": "sim_err" if self.cfg.mode == "dry" else "failed", "err": _no_key(f"{type(e).__name__}: {e}")[:300]}
             self._settled(o, res)
         now = time.time()
+        due, self.retries = [r for r in self.retries if r[0] <= now], [r for r in self.retries if r[0] > now]
+        for _, mint, tries in due:
+            if mint in self.pos:
+                self._sell(mint, None, "retry", tries)
         if not self.cfg.wallets and now - self.at["targets"] >= 60:
             self.targets = {w for (w,) in self.c.execute("SELECT wallet FROM follow WHERE golden_ever = 1")}
             self.at["targets"] = now
@@ -330,7 +337,7 @@ class LiveFollow:
         if o["side"] != "sell" or o["mint"] not in self.pos:
             return
         if o["tries"] < SELL_TRIES:
-            self._sell(o["mint"], None, "retry", o["tries"] + 1)
+            self.retries.append((time.time() + RETRY_WAIT_S, o["mint"], o["tries"] + 1))
         else:
             self.pos[o["mint"]]["stuck"] = 1
             self.c.execute("UPDATE lpos SET stuck = 1 WHERE mint = ?", (o["mint"],))
@@ -375,7 +382,8 @@ class LiveFollow:
             tx = self.rpc.call("getTransaction", [o["sig"], {"encoding": "json", "maxSupportedTransactionVersion": 1,
                                                              "commitment": "confirmed"}])
         except Exception as e:  # noqa: BLE001
-            log.info("live: looking up %s failed (%s): again in %d s", o["sig"], str(e)[:120], LOOK_EVERY_S)
+            from .pumpfun import _no_key
+            log.info("live: looking up %s failed (%s): again in %d s", o["sig"], _no_key(str(e))[:120], LOOK_EVERY_S)
             return {}
         if tx is None:
             return {"status": "expired"} if time.time() - (o["done"] or 0) >= EXPIRE_S else {}

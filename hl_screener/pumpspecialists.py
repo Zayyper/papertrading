@@ -7,7 +7,7 @@ A position is one wallet's trades in one coin, counted when its first buy there 
 the last price; tokens it sold beyond what it bought came from elsewhere and earn it nothing. The copy is replayed:
 `stake` SOL bought `latency` slots after its first buy and sold `latency` slots after its first sell (or held to the
 last price), each at the fee a trade in that coin was paying then. Coins its own wallet launched are left out.
-Read from the trades still stored: coins born in the last three days, so older coins' specialists are out of sight.
+Read from the trades still stored: coins born in the last two days, so older coins' specialists are out of sight.
 
 Wallets that made money that way in both halves of the window, themselves and copied, are paper-followed from then on
 (`follow_specialists`): the ranking picks them on the past, the paper follower tests them on what comes next.
