@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from .pumppools import WORKED_S
 from .pumptx import PUBLIC_RPC, Rpc, fresh_coin
 
 log = logging.getLogger(__name__)
@@ -65,11 +66,11 @@ LOW_DISK_KEEP_S = 36 * 3600    # not less than 31 h: mature coins are settled ~3
 DISK_WARN_GB = 6.0             # below this much, the log warns once an hour, while there is still time to act
 GAP_PACE_S = 0.5               # between two reads after a feed gap (a sold copy costs a few more, paced too): the public RPC
                                # allows 40 per 10 s per method and 100 per 10 s in all, shared with the live copies' calls
-                               # allows an IP in all, which a live send's blockhash and balance calls need too
 GAP_LOOK_BACK_S = 3 * 86_400   # copies opened longer ago are not checked: a wallet that never sells a dead coin would be read on every reconnect
 GAP_KEPT = 0.99                # a leader holding less than this share of the tokens we saw it buy sold while we were blind
 WAL_LIMIT = 64 * 2**20         # bytes the write-ahead log keeps after a checkpoint resets it
-STABLE_S = 300                 # a feed connection that lived this long was healthy; one that died sooner counts as a failure
+SILENT_S = 30                  # this long without pump.fun's logs (they come many times a second), a connection is stalled,
+                               # even with its slots still coming
 FALLBACK_S = 900               # one stretch on the fallback feed
 FALLBACK_PER_DAY = 2           # at most this many a UTC day: Helius's free credits cover ~10 h of this stream
 SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
@@ -793,7 +794,6 @@ class Collector:
             self.stats.update(host_resources(self.db_path.parent), **self.pool_feed.stats)
             self._warn_disk()
             self.last_paper = now
-        self.stats["heartbeat"] = int(now)
         set_meta(self.c, "stats", self.stats)
         self.c.commit()
 
@@ -888,15 +888,17 @@ class Collector:
         self.mints = {a: v for a, v in self.mints.items() if v[1] >= cutoff}
         self.paper.forget()
 
-    def _dropped(self, lived_s: float, on_fallback: bool) -> float:
-        """A feed connection ended after `lived_s` seconds: returns how long to wait before the next one. A connection
-        that dies within STABLE_S is a failure even though it connected: the public RPC throttles a client that
-        reconnects in a loop (on 2026-09-25 it dropped us every 30-60 s and let ~15 % of trades through), so the wait
-        grows, and after two such failures in a row the fallback takes over for FALLBACK_S, FALLBACK_PER_DAY times a day."""
-        stable = lived_s >= STABLE_S
-        self.fails = 1 if stable else self.fails + 1
-        self.backoff = 2.0 if stable else min(self.backoff * 2, 60.0)
-        if on_fallback and lived_s < 10:                      # the fallback refuses us (Helius answered 429 on 2026-09-25):
+    def _dropped(self, worked_s: float, on_fallback: bool) -> float:
+        """A feed connection ended after bringing pump.fun's logs for `worked_s` seconds: returns how long to wait before
+        the next one. One refused, silent or dropped within WORKED_S is a failure: the wait grows, up to 60 s, as a client
+        reconnecting in a loop needs, and after two in a row the fallback takes over for FALLBACK_S, FALLBACK_PER_DAY
+        times a day. One that worked longer was closed by the server, which the public RPC does every 1-5 min since
+        2026-09-29 (close code 1002): the next one opens in 2 s, where a wait doubling to 60 s cost up to half the trades,
+        and the failures start again from none, so a single refusal after it spends none of the fallback's day."""
+        worked = worked_s >= WORKED_S
+        self.fails = 0 if worked else self.fails + 1
+        self.backoff = 2.0 if worked else min(self.backoff * 2, 60.0)
+        if on_fallback and worked_s < 10:                     # the fallback refuses us (Helius answered 429 on 2026-09-25):
             self.fallback_until = 0.0                          # back to the main feed, which at least lets some through
             return self.backoff
         day = time.strftime("%Y-%m-%d", time.gmtime())
@@ -910,6 +912,19 @@ class Collector:
         self.stats["fallback_used_today"] = self.fallback_used
         return self.backoff
 
+    async def _flush_loop(self, stop: asyncio.Event) -> None:
+        """flush() once a second, whatever the feeds do. The pool feeds write through this connection too, and while
+        only a pump.fun message led to a flush, a pool trade's write stayed uncommitted for as long as that feed was
+        silent or waiting to reconnect (up to 60 s): the maintenance thread gave up on the lock (2026-09-29, "database
+        is locked" in the prune and the report). A failure other than the disk's stops the collector, as it always did."""
+        while not stop.is_set():
+            await asyncio.sleep(1)
+            try:
+                self.flush()
+            except Exception:  # noqa: BLE001 - said, then the collector stops and the container restarts it
+                log.exception("writing failed: stopping")
+                stop.set()
+
     async def run(self, stop: asyncio.Event | None = None) -> None:
         import websockets  # here so `pump report` works without the package
         stop = stop or asyncio.Event()
@@ -918,15 +933,16 @@ class Collector:
                 asyncio.get_running_loop().add_signal_handler(sig, stop.set)
             except (NotImplementedError, RuntimeError):   # Windows, or not the main thread: Ctrl+C still ends it
                 pass
-        last_flush, last_line, last_forget = time.time(), time.time(), time.time()
+        last_line, last_forget = time.time(), time.time()
         gap_from = None
         seen = (self.stats["trades"], self.stats["mints"])
         pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
+        writes = asyncio.create_task(self._flush_loop(stop))
         self.check_gap("restart")                               # the copies loaded from the database: were they sold meanwhile?
         while not stop.is_set():
             on_fallback = bool(self.fallback_url) and time.time() < self.fallback_until
             url = self.fallback_url if on_fallback else self.ws_url
-            opened = time.time()
+            opened = heard = time.time()                          # heard: pump.fun's logs, last seen on this connection
             try:
                 async with websockets.connect(url, max_size=2**24, max_queue=4096, ping_interval=20, ping_timeout=30,
                                               close_timeout=5) as ws:     # 5 s for a closing handshake: a stop fits its 15 s grace
@@ -935,35 +951,37 @@ class Collector:
                     await ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "slotSubscribe"}))   # our pools, in pumppools
                     self.stats["ws"] = ("fallback: " if on_fallback else "") + url.split("?")[0]
                     log.info("connected to %s", self.stats["ws"])
-                    opened = time.time()
-                    if gap_from is not None:
-                        self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + time.time() - gap_from, 1)
-                        gap_from = None
-                        self.check_gap("reconnect")
-                    heard = time.time()
+                    opened = heard = time.time()
                     while not stop.is_set():
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=1)   # a second at most: a stop is seen at once
+                            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1))   # a second at most: a stop is seen at once
                         except asyncio.TimeoutError:
-                            if time.time() - heard >= 30:
-                                raise                                          # 30 s of silence = a stalled feed
-                            continue
-                        heard = time.time()
-                        msg = json.loads(raw)
+                            msg = {}
                         method = msg.get("method")
                         if method == "slotNotification":
                             self.tip = max(self.tip, msg["params"]["result"]["slot"])
-                        elif method == "logsNotification":
+                        elif method == "logsNotification":             # the slots alone keep neither the feed nor the page's "live"
+                            heard = time.time()
+                            self.stats["heartbeat"] = int(heard)
+                            if gap_from is not None:                   # listening again: the gap ends here, not at the connect
+                                self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + heard - gap_from, 1)
+                                gap_from = None
+                                self.check_gap("reconnect")
                             res = msg["params"]["result"]
                             if not res["value"].get("err"):
                                 self.on_logs(res["context"]["slot"], res["value"]["logs"], res["value"].get("signature"))
+                        elif "error" in msg:
+                            why = f"subscription {msg.get('id')} refused: {_no_key(str(msg['error']))[:160]}"
+                            if msg.get("id") == 1:
+                                raise ConnectionError(why)             # pump.fun's logs will not come: no use waiting SILENT_S
+                            log.warning("feed %s", why)
                         now = time.time()
+                        if now - heard >= SILENT_S:                    # after each frame or second, not on a timeout only: the slots never stop
+                            raise TimeoutError(f"{SILENT_S:g} s without pump.fun's logs")
                         if on_fallback and now >= self.fallback_until:
                             log.info("fallback window over: back to the main feed")
+                            gap_from = gap_from or now                 # blind until the main feed's first logs
                             break
-                        if now - last_flush >= 1:
-                            self.flush()
-                            last_flush = now
                         if now - last_line >= 60:
                             pf = self.pool_feed.stats
                             log.info("last minute: %d trades, %d new tokens (total %d / %d) | delay %s slot(s) | pools %s of %s followed on "
@@ -985,7 +1003,7 @@ class Collector:
                 self.stats["reconnects"] += 1
                 self.stats["last_error"] = _no_key(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {type(e).__name__}: {e}")[:300]
                 lived = time.time() - opened
-                wait = self._dropped(lived, on_fallback)
+                wait = self._dropped(heard - opened, on_fallback)
                 log.warning("feed error after %.0fs connected (%s); reconnecting in %.0fs", lived, self.stats["last_error"], wait)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=wait)   # a stop cuts the wait short
@@ -993,7 +1011,8 @@ class Collector:
                     pass
         self.halt.set()                                          # the gap worker stops reading: its findings wait for the next start
         pools.cancel()
-        await asyncio.gather(pools, return_exceptions=True)      # its sockets close properly too (PoolFeed.run)
+        writes.cancel()
+        await asyncio.gather(pools, writes, return_exceptions=True)   # the pools' sockets close properly too (PoolFeed.run)
         self.flush()
         log.info("stopped: the feeds are closed and what they brought is written")
 

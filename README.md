@@ -147,7 +147,11 @@ bought came from elsewhere and earn it nothing in these numbers.
 - **Feeds.** `SOLANA_WS_URL` swaps the main RPC. `SOLANA_WS_FALLBACK` is used only after the main
   one fails twice in a row, for 15 minutes. Helius meters websockets at 2 credits per 0.1 MB: this
   stream (about 1.4 MB/s) would empty a free plan's million monthly credits in half a day, but
-  covering outages costs about 25,000 credits each. The page shows drops and seconds lost.
+  covering outages costs about 25,000 credits each. The page shows drops and seconds lost. A connection
+  that brought pump.fun's logs for 30 s or more and was then closed by the server (the public RPC does so
+  every 1–5 minutes since 2026-09-29) is replaced in 2 s and counts as no failure; one refused, silent or
+  dropped sooner waits longer each time, up to a minute. Writes are committed every second whatever the
+  feeds do, and the page says "live" only while pump.fun's logs arrive.
 - **Wallet profit** uses the exact fees from each event. A launcher's positions in its own tokens
   never count as trading.
 - **Copier profit is replayed, not modelled.** A copier landing `--latency-slots` (2, about 0.8 s)
@@ -175,7 +179,11 @@ bought came from elsewhere and earn it nothing in these numbers.
   `PUMP_LIVE_WALLETS`, at most `PUMP_LIVE_MAX_OPEN` (3) at once, stops new copies for the UTC day after
   `PUMP_LIVE_DAY_LOSS_SOL` (0.5) is lost, and gives each sell three tries, the last at any price; a coin
   that still will not sell is left in the log for its owner. The transactions are pinned to real mainnet
-  ones in `tests/test_pumptx.py` and simulated on mainnet by `checks/pumplive_simulate.py`.
+  ones in `tests/test_pumptx.py` and simulated on mainnet by `checks/pumplive_simulate.py`. A failure names
+  the account it failed on: `ConstraintSeeds (creator_vault)` is a coin whose creator moved to a fee-sharing
+  config (`MigrateBondingCurveCreator`) between the copied buy and ours, seconds after it. That hit 5% of
+  4yFAz7's buys in the first dry run, and a live copy would fail the same way; the sells are not affected, since
+  every trade after the move names the new creator.
 - **Going live: the rule (`hl_screener/pumpgo.py`), fixed on 2026-09-28 before the results were seen.** A golden
   wallet is copied live only when all four hold, on its 0.25 SOL paper copies alone (the 0.1 SOL ones do not count):
   at least 100 closed copies; at least +3% profit per closed copy after fees; at least 80% of its dry-run buys, out

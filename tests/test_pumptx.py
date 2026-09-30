@@ -5,7 +5,8 @@ import pytest
 pytest.importorskip("solders")
 
 from hl_screener.pumptx import (AMM_LISTS, AMM_PROGRAM, PUMP_PROGRAM, TOKEN_2022_PROGRAM, canonical_pool, compose,  # noqa: E402
-                                curve_buy_ixs, curve_sell_ixs, parse_global, pool_buy_ixs, pool_sell_ixs, sol_for, tokens_for)
+                                curve_buy_ixs, curve_sell_ixs, parse_global, pool_buy_ixs, pool_sell_ixs, sim_error, sol_for,
+                                tokens_for)
 
 T22 = TOKEN_2022_PROGRAM
 
@@ -161,3 +162,12 @@ def test_a_copy_is_priced_like_the_paper_copy_and_fits_one_transaction():
     ixs, cu = curve_buy_ixs(coin, user, 250_000_000, tok, T22, {})
     tx = compose(user, ixs, cu_limit=cu, tip_to="96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", tip_lamports=1_000_000)
     assert len(bytes(tx)) < 1232                                                 # Solana's packet limit, no lookup table needed
+
+
+def test_a_failure_names_the_account_its_constraint_failed_on():
+    moved = {"err": {"InstructionError": [3, {"Custom": 2006}]}, "logs": [   # a mainnet simulation, 2026-09-30
+        "Program log: AnchorError caused by account: creator_vault. Error Code: ConstraintSeeds. Error Number: 2006. "
+        "Error Message: A seeds constraint was violated.", "Program log: Left:", "Program log: Right:"]}
+    assert sim_error(moved) == "ConstraintSeeds (creator_vault)"               # the coin's creator moved after the copied buy
+    assert sim_error({"err": {}, "logs": ["Program log: AnchorError occurred. Error Code: TooLittleSolReceived. "
+                                          "Error Number: 6003. Error Message: slippage."]}) == "TooLittleSolReceived"

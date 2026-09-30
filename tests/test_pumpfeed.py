@@ -1,10 +1,11 @@
 import asyncio
+import json
 import sqlite3
 import sys
 import time
 import types
 
-from hl_screener.pumpfun import FALLBACK_PER_DAY, WAL_LIMIT, Collector, checkpoint, connect, paper_lines, set_meta
+from hl_screener.pumpfun import FALLBACK_PER_DAY, WAL_LIMIT, Collector, checkpoint, connect, get_meta, paper_lines, set_meta
 
 
 class Silent:
@@ -32,15 +33,150 @@ class Silent:
         return await self.recv()
 
 
+class Talking(Silent):
+    """A websocket that says what it was given and what the test puts in its queue, and nothing else."""
+    def __init__(self, events, *said):
+        super().__init__(events)
+        self.q = asyncio.Queue()
+        for msg in said:
+            self.q.put_nowait(msg)
+
+    async def recv(self):
+        return await self.q.get()
+
+
+class Stream(Silent):
+    """A websocket that says `msg` every 50 ms, `n` times, then is closed by the server."""
+    def __init__(self, msg, n):
+        super().__init__([])
+        self.msg, self.n = msg, n
+
+    async def recv(self):
+        await asyncio.sleep(0.05)
+        if self.n <= 0:
+            raise ConnectionError("sent 1002 (protocol error) invalid status code; no close frame received")
+        self.n -= 1
+        return self.msg
+
+
+SLOT = json.dumps({"method": "slotNotification", "params": {"result": {"slot": 7}}})
+LOGS = json.dumps({"method": "logsNotification", "params": {"result": {"context": {"slot": 7},
+                                                                      "value": {"err": None, "logs": [], "signature": "sig"}}}})
+
+
 def test_a_feed_that_keeps_dropping_waits_longer_and_borrows_the_fallback_twice_a_day(tmp_path):
     col = Collector(tmp_path / "pump.db", fallback_url="wss://fallback.example")
-    waits = [col._dropped(30, on_fallback=False) for _ in range(5)]   # connects, then dies within the minute, again and again
+    waits = [col._dropped(5, on_fallback=False) for _ in range(5)]    # connects, then dies within seconds, again and again
     assert waits == [2, 4, 8, 16, 32]                                 # not back in 2 s every time: that is what gets throttled
     assert col.fallback_used == FALLBACK_PER_DAY == 2                 # the fallback, but only twice a day
-    assert col._dropped(600, on_fallback=False) == 2 and col.fails == 1   # a connection that held is a fresh start
+    assert col._dropped(600, on_fallback=False) == 2 and col.fails == 0   # a connection that held is a fresh start
     col.fallback_until = 1e12
     col._dropped(0, on_fallback=True)                                  # the fallback turns us away at the door ...
     assert col.fallback_until == 0.0                                   # ... so its window ends and the main feed is tried
+    col.c.close()
+
+
+def test_a_connection_the_server_closed_after_it_worked_is_back_in_2_s(tmp_path):
+    col = Collector(tmp_path / "pump.db", fallback_url="wss://fallback.example")
+    assert [col._dropped(90, on_fallback=False) for _ in range(4)] == [2, 2, 2, 2]   # 2026-09-29: closed every 1-5 min,
+    assert col.fallback_used == 0                                     # and 60 s waits lost up to half the trades; nor do those
+    assert col._dropped(0, on_fallback=False) == 4 and col.fallback_used == 0   # closes spend the fallback, nor does one
+    assert col._dropped(0, on_fallback=False) == 8 and col.fallback_used == 1   # refusal after them: two in a row do
+    col.c.close()
+    from hl_screener.pumppools import PoolFeed, _Conn
+    pf = PoolFeed("wss://public.example", lambda *a: None)
+
+    def closed(*args, **kwargs):
+        raise ConnectionError("sent 1002 (protocol error) invalid status code; no close frame received")
+
+    def drop(lived):                                                  # the pool feed's next connection waits until
+        c = _Conn()
+        c.opened = time.time() - lived
+        asyncio.run(pf._conn(c, types.SimpleNamespace(connect=closed)))
+        return round(pf.wait_until - time.time())
+
+    assert [drop(90) for _ in range(3)] == [2, 2, 2]
+    assert [drop(0) for _ in range(3)] == [4, 8, 16]                  # refused at the door: longer each time
+
+
+def test_writes_are_committed_every_second_while_the_pump_feed_is_silent(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace(connect=lambda *a, **k: Silent([])))
+    col = Collector(tmp_path / "pump.db")
+    col.check_gap = lambda why: None
+
+    async def main():
+        stop = asyncio.Event()
+        task = asyncio.create_task(col.run(stop))
+        await asyncio.sleep(0.2)
+        col.wallet_id("PoolTrader")                                   # a pool trade by a new wallet: a write, left open
+        await asyncio.sleep(1.5)                                      # the pump.fun feed says nothing meanwhile
+        other = sqlite3.connect(tmp_path / "pump.db", timeout=0.2)    # the maintenance thread's own connection
+        try:
+            set_meta(other, "report", {"ok": 1})                      # "database is locked" on 2026-09-29
+            other.commit()
+            assert "heartbeat" not in get_meta(other, "stats")        # written, yet the page still says the feed is silent
+            return other.execute("SELECT COUNT(*) FROM wallets WHERE addr = 'PoolTrader'").fetchone()[0]
+        finally:
+            other.close()
+            stop.set()
+            await task
+
+    assert asyncio.run(main()) == 1
+    col.c.close()
+
+
+def test_the_page_says_live_only_while_pump_funs_logs_arrive(tmp_path, monkeypatch):
+    ws = Talking([])
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace(connect=lambda *a, **k: ws))
+    col = Collector(tmp_path / "pump.db")
+    col.check_gap = lambda why: None
+
+    async def main():
+        stop = asyncio.Event()
+        task = asyncio.create_task(col.run(stop))
+        await ws.q.put(SLOT)
+        await asyncio.sleep(1.3)                                      # a write goes by meanwhile
+        slots_only = col.stats.get("heartbeat")                       # the slots come, pump.fun's logs do not: not live
+        await ws.q.put(LOGS)
+        await asyncio.sleep(0.1)
+        logs = col.stats.get("heartbeat")
+        stop.set()
+        await task
+        return slots_only, logs
+
+    slots_only, logs = asyncio.run(main())
+    assert slots_only is None and abs(logs - time.time()) < 5
+    col.c.close()
+
+
+def test_slots_without_logs_are_a_stalled_feed_and_only_the_logs_count_as_work(tmp_path, monkeypatch):
+    from hl_screener import pumpfun
+    monkeypatch.setattr(pumpfun, "SILENT_S", 0.3)                     # 30 s, scaled down
+    refused = json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "too many subscriptions"}})
+    conns = [Talking([], SLOT, refused), Stream(SLOT, 10**6), Stream(LOGS, 12)]   # logs refused; slots and never a log;
+    monkeypatch.setitem(sys.modules, "websockets",                                # then 0.6 s of logs, and the server closes
+                        types.SimpleNamespace(connect=lambda *a, **k: conns.pop(0) if conns else Silent([])))
+    col = Collector(tmp_path / "pump.db")
+    gaps, drops = [], []
+    col.check_gap = gaps.append
+    col._dropped = lambda worked, on_fallback: drops.append((worked, col.stats["last_error"])) or 0.01
+
+    async def main():
+        stop = asyncio.Event()
+        task = asyncio.create_task(col.run(stop))
+        while len(drops) < 3:
+            await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+    t0 = time.time()
+    asyncio.run(asyncio.wait_for(main(), 10))
+    (no_logs, why0), (stalled, why1), (closed, why2) = drops[:3]
+    assert no_logs == 0 and "ConnectionError: subscription 1 refused" in why0   # at once, not after SILENT_S
+    assert stalled == 0 and why1.endswith("TimeoutError: 0.3 s without pump.fun's logs")   # the slots kept coming: stalled all the same
+    assert 0.2 < closed < 5 and "sent 1002" in why2                   # the 0.6 s of logs count as work, then the server's close
+    assert gaps == ["restart", "reconnect"]                           # the gap ends at the first logs, not at a connect
+    assert time.time() - t0 < 5
     col.c.close()
 
 
@@ -111,7 +247,7 @@ def test_a_cancelled_pool_feed_returns_only_once_its_sockets_are_closed(monkeypa
 
 def test_a_stop_ends_the_collector_within_seconds_with_its_feed_closed_properly(tmp_path, monkeypatch):
     events, gaps, opened = [], [], []
-    conns = iter([OSError("HTTP 429"), Silent(events)])              # refused once, then a feed that never speaks
+    conns = iter([OSError("HTTP 429"), Talking(events, LOGS)])       # refused once, then a feed that speaks once
 
     def connect(*args, **kwargs):
         opened.append(kwargs)

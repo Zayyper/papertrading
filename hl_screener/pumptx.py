@@ -292,12 +292,14 @@ def own_trade(logs: list[str], user: str) -> dict[str, Any]:
 
 
 def sim_error(res: dict[str, Any]) -> str:
-    """Why a simulation or a transaction failed, short: the program's own error name when its logs give one."""
+    """Why a simulation or a transaction failed, short: the program's own error name when its logs give one, and the
+    account a constraint failed on. 'ConstraintSeeds (creator_vault)': the coin's creator moved to a fee-sharing config
+    between the copied buy and ours (seen on 5 % of 4yFAz7's buys, 2026-09-30), so the copy named the old creator's vault."""
     import re
     for line in reversed(res.get("logs") or res.get("logMessages") or []):
-        m = re.search(r"Error Code: (\w+)", line)
+        m = re.search(r"(?:caused by account: (\w+)\. )?Error Code: (\w+)", line)
         if m:
-            return m.group(1)
+            return f"{m.group(2)} ({m.group(1)})" if m.group(1) else m.group(2)
         if "insufficient" in line.lower():
             return line.split(": ", 1)[-1][:120]
     return str(res.get("err"))[:160]

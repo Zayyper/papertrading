@@ -23,6 +23,8 @@ POOL_CONNS = 8                  # connections for pools, on top of the pump.fun 
                                 # (x-ratelimit pubsub-limit, 2026-09-26), so a restart's overlap with the old container goes over
 POOL_IDLE_S = 3600              # a pool that has not traded for this long is dropped at the next retirement
 SUB_PER_S = 8.0                 # subscribe requests a second over all connections (the public RPC: 100 per 10 s per IP)
+WORKED_S = 30                   # a connection that lived this long was let in and fed us: the server closed it (every 1-5 min
+                                # since 2026-09-29, close code 1002), so the next one opens in 2 s; only shorter ones wait longer
 
 
 class _Conn:
@@ -134,7 +136,7 @@ class PoolFeed:
             why = f"{type(e).__name__}: {str(e)[:120]}"
         self.stats["pool_drops"] += 1                  # ended either way: its pools go to another connection
         lived = time.time() - c.opened
-        self.fails = 0 if lived >= 300 else self.fails + 1
+        self.fails = 0 if lived >= WORKED_S else self.fails + 1
         self.wait_until = time.time() + min(2.0 * 2 ** self.fails, 60.0)
         log.warning("pool feed connection with %d pools ended after %.0fs (%s)", len(c.pools), lived, why)
 
