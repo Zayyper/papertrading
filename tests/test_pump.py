@@ -52,16 +52,53 @@ def create_bytes(mint, user, ts=1_790_000_000, quote=bytes(32), token_program=by
     return b + struct.pack("<4Q", 0, 0, 0, 0) + token_program + struct.pack("<??", False, False) + quote + struct.pack("<QQ?", 0, 0, False)
 
 
-def test_parse_exact_layout_or_nothing():
+def test_parse_the_layout_or_its_known_tail_and_refuse_the_rest():
     mint, user = bytes([1]) * 32, bytes([2]) * 32
     e = parse_trade(trade_bytes(mint, user, True, 10**9, 5 * 10**12, 31 * 10**9, 10**15, shareholders=2))
     assert e["buy"] and e["sol"] == 10**9 and e["user"] == user and e["sol_quote"]
     assert e["fee"] == int(10**9 * 0.0095) + int(10**9 * 0.003)
-    assert parse_trade(trade_bytes(mint, user, True, 1, 1, 1, 1) + b"\0") is None       # layout drift: refuse
+    b = trade_bytes(mint, user, True, 1, 1, 1, 1)
+    assert parse_trade(b + bytes(8)) == parse_trade(b)                                    # the tail of 2026-10-02: read without it
+    assert parse_trade(b + bytes(1)) is None and parse_trade(b + bytes(16)) is None      # any other length: refuse
+    assert parse_trade(b[:-1]) is None
+    assert parse_trade(trade_bytes(mint, user, True, 1, 1, 1, 1, ix="b\x00y")) is None   # fields moved: not a name, refuse
     assert not parse_trade(trade_bytes(mint, user, True, 1, 1, 1, 1, quote=bytes([9]) * 32))["sol_quote"]
     c = parse_create(create_bytes(mint, user))
     assert c["mint"] == mint and c["user"] == user and c["symbol"] == "CAT" and c["sol_quote"]
     assert parse_create(create_bytes(mint, user)[:-1]) is None
+    assert parse_create(create_bytes(mint, user) + bytes(8)) is None                     # creations kept their layout
+
+
+def test_todays_events_parse_with_the_field_pump_fun_appended():
+    """Three events from mainnet on 2026-10-05, each 8 bytes longer than the published layout, which stopped every
+    trade from 2026-10-02 15:48 UTC. Each names its transaction's signer as the trader."""
+    curve_buy = base64.b64decode(
+        "vdt/007mYe56Dy5lvdCRFrxk8JtnES5kd6CtLk5zIT3sD+SUBuFqfwz8EAAAAAAAhnfZJAkAAAABEInemyEgse2GFTwHUjhVw7rZ5muUhkd3oy0uhI6dZKGv2c"
+        "NqAAAAAD1lZggHAAAAEwPa+T3JAwA9uUIMAAAAABNrx62sygIA4ATIfOuY+lzkf4A4Bv0seUXSlSSVmuwA3tl4FPOPeEZfAAAAAAAAAE8pAAAAAAAAVUWwc0Zfly"
+        "QFonzWh+WHbvFNu8cw16UrWpWZuwwit6geAAAAAAAAAAwNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAGJ1eQAAAAAAAAAAAAAAAAAA"
+        "AAAAiBMAAAAAAACnFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAz8EAAAAAAAPWVmCAcAAAA9uUIMAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAA==")
+    pool_buy = base64.b64decode(
+        "Z/RSHyz1d3ev2cNqAAAAAKlBjXAAAAAAIr+1AAAAAAAAAAAAAAAAACK/tQAAAAAA1ZIUSx3SBwDAwjBOlwwAACK/tQAAAAAAGQAAAAAAAAD5cwAAAAAAAAUAAAAA"
+        "AAAAMhcAAAAAAADwp7UAAAAAAPcztQAAAAAAHD3Jo2HIJcySwVewP4g1/ApIEud7nFdr2WX8Ql2rVfIZtMP01xR31Od2E0TOKBEGV4evFIWpc7TxjyVm41ig2pQZ"
+        "Owd2yAyWpNEa8DYc8ZbUZNRMXRWOArbIvN6iOQJ2mTrTrC7j0O6jraKrOap+4hZ7MpArlC6g9LK8QCM3qoTXqo+wYNgpG0xNR12v92LJa9wNrOs2wBLq0S7TqUhB"
+        "YR1A0DnVpcb23YuZx5/4/yZMB7KjKc+LXfik7qAIH9htAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAASAAAAYnV5X2V4YWN0X3F1b3RlX2luAAAAAAAAAAAAAAAAAAAAAIgTAAAAAAAAmQsAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAABZW/m8/9YMLAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    pool_sell = base64.b64decode(
+        "Pi83CqUD3CrB2cNqAAAAAJB8pZ9kAAAAUDGyAAAAAADwHbRNqBEAAAAAAAAAAAAAvSF4CWNkMgB7+/hpWgAAAL+ItAAAAAAAGQAAAAAAAACLcwAAAAAAAAUAAAAAAA"
+        "AAHBcAAAAAAAA0FbQAAAAAABj+swAAAAAAU4U+R4Zk5MQ8e4p4oSHfwBvHodQIviWOk1sZdRfLL3npNHrcpy5d8O0fq3SW53PQFppv2Sc64blaMqu8mWAl5lUKUxUw"
+        "FHinLghRe4aY5+EPr4UoKcBiodag4rtvBpeNs5A75VOOkxh5PBYZESaDaMT/BsbqvU7YagMhaJutQLjgBMh865j6XOR/gDgG/Sx5RdKVJJWa7ADe2XgU8494RpwlJH"
+        "x6/mh3nE583EE55WuEze54pO2bR06h+o7pPOIlAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIgT"
+        "AAAAAAAAjgsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK7/TY+0HceKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    e = parse_trade(curve_buy)
+    assert e and e["buy"] and e["ix"] == "buy" and e["sol_quote"] and b58(e["user"]) == "27ZTRxzCXD8rgjCPWxyFacppGReB5Vx4LcEiLd6WeD4C"
+    assert e == parse_trade(curve_buy[:-8])                    # the appended field changes nothing we read
+    for raw, buy, signer in ((pool_buy, True, "2jM4cg3nAXWKJaVMvHs2JFtDsg3uviwgP3tXDhZh4433"),
+                             (pool_sell, False, "GhLQcTvJNfXNK2F6wjrJjGP9c4VDUY8jYceRmiXadaCM")):
+        a = parse_amm_trade(raw)
+        assert a and a["buy"] is buy and b58(a["user"]) == signer and a["sol"] > 0 and a["tok"] > 0 and a["vsol"] > 0
+        assert a == parse_amm_trade(raw[:-8])
 
 
 class Curve:
@@ -479,7 +516,10 @@ def test_pumpswap_events_decode_to_post_trade_reserves():
     sell = parse_amm_trade(amm_bytes(False, pool, user, 10**12, B, Q, 10**8, 2 * 10**5, 10**8 - 2 * 10**5, 10**8 - 6 * 10**5, vq))
     assert (sell["vtok"], sell["vsol"], sell["fee"]) == (B + 10**12, Q - 10**8 + 2 * 10**5 + vq, 6 * 10**5)
     assert not sell["buy"] and buy["buy"] and buy["pool"] == pool
-    assert parse_amm_trade(amm_bytes(False, pool, user, 1, 1, 1, 1, 0, 1, 1) + b"\0") is None
+    small = amm_bytes(False, pool, user, 1, 1, 1, 1, 0, 1, 1)
+    assert parse_amm_trade(small + bytes(8)) == parse_amm_trade(small) and parse_amm_trade(small[:-1]) is None
+    moved = small[:8 + 8 + 13 * 8] + bytes(1) + small[8 + 8 + 13 * 8:] + bytes(8)       # a byte before the pool, and the tail:
+    assert parse_amm_trade(moved) is None                                                # 9 bytes over is no known length
 
 
 def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):

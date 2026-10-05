@@ -115,9 +115,24 @@ class _Reader:
         return self.b[self.o - n:self.o].decode("utf-8", "replace")
 
 
+TRADE_TAIL = 8     # bytes pump.fun's upgrade of 2026-10-02 ~15:48 UTC appended, undocumented, to TradeEvent, BuyEvent, SellEvent
+
+
+def _whole(r: _Reader, tails: tuple[int, ...] = (0,)) -> bool:
+    """The event was read to the end of its layout, give or take a tail pump.fun is known to append. Any other length
+    means the layout changed: the event is refused rather than read wrong, and the minute line counts it. The exact
+    length alone refused the 8 bytes appended on 2026-10-02, and no trade was stored for three days."""
+    return len(r.b) - r.o in tails
+
+
+def _name(s: str) -> bool:
+    """An instruction name, e.g. buy_exact_sol_in: the check that the fields before it sit where the layout says."""
+    return 0 < len(s) <= 40 and s.isascii() and s.replace("_", "").isalnum()
+
+
 def parse_trade(b: bytes) -> dict[str, Any] | None:
-    """TradeEvent, or None when the bytes do not fit the layout exactly: a changed layout must stop the
-    data, not silently corrupt it."""
+    """TradeEvent, or None when the bytes do not fit its layout (as published, or with the tail of 2026-10-02):
+    a changed layout must stop the data, not silently corrupt it."""
     try:
         r = _Reader(b)
         mint = r.pk()
@@ -141,7 +156,7 @@ def parse_trade(b: bytes) -> dict[str, Any] | None:
         r.skip(8 * 5)                             # quote amount/reserves, holder rewards
     except (struct.error, ValueError):
         return None
-    if r.o != len(b):
+    if not _whole(r, (0, TRADE_TAIL)) or not _name(ix):
         return None
     return {"mint": mint, "user": user, "buy": is_buy, "sol": sol, "tok": tok, "fee": fee, "ts": ts,
             "vsol": vsol, "vtok": vtok, "sol_quote": quote == SOL_QUOTE,
@@ -165,7 +180,7 @@ def parse_create(b: bytes) -> dict[str, Any] | None:
         r.skip(8 + 8 + 1)                         # virtual_quote_reserves, creator_fee_bps, is_holder_reward
     except (struct.error, ValueError):
         return None
-    if r.o != len(b):
+    if not _whole(r):
         return None
     return {"mint": mint, "user": user, "name": name[:64], "symbol": symbol[:32], "ts": ts, "sol_quote": quote == SOL_QUOTE,
             "token_program": token_program}
@@ -187,15 +202,16 @@ def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
         r.skip(32)                                # its token account
         creator = r.pk()                          # coin_creator
         r.skip(16)                                # creator fee bps/amount
+        ix = "sell"
         if buy:
             r.skip(1 + 8 * 4 + 8)                 # track_volume, volume totals, min_base_amount_out
-            r.string()                            # ix_name
+            ix = r.string()                       # ix_name
         r.skip(8 * 4)                             # cashback and buyback bps/amounts
         vq = int.from_bytes(r.b[r.o:r.o + 16], "little", signed=True)
         r.skip(16 + 1 + 8 + 16)                   # virtual_quote_reserves, can_boost, base_supply, holder rewards
     except (struct.error, ValueError):
         return None
-    if r.o != len(b):
+    if not _whole(r, (0, TRADE_TAIL)) or not _name(ix):
         return None
     base, B, Q, q, q_net, user_q = v[0], v[4], v[5], v[6], v[11], v[12]
     if buy:
@@ -216,7 +232,7 @@ def parse_create_pool(b: bytes) -> dict[str, Any] | None:
         r.skip(32 * 4 + 1 + 8 + 1 + 1)            # lp_mint, token accounts, coin_creator, flags, creator_fee_bps
     except (struct.error, ValueError):
         return None
-    if r.o != len(b):
+    if not _whole(r):
         return None
     return {"pool": pool, "base_mint": base, "quote_mint": quote}
 
@@ -935,7 +951,7 @@ class Collector:
                 pass
         last_line, last_forget = time.time(), time.time()
         gap_from = None
-        seen = (self.stats["trades"], self.stats["mints"])
+        seen = (self.stats["trades"], self.stats["mints"], self.stats["parse_errors"])
         pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
         writes = asyncio.create_task(self._flush_loop(stop))
         self.check_gap("restart")                               # the copies loaded from the database: were they sold meanwhile?
@@ -983,15 +999,16 @@ class Collector:
                             gap_from = gap_from or now                 # blind until the main feed's first logs
                             break
                         if now - last_line >= 60:
-                            pf = self.pool_feed.stats
+                            pf, unread = self.pool_feed.stats, self.stats["parse_errors"] - seen[2]
                             log.info("last minute: %d trades, %d new tokens (total %d / %d) | delay %s slot(s) | pools %s of %s followed on "
-                                     "%s connections, %s drops | disk %s of %s GB free, memory %s of %s GB free%s",
+                                     "%s connections, %s drops | disk %s of %s GB free, memory %s of %s GB free%s%s",
                                      self.stats["trades"] - seen[0], self.stats["mints"] - seen[1], self.stats["trades"], self.stats["mints"],
                                      self.stats.get("lag_p50"), pf.get("pools_followed"), pf.get("pools_wanted"), pf.get("pool_conns"),
                                      pf.get("pool_drops"), self.stats.get("disk_free_gb"), self.stats.get("disk_total_gb"),
                                      self.stats.get("mem_avail_gb", "?"), self.stats.get("mem_total_gb", "?"),
-                                     f" | NOT STORING trades: under {MIN_FREE_GB:g} GB of disk free" if self.stats.get("paused_low_disk") else "")
-                            seen, last_line = (self.stats["trades"], self.stats["mints"]), now
+                                     f" | NOT STORING trades: under {MIN_FREE_GB:g} GB of disk free" if self.stats.get("paused_low_disk") else "",
+                                     f" | {unread} events not understood: has pump.fun changed a layout?" if unread else "")
+                            seen, last_line = (self.stats["trades"], self.stats["mints"], self.stats["parse_errors"]), now
                         if now - last_forget >= 3600:
                             self.forget_old_mints()
                             last_forget = now
