@@ -15,8 +15,6 @@ from typing import Any
 
 from .pumpfun import LAMPORTS, cohorts_of, connect, read_launches, save_meta
 
-FRESH_CURVE_SOL = 30.0          # a new curve's virtual SOL: what is in it beyond this was bought
-
 
 def _q(xs: list[float], p: float) -> float | None:
     xs = sorted(xs)
@@ -31,8 +29,8 @@ def dossier(c, addr: str, crew: set[str], launches_of: collections.Counter) -> d
     toks: dict[str, dict[str, Any]] = {}
     hours: collections.Counter = collections.Counter()
     n_trades = 0
-    for slot, ts, mint, mslot, creator, buy, sol, tok, fee, vsol, grad in c.execute(
-            """SELECT t.slot, t.ts, m.addr, m.slot, w.addr, t.buy, t.sol, t.tok, t.fee, t.vsol, m.pool IS NOT NULL
+    for slot, ts, mint, mslot, creator, buy, sol, tok, fee, mint_id, rowid, grad in c.execute(
+            """SELECT t.slot, t.ts, m.addr, m.slot, w.addr, t.buy, t.sol, t.tok, t.fee, t.mint, t.rowid, m.pool IS NOT NULL
                FROM trades t JOIN mints m ON m.id = t.mint LEFT JOIN wallets w ON w.id = m.creator
                WHERE t.wallet = ? ORDER BY t.slot""", (wid,)):
         n_trades += 1
@@ -44,8 +42,10 @@ def dossier(c, addr: str, crew: set[str], launches_of: collections.Counter) -> d
             t["tin"] += tok
             if t["first"] is None:
                 t["first"], t["first_ts"] = slot, ts
-                before = (vsol - sol) / LAMPORTS - FRESH_CURVE_SOL if vsol else None
-                t["curve_sol"] = before if before is not None and 0 <= before < 90 else None   # on the curve, not a pool
+                before = c.execute("""SELECT COALESCE(SUM(CASE WHEN buy THEN sol ELSE -sol END), 0) FROM trades
+                                      WHERE mint = ? AND slot <= ? AND (slot < ? OR rowid < ?)""",
+                                   (mint_id, slot, slot, rowid)).fetchone()[0] / LAMPORTS   # bought before it, net of sells:
+                t["curve_sol"] = before if 0 <= before < 90 else None   # not virtual SOL over 30, which a mayhem coin's agent moves
         else:
             t["back"] += (sol - fee) / LAMPORTS
             t["tout"] += tok

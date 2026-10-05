@@ -38,8 +38,8 @@ def s(x: str) -> bytes:
 
 
 def trade_bytes(mint, user, buy, sol, tok, vsol, vtok, ts=1_790_000_000, quote=bytes(32), ix="buy", shareholders=0,
-                fee_recipient=bytes(32), creator=bytes(32), mayhem=False):
-    fee, cfee = int(sol * 0.0095), int(sol * 0.003)
+                fee_recipient=bytes(32), creator=bytes(32), mayhem=False, fees=True):
+    fee, cfee = (int(sol * 0.0095), int(sol * 0.003)) if fees else (0, 0)
     b = D_TRADE + mint + struct.pack("<QQ?", sol, tok, buy) + user + struct.pack("<qQQ", ts, vsol, vtok)
     b += struct.pack("<QQ", 0, 0) + fee_recipient + struct.pack("<QQ", 95, fee) + creator + struct.pack("<QQ", 30, cfee)
     b += struct.pack("<?QQQq", True, 0, 0, 0, 0) + s(ix)
@@ -368,6 +368,35 @@ def test_a_later_entry_buys_at_60_s_or_8_sol_and_sells_two_minutes_later(tmp_pat
     col.c.close()
 
 
+def test_the_8_sol_entry_waits_for_sol_bought_not_a_mayhem_agents_reserve_shift(tmp_path):
+    """On a mayhem coin pump.fun's agent trades at the curve's price, then moves its virtual SOL (mainnet 2026-09-30: a
+    0.12 SOL sell took 3fHgqgak from 32.9 to 23.6 virtual SOL), so virtual SOL over 30 is not what was bought."""
+    col = Collector(tmp_path / "pump.db")
+    dev, m, agent, A, B, C = (bytes([190 + i]) * 32 for i in range(6))
+    now = int(time.time()) - 3600
+
+    def trade(slot, dt, who, buy, sol, vsol, vtok):
+        col.on_logs(slot, logs(trade_bytes(m, who, buy, sol, 10**12, vsol, vtok, ts=now + dt, mayhem=True, fees=who != agent)))
+        return vsol, vtok
+
+    col.on_logs(1000, logs(create_bytes(m, dev, ts=now)))
+    trade(1001, 1, A, True, 10**9, 31 * 10**9, 1_038 * 10**12)                    # 1 SOL bought
+    pumped = trade(1010, 5, agent, True, 5 * 10**7, 45 * 10**9, 1_037 * 10**12)   # the agent's shift: 45 virtual, 1.05 bought
+    trade(1020, 10, agent, False, 10**8, 12 * 10**9, 1_040 * 10**12)              # and down to 12: 0.95 bought
+    trade(1100, 30, B, True, 4 * 10**9, 16 * 10**9, 780 * 10**12)                 # 4.95 bought
+    bought8 = trade(1200, 50, C, True, 32 * 10**8, 19_200_000_000, 644 * 10**12)  # 8.15 bought, still under 38 virtual
+    trade(1300, 80, A, False, 5 * 10**8, 18_700_000_000, 645 * 10**12)            # the first sell that pays a fee
+    col.flush()
+    mint, dev_id = (col.c.execute(q, (b58(k),)).fetchone()[0] for q, k in
+                    (("SELECT id FROM mints WHERE addr = ?", m), ("SELECT id FROM wallets WHERE addr = ?", dev)))
+    st = strategy_states(col.c, mint, 1000, now, dev_id, latency_slots=2, stake_sol=0.1, hold_s=900)
+    assert pumped[0] >= 38 * 10**9 > bought8[0]
+    assert st["c8"] == bought8                                # not the agent's pump, where virtual SOL first passed 38
+    assert "sol8_2m" in launch_pnl(st, 0.1, TX_COST_SOL)
+    assert abs(st["fee_in"] - 0.0125) < 1e-12 and abs(st["fee_out"] - 0.0125) < 1e-12   # the coin's fee, not the agent's 0
+    col.c.close()
+
+
 def test_a_launch_is_only_in_the_crew_cohort_once_the_crew_was_already_known():
     crew, bot = ["11", "22", "33"], "99"
     rows = [{"creator": "A", "buyers": ",".join(crew), "ts": t} for t in range(5)]        # the crew builds its record
@@ -431,6 +460,25 @@ def test_a_dossier_of_a_wallet_that_closed_nothing_yet_still_prints(tmp_path):
     assert "0 closed +0.000 SOL on 0.00 SOL spent (n/a), won n/a, median n/a SOL" in "\n".join(dossiers(db))   # 2026-09-26: it crashed the startup log
 
 
+def test_a_dossier_counts_the_sol_bought_before_an_entry_not_virtual_sol_over_30(tmp_path):
+    from hl_screener.pumpdossier import dossiers
+    from hl_screener.pumpfun import connect
+    db, L = tmp_path / "pump.db", 10**9
+    c = connect(db)
+    c.executemany("INSERT INTO wallets(id, addr) VALUES (?, ?)", [(1, "G"), (2, "M"), (3, "A"), (4, "agent")])
+    c.execute("INSERT INTO mints(id, addr, slot, ts, creator) VALUES (1, 'coin1', 100, 1000, 2)")
+    c.executemany("INSERT INTO trades(slot, ts, mint, wallet, buy, sol, tok, fee, vsol, vtok) VALUES (?,?,?,?,?,?,?,?,?,?)", [
+        (101, 1000, 1, 3, 1, L, 1000, 12_500_000, 31 * L, 1),   # 1 SOL bought
+        (102, 1001, 1, 4, 1, L // 20, 10, 0, 45 * L, 1),        # a mayhem coin's agent lifts virtual SOL to 45 on 0.05 SOL
+        (103, 1002, 1, 4, 0, L // 10, 10, 0, 12 * L, 1),        # and drops it to 12: 0.95 SOL really in the curve
+        (110, 1005, 1, 3, 1, L // 2, 500, 6_250_000, 25 * L // 2, 1),   # 0.5 more, earlier in G's own slot: 1.45
+        (110, 1005, 1, 1, 1, L, 1000, 12_500_000, 27 * L // 2, 1)])     # G's entry: virtual SOL over 30 says -17.5
+    c.execute("INSERT INTO follow(wallet, added_at, golden_now, golden_ever) VALUES ('G', 0, 1, 1)")
+    c.commit()
+    c.close()
+    assert "SOL already in the curve p50 1.45" in "\n".join(dossiers(db))
+
+
 def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():
     def launch(creator, buyers, ts=0):
         return {"creator": creator, "buyers": ",".join(buyers), "ts": ts}
@@ -453,6 +501,21 @@ def test_a_copy_pays_signature_priority_and_tip_on_both_transactions():
     free = copy_trade(entry, exit_, 0.1, 0.0)
     assert abs(free - copy_trade(entry, exit_, 0.1, TX_COST_SOL) - 2 * TX_COST_SOL) < 1e-12   # in and out
     assert 2 * TX_COST_SOL / 0.1 > 0.02                          # over 2% of the stake: it has to show up in the ranking
+
+
+def test_the_fee_free_mayhem_agent_is_not_a_sniper_to_copy(tmp_path):
+    db = tmp_path / "pump.db"
+    col = Collector(db)
+    A, agent, dev = (bytes([i]) * 32 for i in (104, 105, 106))
+    now = int(time.time())
+    for k in range(3):                                   # the agent snipes three tokens without a fee, A two with one
+        m, cv = bytes([120 + k]) * 32, Curve()
+        col.on_logs(1000 + 100 * k, logs(create_bytes(m, dev, ts=now)))
+        for who, fees in ((agent, False), (A, True))[:2 if k < 2 else 1]:
+            tok = cv.buy(10**8)
+            col.on_logs(1001 + 100 * k, logs(trade_bytes(m, who, True, 10**8, tok, cv.vsol, cv.vtok, ts=now, mayhem=True, fees=fees)))
+    col.flush()
+    assert [a for a, _ in update_snipers(db, top_n=2, window_h=24)] == [b58(A)]
 
 
 def test_top_snipers_rotate_and_a_dropped_one_still_exits(tmp_path):

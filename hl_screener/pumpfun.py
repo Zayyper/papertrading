@@ -76,7 +76,6 @@ FALLBACK_PER_DAY = 2           # at most this many a UTC day: Helius's free cred
 SNIPER_TOP = 5                 # snipers copied at any moment: the busiest of the window
 SNIPER_EVERY_S = 300           # how often that ranking is redone; it turns over fast
 SNIPER_WINDOW_H = 2.0          # the snipes it is ranked on
-CURVE_START_SOL = 30.0         # a fresh curve's virtual SOL: what is in it beyond this was bought
 LATE_STATES = ("x180", "e20", "e50", "c8", "c8x")   # the later entries' states, see _late_states
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -547,6 +546,7 @@ WITH recent AS MATERIALIZED (SELECT id, slot, creator FROM mints WHERE ts >= :si
 SELECT w.addr, COUNT(DISTINCT t.mint) AS snipes
 FROM recent m
 JOIN trades t INDEXED BY ix_trades_mint ON t.mint = m.id AND t.slot <= m.slot + :snipe AND t.buy = 1 AND t.wallet != m.creator
+                                        AND t.fee > 0
 JOIN wallets w ON w.id = t.wallet
 GROUP BY t.wallet ORDER BY snipes DESC LIMIT :top
 """     # MATERIALIZED: read the window's tokens first, then only the first slots of each, never the whole trades table
@@ -555,7 +555,9 @@ GROUP BY t.wallet ORDER BY snipes DESC LIMIT :top
 def update_snipers(db_path: str | Path, top_n: int = SNIPER_TOP, window_h: float = SNIPER_WINDOW_H,
                    snipe_slots: int = 2) -> list[tuple[str, int]]:
     """Follow the snipers of the moment: the `top_n` wallets that bought the most tokens within `snipe_slots` of
-    their creation over the last `window_h`, launchers excluded. That ranking turns over fast, so it is redone
+    their creation over the last `window_h`, launchers excluded, and fee-free buys: only pump.fun's mayhem agent buys the
+    curve without a fee, on nearly every mayhem coin, and its own trade moves the price after it, so a copy of it lands
+    on the move (-7 % a copy on 2026-09-21's trades). That ranking turns over fast, so it is redone
     every few minutes and a wallet is copied only while it is in the set; copies already open still exit on its
     sells. Unlike a golden wallet, which is followed for good, a sniper leaves the moment it drops out."""
     c = connect(db_path)
@@ -1301,8 +1303,9 @@ def _fee_rate(c: sqlite3.Connection, wallet: int, mint: int, buy: int, slot: int
 
 
 def _mint_fee_rate(c: sqlite3.Connection, mint: int, buy: int) -> float:
-    """The fee rate this token charges: 1.25 % on the curve, less on PumpSwap, and creators can set their own."""
-    row = c.execute("SELECT fee * 1.0 / sol FROM trades WHERE mint=? AND buy=? AND sol > 0 LIMIT 1", (mint, buy)).fetchone()
+    """The fee rate this token charges: 1.25 % on the curve, less on PumpSwap, and creators can set their own. From a trade
+    that paid one: pump.fun's mayhem agent trades fee-free, and on most mayhem coins its sell is the first."""
+    row = c.execute("SELECT fee * 1.0 / sol FROM trades WHERE mint=? AND buy=? AND sol > 0 AND fee > 0 LIMIT 1", (mint, buy)).fetchone()
     return row[0] if row and row[0] is not None else FEE
 
 
@@ -1331,9 +1334,13 @@ def strategy_states(c: sqlite3.Connection, mint: int, cslot: int, cts: int, crea
     tokens = entry[1] - entry[0] * entry[1] / (entry[0] + stake_sol * LAMPORTS / (1 + fee_in))
     if tokens <= 0:
         return None
-    path = c.execute("""SELECT slot, vsol, vtok, wallet, buy, ts FROM trades
-                        WHERE mint = ? AND slot >= ? AND slot <= ? ORDER BY slot, rowid""",
-                     (mint, cslot + latency_slots, cslot + max(1, int(hold_s / 0.4)))).fetchall()
+    # ponytail: `bought` sums the stored trades, so one the feed missed shifts it; store TradeEvent.real_sol_reserves if that bites
+    path = c.execute("""SELECT slot, vsol, vtok, wallet, buy, ts, bought FROM (
+                            SELECT slot, vsol, vtok, wallet, buy, ts, rowid AS r,
+                                   SUM(CASE WHEN buy THEN sol ELSE -sol END) OVER (ORDER BY slot, rowid) AS bought
+                            FROM trades WHERE mint = ? AND slot <= ?)
+                        WHERE slot >= ? ORDER BY slot, r""",
+                     (mint, cslot + max(1, int(hold_s / 0.4)), cslot + latency_slots)).fetchall()
 
     def land(i: int) -> tuple[int, int]:
         """The reserves our order reaches: the last state before it lands, `latency_slots` after path[i]."""
@@ -1369,7 +1376,8 @@ def _late_states(path: list, land, cts: int, entry60: tuple[int, int] | None, la
 
     x180     in at 60 s (the s60 state), out 2 minutes after that
     e20/e50  that position worth +20 % / +50 % before the 2 minutes are up
-    c8, c8x  in once 8 SOL is in the curve, out 2 minutes after that"""
+    c8, c8x  in once 8 SOL is in the curve, out 2 minutes after that: SOL bought net of sells since creation (`path`'s
+             last column), not virtual SOL over the 30 a curve starts at, which a mayhem coin's agent moves without buying"""
     last_by = lambda t: next((i for i in range(len(path) - 1, -1, -1) if path[i][5] <= t), None)   # noqa: E731
     out: dict[str, Any] = {k: None for k in LATE_STATES}
     i60 = last_by(cts + 60)
@@ -1382,7 +1390,7 @@ def _late_states(path: list, land, cts: int, entry60: tuple[int, int] | None, la
             j = next((j for j in range(i60 + 1, k + 1) if path[j][0] >= landed
                       and _value((path[j][1], path[j][2]), tokens, fee_out) >= (1 + tp) * stake_sol), None)
             out[key] = land(j) if j is not None else None
-    c = next((i for i, r in enumerate(path) if r[1] >= (CURVE_START_SOL + curve_sol) * LAMPORTS), None)
+    c = next((i for i, r in enumerate(path) if r[6] >= curve_sol * LAMPORTS), None)
     if c is not None:
         out["c8"], out["c8x"] = land(c), land(last_by(path[c][5] + hold_s))
     return out
