@@ -22,13 +22,18 @@ services:
       SOLANA_WS_URL: ${SOLANA_WS_URL:-}               # blank = Solana's public endpoint (free, about 1 slot behind the chain)
       SOLANA_WS_FALLBACK: ${SOLANA_WS_FALLBACK:-}     # e.g. a Helius URL: used only after the main feed fails twice in a row, for 15 min
       PUMP_RETENTION_DAYS: ${PUMP_RETENTION_DAYS:-2}  # about 1.2 GB per day of trades; under 3 GB free only 36 h are kept, under 1 GB storing pauses
-      PUMP_LIVE: ${PUMP_LIVE:-dry}                    # dry: every copy simulated, nothing sent | live: real trades (needs the next two) | off
-      PUMP_LIVE_KEY: ${PUMP_LIVE_KEY:-}               # live only: base58 secret key of a wallet used for nothing else; set in Coolify, never in git
+      PUMP_LIVE: ${PUMP_LIVE:-dry}                    # dry: every copy simulated, nothing sent | live: real trades (needs the next two) | exit: no new copies, the open ones sold | off
+      PUMP_LIVE_KEY: ${PUMP_LIVE_KEY:-}               # live and exit: base58 secret key of a wallet used for nothing else; set in Coolify, never in git
       PUMP_LIVE_WALLETS: ${PUMP_LIVE_WALLETS:-}       # whom to copy, comma-separated (dry with none: every golden wallet)
       PUMP_LIVE_STAKE_SOL: ${PUMP_LIVE_STAKE_SOL:-0.25}
       PUMP_LIVE_MAX_OPEN: ${PUMP_LIVE_MAX_OPEN:-3}
       PUMP_LIVE_DAY_LOSS_SOL: ${PUMP_LIVE_DAY_LOSS_SOL:-0.5}
-      PUMP_LIVE_RPC: ${PUMP_LIVE_RPC:-}               # an HTTPS RPC for reads: gap checks, simulations, blockhashes; blank = the public endpoint
+      PUMP_LIVE_RPC: ${PUMP_LIVE_RPC:-}               # an HTTPS RPC for the live copies' reads: simulations, blockhashes, balances, lookups; blank = the public endpoint
+      PUMP_GAP_RPC: ${PUMP_GAP_RPC:-}                 # the gap checks' reads (about 2 a second after each feed drop); blank = the public endpoint, never PUMP_LIVE_RPC
+      PUMP_LIVE_SEND: ${PUMP_LIVE_SEND:-}             # where signed transactions go, comma-separated; blank = Helius Sender, keyless (1 a second per IP)
+      PUMP_LIVE_BUY_SLIP: ${PUMP_LIVE_BUY_SLIP:-}     # blank = 0.25: a buy fails rather than get 25 % fewer tokens than priced
+      PUMP_LIVE_SELL_SLIP: ${PUMP_LIVE_SELL_SLIP:-}   # blank = 0.5: sell tries 1-2 take up to 50 % less SOL than priced; the last try takes any price
+      PUMP_LIVE_SIM_SIGNER: ${PUMP_LIVE_SIM_SIGNER:-} # dry only: simulate as this funded address; blank = as the copied wallet
     volumes:
       - hl-data:/app/data
 

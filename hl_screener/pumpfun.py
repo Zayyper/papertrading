@@ -149,7 +149,8 @@ def parse_trade(b: bytes) -> dict[str, Any] | None:
         r.skip(1 + 8 * 4)                         # track_volume, (un)claimed tokens, current_sol_volume, last_update
         ix = r.string()                           # ix_name
         mayhem = r.take("<?")
-        r.skip(8 * 4)                             # cashback and buyback bps/amounts
+        cashback_bps = r.take("<Q")               # > 0 on a cashback coin: its sells name more accounts
+        r.skip(8 * 3)                             # cashback amount, buyback bps/amount
         r.skip(34 * r.take("<I"))                 # shareholders: vec<(pubkey, u16)>
         quote = r.pk()
         r.skip(8 * 5)                             # quote amount/reserves, holder rewards
@@ -158,8 +159,8 @@ def parse_trade(b: bytes) -> dict[str, Any] | None:
     if not _whole(r, (0, TRADE_TAIL)) or not _name(ix):
         return None
     return {"mint": mint, "user": user, "buy": is_buy, "sol": sol, "tok": tok, "fee": fee, "ts": ts,
-            "vsol": vsol, "vtok": vtok, "sol_quote": quote == SOL_QUOTE,
-            "fee_recipient": fee_recipient, "creator": creator, "mayhem": mayhem, "ix": ix}   # what a live copy's transaction needs
+            "vsol": vsol, "vtok": vtok, "sol_quote": quote == SOL_QUOTE, "fee_recipient": fee_recipient, "creator": creator,
+            "mayhem": mayhem, "cashback_bps": cashback_bps, "ix": ix}   # what a live copy's transaction needs
 
 
 def parse_create(b: bytes) -> dict[str, Any] | None:
@@ -205,7 +206,8 @@ def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
         if buy:
             r.skip(1 + 8 * 4 + 8)                 # track_volume, volume totals, min_base_amount_out
             ix = r.string()                       # ix_name
-        r.skip(8 * 4)                             # cashback and buyback bps/amounts
+        cashback_bps = r.take("<Q")
+        r.skip(8 * 3)                             # cashback amount, buyback bps/amount
         vq = int.from_bytes(r.b[r.o:r.o + 16], "little", signed=True)
         r.skip(16 + 1 + 8 + 16)                   # virtual_quote_reserves, can_boost, base_supply, holder rewards
     except (struct.error, ValueError):
@@ -218,7 +220,7 @@ def parse_amm_trade(b: bytes) -> dict[str, Any] | None:
     else:
         vtok, vsol, fee = B + base, Q - q_net + vq, q - user_q
     return {"pool": pool, "user": user, "buy": buy, "sol": q, "tok": base, "fee": max(fee, 0), "ts": ts, "vsol": vsol, "vtok": vtok,
-            "fee_recipient": fee_recipient, "creator": creator}
+            "fee_recipient": fee_recipient, "creator": creator, "cashback_bps": cashback_bps}
 
 
 def parse_create_pool(b: bytes) -> dict[str, Any] | None:
@@ -648,8 +650,11 @@ class Collector:
             self.pool_feed.add(pool, last or 0.0)
 
     def _pinned_pools(self) -> set[str]:
-        """Pools where a paper copy is open or on its way: their leader's sell must still reach us."""
+        """Pools where a copy, paper or live, is open or on its way: their leader's sell, and a sale by hand of a live
+        copy, must still reach us. A live copy pins its own pool: the paper's may have closed, or never opened."""
         open_ = {m for (_, m) in self.paper.pos} | set(self.paper.pending)
+        if self.live is not None:
+            open_ |= set(self.live.pos) | {o["mint"] for o in self.live._orders()}
         return {p for p, m in self.pools.items() if m in open_}
 
     def wallet_id(self, addr: str) -> int:
@@ -1125,18 +1130,23 @@ def _best(rules: list[dict[str, Any]] | None) -> str:
 def collect(db_path: str | Path, ws_url: str, retention_days: float, report_every_s: float = 1800,
             fallback_url: str | None = None, sniper_every_s: float = SNIPER_EVERY_S, sniper_top: int = SNIPER_TOP) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
-    col = Collector(db_path, ws_url, retention_days, fallback_url, rpc_url=os.environ.get("PUMP_LIVE_RPC") or PUBLIC_RPC)
+    logging.getLogger("hl_screener.pumplive").setLevel(logging.INFO)    # the live copies' sent, bought, sold and skipped lines
+    # the gap checks read about twice a second: on the public RPC, not on PUMP_LIVE_RPC, where a keyed free plan's
+    # credits would last days and the live copies' own reads would be refused with them
+    col = Collector(db_path, ws_url, retention_days, fallback_url, rpc_url=os.environ.get("PUMP_GAP_RPC") or PUBLIC_RPC)
     col.paper.sniper_cfg = {"top": sniper_top, "every_s": sniper_every_s, "window_h": SNIPER_WINDOW_H}
     from .pumplive import LiveCfg, LiveFollow, live_lines, load_keypair   # here: those modules build on this one
     from .pumpgo import go_lines
     try:
         live = LiveCfg.from_env()
         if live.mode != "off":
-            col.live = LiveFollow(col.c, live, keypair=load_keypair() if live.mode == "live" else None)
+            col.live = LiveFollow(col.c, live, keypair=load_keypair() if live.sends else None)
             who = ", ".join(sorted(live.wallets)) or "the golden wallets"
-            print(f"live copies: {live.mode}{f' from {col.live.me}' if col.live.me else ''}, copying {who} with "
-                  f"{live.stake_sol:g} SOL" + (f", at most {live.max_open} open, new copies stop after {live.day_loss_sol:g} SOL "
-                  f"lost in a day" if live.mode == "live" else ", simulated, nothing sent"), flush=True)
+            print(f"live copies: {live.mode}{f' from {col.live.me}' if col.live.me else ''}, " + (
+                  f"winding down: no new copies, the {len(col.live.pos)} open ones sold as their wallets sell"
+                  if live.mode == "exit" else f"copying {who} with {live.stake_sol:g} SOL" + (
+                      f", at most {live.max_open} open, new copies stop after {live.day_loss_sol:g} SOL lost in a day"
+                      if live.mode == "live" else ", simulated, nothing sent")), flush=True)
     except Exception as e:  # noqa: BLE001 - a bad setting must not stop the collector; the key never reaches the message
         log.error("live copies off: %s", e)
     print(f"pump collector: {col.stats['ws']}{' (fallback feed set)' if fallback_url else ''}, keeping {retention_days:g} days, "

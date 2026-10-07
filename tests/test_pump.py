@@ -20,12 +20,12 @@ def b58decode(s: str) -> bytes:
     return n.to_bytes(32, "big")
 
 
-def amm_bytes(buy, pool, user, base, B, Q, q, lp, q_net, user_q, vq=0, ix="buy"):
+def amm_bytes(buy, pool, user, base, B, Q, q, lp, q_net, user_q, vq=0, ix="buy", cashback=0):
     b = (D_BUY if buy else D_SELL) + struct.pack("<q", 1_790_000_000)
     b += struct.pack("<13Q", base, 0, 0, 0, B, Q, q, 20, lp, 5, 0, q_net, user_q) + pool + user + bytes(32 * 5) + struct.pack("<QQ", 30, 0)
     if buy:
         b += struct.pack("<?QQQqQ", False, 0, 0, 0, 0, 0) + s(ix)
-    return b + struct.pack("<4Q", 0, 0, 0, 0) + vq.to_bytes(16, "little", signed=True) + struct.pack("<?QQQ", False, 0, 0, 0)
+    return b + struct.pack("<4Q", cashback, 0, 0, 0) + vq.to_bytes(16, "little", signed=True) + struct.pack("<?QQQ", False, 0, 0, 0)
 
 
 def pool_bytes(pool, base_mint, quote_mint):
@@ -38,12 +38,12 @@ def s(x: str) -> bytes:
 
 
 def trade_bytes(mint, user, buy, sol, tok, vsol, vtok, ts=1_790_000_000, quote=bytes(32), ix="buy", shareholders=0,
-                fee_recipient=bytes(32), creator=bytes(32), mayhem=False, fees=True):
+                fee_recipient=bytes(32), creator=bytes(32), mayhem=False, fees=True, cashback=0):
     fee, cfee = (int(sol * 0.0095), int(sol * 0.003)) if fees else (0, 0)
     b = D_TRADE + mint + struct.pack("<QQ?", sol, tok, buy) + user + struct.pack("<qQQ", ts, vsol, vtok)
     b += struct.pack("<QQ", 0, 0) + fee_recipient + struct.pack("<QQ", 95, fee) + creator + struct.pack("<QQ", 30, cfee)
     b += struct.pack("<?QQQq", True, 0, 0, 0, 0) + s(ix)
-    b += struct.pack("<?QQQQ", mayhem, 0, 0, 0, 0) + struct.pack("<I", shareholders) + bytes(34 * shareholders)
+    b += struct.pack("<?QQQQ", mayhem, cashback, 0, 0, 0) + struct.pack("<I", shareholders) + bytes(34 * shareholders)
     return b + quote + struct.pack("<5Q", 0, 0, 0, 0, 0)
 
 
@@ -99,6 +99,23 @@ def test_todays_events_parse_with_the_field_pump_fun_appended():
         a = parse_amm_trade(raw)
         assert a and a["buy"] is buy and b58(a["user"]) == signer and a["sol"] > 0 and a["tok"] > 0 and a["vsol"] > 0
         assert a == parse_amm_trade(raw[:-8])
+
+
+def test_a_cashback_coin_is_known_by_its_trades():
+    """A cashback coin's sells name the seller's volume accumulator, and its PumpSwap buys that account's wrapped SOL:
+    without them InvalidCashbackAccumulator (mainnet simulations, 2026-10-07). Its trade events carry the cashback fee,
+    30 bps on the curve and 95 on PumpSwap, 0 on every other coin, in the first of the four u64 after the mayhem flag."""
+    from hl_screener.pumptx import coin_of
+    mint, user, pool = bytes([1]) * 32, bytes([2]) * 32, bytes([3]) * 32
+    plain = trade_bytes(mint, user, False, 10**9, 5 * 10**12, 31 * 10**9, 10**15)
+    cash = trade_bytes(mint, user, False, 10**9, 5 * 10**12, 31 * 10**9, 10**15, cashback=30)
+    assert len(cash) == len(plain) and parse_trade(cash + bytes(8)) == parse_trade(cash)    # the same layout and tail
+    assert coin_of(b58(mint), parse_trade(cash))["cashback"] is True
+    assert coin_of(b58(mint), parse_trade(plain))["cashback"] is False
+    for buy in (True, False):
+        args = (buy, pool, user, 10**9, 10**15, 40 * 10**9, 10**9, 0, 10**9, 10**9)
+        assert coin_of(b58(mint), parse_amm_trade(amm_bytes(*args, cashback=95)))["cashback"] is True
+        assert coin_of(b58(mint), parse_amm_trade(amm_bytes(*args)))["cashback"] is False
 
 
 class Curve:

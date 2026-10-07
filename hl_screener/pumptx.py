@@ -41,8 +41,9 @@ BUY_EXACT_QUOTE_IN = bytes.fromhex("c62e1552b4d9e870")                     # sha
 # where each global account keeps its recipient lists: (byte offset, count)
 PUMP_LISTS = {"fee": ((41, 1), (162, 7)), "reserved": ((483, 1), (516, 7)), "buyback": ((741, 8),)}
 AMM_LISTS = {"fee": ((57, 8),), "reserved": ((385, 1), (418, 7)), "buyback": ((643, 8),)}
-# compute-unit limits: the most seen on mainnet on 2026-09-26, x1.3
-CURVE_BUY_CU, CURVE_SELL_CU, POOL_BUY_CU, POOL_SELL_CU = 130_000, 90_000, 165_000, 145_000
+# compute-unit limits: the most seen on mainnet on 2026-09-26, x1.3; a cashback pool buy used 151,241 (2026-10-07), so
+# PumpSwap buys get 200,000. The priority fee is set for the whole limit: a higher one costs nothing more.
+CURVE_BUY_CU, CURVE_SELL_CU, POOL_BUY_CU, POOL_SELL_CU = 130_000, 90_000, 200_000, 145_000
 # around each swap, the paper copies' costs (pumpfun.PRIORITY_SOL, TIP_SOL): Helius Sender's minimum tip, to its accounts
 PRIORITY_LAMPORTS = 500_000
 TIP_LAMPORTS = 1_000_000
@@ -233,10 +234,12 @@ def sell_ixs(coin: dict[str, Any], user: str, tok: int, min_sol: int, tp: str, g
 # prices and events
 # ---------------------------------------------------------------------------
 def coin_of(mint: str, e: dict[str, Any]) -> dict[str, Any]:
-    """What a trade of this coin needs, from a trade event: the reserves it left, and the accounts it named."""
+    """What a trade of this coin needs, from a trade event: the reserves it left, and the accounts it named. A cashback
+    coin's trades pay a cashback fee (30 bps on the curve, 95 on PumpSwap, 2026-10-07): its sells and pool buys name more."""
     from .pumpfun import FEE, b58
     return {"mint": mint, "pool": b58(e["pool"]) if "pool" in e else None, "creator": b58(e["creator"]),
-            "fee_recipient": b58(e["fee_recipient"]), "mayhem": bool(e.get("mayhem")), "vsol": e["vsol"], "vtok": e["vtok"],
+            "fee_recipient": b58(e["fee_recipient"]), "mayhem": bool(e.get("mayhem")), "cashback": e.get("cashback_bps", 0) > 0,
+            "vsol": e["vsol"], "vtok": e["vtok"],
             "fee": max(FEE, e["fee"] / e["sol"]) if e["sol"] and e["fee"] > 0 else FEE}   # a PumpSwap buy logs ~0 fee
 
 
@@ -308,8 +311,16 @@ def sim_error(res: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # JSON-RPC
 # ---------------------------------------------------------------------------
+HASH_KEEP_S = 45.0       # a blockhash older than this is not sent with, even when a fresh one cannot be read
+
+
 class RpcError(Exception):
     pass
+
+
+class Refused(RpcError):
+    """The endpoint answered, and said no: a client error status (429 among them) or a JSON-RPC error. A transaction it
+    refused did not go out there. A 5xx, a timeout or a dropped connection says nothing of the sort."""
 
 
 class Rpc:
@@ -327,10 +338,10 @@ class Rpc:
         r = self.local.http.post(url or self.url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                                  timeout=self.timeout)
         if r.status_code != 200:
-            raise RpcError(f"{method}: HTTP {r.status_code}")
+            raise (Refused if r.status_code < 500 else RpcError)(f"{method}: HTTP {r.status_code}")
         body = r.json()
         if "error" in body:
-            raise RpcError(f"{method}: {str(body['error'])[:200]}")
+            raise Refused(f"{method}: {str(body['error'])[:200]}")
         return body["result"]
 
     def account(self, addr: str) -> tuple[str, bytes] | None:
@@ -345,27 +356,37 @@ class Rpc:
         return {**res["value"], "slot": res["context"]["slot"]}
 
     def send(self, tx) -> str:
-        """Send a signed transaction to every endpoint at once; its signature, whichever gets it in."""
+        """Send a signed transaction to every endpoint at once; its signature, whichever gets it in. Refused when every
+        endpoint said no: nothing went out. Any other failure (a timeout, a dropped connection, a 5xx) may hide an
+        endpoint that took it: RpcError, and only a lookup of the signature knows."""
         from concurrent.futures import ThreadPoolExecutor
         raw = base64.b64encode(bytes(tx)).decode()
         params = [raw, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}]
         with ThreadPoolExecutor(max_workers=len(self.send_urls)) as pool:
-            outcomes = list(pool.map(lambda u: self._try(u, params), self.send_urls))
-        if all(o is not None for o in outcomes):
-            raise RpcError("; ".join(outcomes))
+            errors = [e for e in pool.map(lambda u: self._try(u, params), self.send_urls) if e is not None]
+        if len(errors) == len(self.send_urls):
+            text = "; ".join(f"{u.split('?')[0]}: {type(e).__name__}: {str(e)[:120]}" for u, e in errors)
+            raise (Refused if all(isinstance(e, Refused) for _, e in errors) else RpcError)(text)
         return str(tx.signatures[0])
 
-    def _try(self, url: str, params: list) -> str | None:
+    def _try(self, url: str, params: list) -> tuple[str, Exception] | None:
         try:
             self.call("sendTransaction", params, url)
             return None
         except Exception as e:  # noqa: BLE001 - one endpoint down is fine while another takes it
-            return f"{url.split('?')[0]}: {type(e).__name__}: {str(e)[:120]}"
+            return url, e
 
     def blockhash(self, max_age_s: float = 20.0):
+        """A recent blockhash, read again once older than `max_age_s`. A read refused keeps the last one while it is
+        under HASH_KEEP_S old: a blockhash lands for about 150 slots (~60 s), and a sell must not wait on a rate limit."""
         from solders.hash import Hash
         if self._hash is None or time.time() - self._hash[0] > max_age_s:
-            v = self.call("getLatestBlockhash", [{"commitment": "confirmed"}])["value"]
+            try:
+                v = self.call("getLatestBlockhash", [{"commitment": "confirmed"}])["value"]
+            except Exception:
+                if self._hash is None or time.time() - self._hash[0] > HASH_KEEP_S:
+                    raise
+                return self._hash[1]
             self._hash = (time.time(), Hash.from_string(v["blockhash"]))
         return self._hash[1]
 

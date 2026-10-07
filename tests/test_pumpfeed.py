@@ -375,3 +375,31 @@ def test_copies_of_two_sizes_count_by_the_sol_put_in_and_the_new_size_is_logged_
     assert paper_lines(db) == [
         "paper golden: 1 wallets, 3 copies (2 closed), -0.036 SOL = -6.0% per copy, won 50%; the wallets themselves n/a",
         "paper golden G at 0.25 SOL: 2 copies (1 closed), -0.053 SOL = -21.2% per closed copy, won 0%"]
+
+
+def test_the_collector_logs_the_live_copies_and_reads_gaps_on_the_public_rpc_whatever_the_live_one(tmp_path, monkeypatch):
+    """The live copies' trades are logged at INFO, which the container's WARNING default dropped; and the gap checks
+    (two reads a second) stay off PUMP_LIVE_RPC, where a keyed free plan would run out of credits in days."""
+    import logging
+
+    from hl_screener import pumpfun
+    seen = {}
+
+    async def run(self, stop=None):
+        seen["gap_rpc"] = self.rpc.url
+        seen["live_info"] = logging.getLogger("hl_screener.pumplive").isEnabledFor(logging.INFO)
+
+    monkeypatch.setattr(Collector, "run", run)
+    monkeypatch.setenv("PUMP_LIVE", "off")
+    monkeypatch.setenv("PUMP_LIVE_RPC", "https://keyed.example/?api-key=k")
+    monkeypatch.delenv("PUMP_GAP_RPC", raising=False)
+    levels = {n: logging.getLogger(n).level for n in ("hl_screener.pumpfun", "hl_screener.pumplive")}
+    try:
+        pumpfun.collect(tmp_path / "pump.db", pumpfun.PUBLIC_WS, 2, sniper_every_s=3600)
+        assert seen == {"gap_rpc": pumpfun.PUBLIC_RPC, "live_info": True}
+        monkeypatch.setenv("PUMP_GAP_RPC", "https://gaps.example")
+        pumpfun.collect(tmp_path / "pump.db", pumpfun.PUBLIC_WS, 2, sniper_every_s=3600)
+        assert seen["gap_rpc"] == "https://gaps.example"
+    finally:
+        for n, level in levels.items():
+            logging.getLogger(n).setLevel(level)

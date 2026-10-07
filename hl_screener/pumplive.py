@@ -6,9 +6,11 @@ PaperFollow's rule, so the two compare copy for copy. PUMP_LIVE picks the mode:
     dry   (the default) each copy's buy is built and simulated by the RPC the moment it would be sent, on the chain's
           newest state: no key, nothing sent. It says whether the transaction would have gone through, what it would
           have bought next to the paper copy, and how fast the tool had it ready.
-    live  signed with PUMP_LIVE_KEY and sent through PUMP_LIVE_SEND (Helius Sender and Jito by default). Only
+    live  signed with PUMP_LIVE_KEY and sent through PUMP_LIVE_SEND (Helius Sender by default). Only
           PUMP_LIVE_WALLETS are copied, at most PUMP_LIVE_MAX_OPEN at a time, and new copies stop for the UTC day once
           PUMP_LIVE_DAY_LOSS_SOL is lost. Sells always go out: up to three tries, the last one at any price.
+    exit  live, but no new copies: the open ones are sold as their wallets sell (or after MAX_HOLD_S). The way out of
+          live mode: dry never sells, off forgets the copies, and both leave them open.
     off   nothing.
 
 The key is read from the server's environment in live mode only, where its owner put it: it never reaches the
@@ -24,13 +26,14 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, TIP_ACCOUNTS, TIP_LAMPORTS, Rpc,
+from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
                      buy_ixs, coin_of, compose, fresh_coin, own_trade, parse_global, sell_ixs, sim_error, sol_for, tokens_for)
 
 log = logging.getLogger(__name__)
 
-SENDERS = ("https://sender.helius-rpc.com/fast",                               # keyless, free, needs the 0.001 SOL tip
-           "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions")  # keyless, 1 a second per IP
+# keyless, free, needs the 0.001 SOL tip, 1 a second per IP. Jito's own endpoint left out (2026-10-07): it wants a tip to
+# one of its accounts, Helius forwards to Jito already, and its 200 could hide a Helius refusal as 'sent' for 90 s.
+SENDERS = ("https://sender.helius-rpc.com/fast",)
 LIVE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS lorders (id INTEGER PRIMARY KEY, mode TEXT, wallet TEXT, mint TEXT, side TEXT, venue TEXT,
     trigger_slot INTEGER, seen REAL, ready REAL, done REAL, slot INTEGER, sig TEXT, status TEXT, err TEXT, sol REAL,
@@ -44,6 +47,8 @@ LOOK_EVERY_S = 5         # and again this often (getTransaction: 10 calls per 10
 EXPIRE_S = 90            # a blockhash lasts 60-90 s: a transaction still unknown after this never landed
 SELL_TRIES = 3           # the last try takes whatever the coin pays and leaves the token account open
 RETRY_WAIT_S = 2.0       # between a failed sell and its next try: three tries within a second would meet the same rate limit
+UNSENT_MAX = 8           # a sell that could not go out (an RPC read or every send refused) tries again this often, waiting
+UNSENT_WAIT_S = 30.0     # RETRY_WAIT_S doubling up to this, about 2.5 min in all, before the attempt counts as one of its tries
 MAX_HOLD_S = 12 * 3600   # a copy whose wallet never sells (it moved its tokens?) is sold after this long
 RESERVE_SOL = 0.02       # left in the wallet for fees and new token accounts' rent
 LISTS_TTL_S = 3600       # fee and buyback recipient lists, re-read this often
@@ -51,7 +56,7 @@ LISTS_TTL_S = 3600       # fee and buyback recipient lists, re-read this often
 
 @dataclass(frozen=True)
 class LiveCfg:
-    mode: str = "dry"                          # off | dry | live
+    mode: str = "dry"                          # off | dry | live | exit
     wallets: frozenset[str] = frozenset()      # whom to copy; dry with none set: every golden wallet
     stake_sol: float = 0.25
     max_open: int = 3                          # copies open or on their way at once
@@ -62,12 +67,17 @@ class LiveCfg:
     send_urls: tuple[str, ...] = SENDERS
     sim_signer: str | None = None              # dry: simulate as this address (a funded wallet), else as the copied wallet
 
+    @property
+    def sends(self) -> bool:
+        """Signs and sends: live, and exit, which only sells what is open."""
+        return self.mode in ("live", "exit")
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "LiveCfg":
         env = os.environ if env is None else env
         mode = (env.get("PUMP_LIVE") or "dry").strip().lower()
-        if mode not in ("off", "dry", "live"):
-            raise ValueError(f"PUMP_LIVE must be off, dry or live, not {mode!r}")
+        if mode not in ("off", "dry", "live", "exit"):
+            raise ValueError(f"PUMP_LIVE must be off, dry, live or exit, not {mode!r}")
         listed = lambda k: tuple(x.strip() for x in (env.get(k) or "").split(",") if x.strip())    # noqa: E731
         num = lambda k, d: float(env.get(k) or d)                                                  # noqa: E731
         cfg = cls(mode=mode, wallets=frozenset(listed("PUMP_LIVE_WALLETS")), stake_sol=num("PUMP_LIVE_STAKE_SOL", 0.25),
@@ -79,8 +89,8 @@ class LiveCfg:
                 or cfg.day_loss_sol <= 0:
             raise ValueError("PUMP_LIVE_STAKE_SOL must be in (0, 5], the slippages in [0, 1), PUMP_LIVE_MAX_OPEN at least 1 "
                              "and PUMP_LIVE_DAY_LOSS_SOL above 0")
-        if mode == "live" and not ((env.get("PUMP_LIVE_KEY") or "").strip() and cfg.wallets):
-            raise ValueError("PUMP_LIVE=live needs PUMP_LIVE_KEY and PUMP_LIVE_WALLETS")
+        if cfg.sends and not ((env.get("PUMP_LIVE_KEY") or "").strip() and cfg.wallets):
+            raise ValueError(f"PUMP_LIVE={mode} needs PUMP_LIVE_KEY and PUMP_LIVE_WALLETS")
         return cfg
 
 
@@ -104,18 +114,21 @@ class LiveFollow:
     def __init__(self, c, cfg: LiveCfg, rpc: Rpc | None = None, workers=None, keypair=None) -> None:
         import threading
         from concurrent.futures import ThreadPoolExecutor
-        if cfg.mode == "live" and keypair is None:
+        if cfg.sends and keypair is None:
             raise ValueError("live copies need the wallet's keypair")
         self.c, self.cfg = c, cfg
         c.executescript(LIVE_SCHEMA)
         self.rpc = rpc or Rpc(cfg.rpc_url, cfg.send_urls)
-        self.kp = keypair if cfg.mode == "live" else None
+        self.kp = keypair if cfg.sends else None
         self.me = str(self.kp.pubkey()) if self.kp is not None else None     # the address only: never the key itself
         self.fill_lock = threading.Lock()
         self.workers = workers or ThreadPoolExecutor(max_workers=4, thread_name_prefix="pumplive")
         self.jobs: list[tuple[dict[str, Any], Any]] = []
         self.targets: set[str] = set(cfg.wallets)
         self.copied = set(c.execute("SELECT wallet, mint FROM lorders WHERE side = 'buy' AND mode = ?", (cfg.mode,)))
+        if cfg.sends:            # a coin the dry run or the paper already copied of that wallet: its next buy is an add, no first buy
+            self.copied |= set(c.execute("SELECT wallet, mint FROM lorders WHERE side = 'buy' UNION "
+                                         "SELECT wallet, mint FROM pfills WHERE side = 'buy'"))
         self.pos = {m: {"wallet": w, "tok": tok, "cost": cost, "opened": opened, "stuck": stuck} for m, w, tok, cost, opened, stuck
                     in c.execute("SELECT mint, wallet, tok, cost, opened, stuck FROM lpos")}
         cols = ("id", "wallet", "mint", "side", "venue", "trigger_slot", "seen", "done", "sig", "tries")
@@ -185,7 +198,7 @@ class LiveFollow:
         coin = self.coins[mint]
         o = {"wallet": wallet, "mint": mint, "side": "buy", "venue": "pool" if coin["pool"] else "curve",
              "trigger_slot": slot, "seen": time.time(), "tries": 1}
-        why = self._blocked() if self.cfg.mode == "live" else None
+        why = ("winding down" if self.cfg.mode == "exit" else self._blocked()) if self.cfg.sends else None
         if why:
             self._record(o, status="skipped", err=why)
             log.info("live: not copying %s's buy of %s: %s", wallet, mint, why)
@@ -200,8 +213,8 @@ class LiveFollow:
 
     def _sell(self, mint: str, slot: int | None, why: str, tries: int = 1) -> None:
         p = self.pos[mint]
-        if self._busy(mint) or (p.get("stuck") and tries == 1):
-            return                                          # a sell is on its way, or three failed: left to the owner
+        if self._busy(mint) or any(r[1] == mint for r in self.retries) or (p.get("stuck") and tries == 1):
+            return                                          # a sell is on its way or due again, or three failed: left to the owner
         coin = None if tries > 1 else self.coins.get(mint)  # a retry, or a coin no trade has shown: read from the chain
         o = {"wallet": p["wallet"], "mint": mint, "side": "sell", "venue": ("pool" if coin["pool"] else "curve") if coin else None,
              "trigger_slot": slot, "seen": time.time(), "tries": tries}
@@ -219,18 +232,37 @@ class LiveFollow:
 
     def _send(self, o: dict[str, Any], signer: str, build) -> dict[str, Any]:
         """On a worker thread: build, then simulate (dry) or sign and send (live)."""
+        if self.cfg.sends:
+            return self._send_live(o, signer, build)
         ixs, cu, extra = build(self._token_program(o["mint"]))
         tip = random.choice(TIP_ACCOUNTS)
-        if self.cfg.mode == "dry":
-            ready = time.time()
-            res = self.rpc.simulate(compose(signer, ixs, cu_limit=cu, tip_to=tip, tip_lamports=TIP_LAMPORTS))
-            got, ok = own_trade(res.get("logs") or [], signer), res.get("err") is None
-            return {**extra, "status": "sim_ok" if ok else "sim_err", "err": None if ok else sim_error(res), "ready": ready,
-                    "units": res.get("unitsConsumed"), "slot": res.get("slot"),
-                    "sol": (got["sol"] + got["fee"]) / 1e9 if got else None, "tok": got.get("tok")}
-        tx = compose(signer, ixs, self.rpc.blockhash(), self.kp, cu_limit=cu, tip_to=tip, tip_lamports=TIP_LAMPORTS)
         ready = time.time()
-        return {**extra, "status": "sent", "sig": self.rpc.send(tx), "ready": ready}
+        res = self.rpc.simulate(compose(signer, ixs, cu_limit=cu, tip_to=tip, tip_lamports=TIP_LAMPORTS))
+        got, ok = own_trade(res.get("logs") or [], signer), res.get("err") is None
+        return {**extra, "status": "sim_ok" if ok else "sim_err", "err": None if ok else sim_error(res), "ready": ready,
+                "units": res.get("unitsConsumed"), "slot": res.get("slot"),
+                "sol": (got["sol"] + got["fee"]) / 1e9 if got else None, "tok": got.get("tok")}
+
+    def _send_live(self, o: dict[str, Any], signer: str, build) -> dict[str, Any]:
+        """Built, signed, sent. 'unsent' when nothing went out: an RPC read failed first (the coin, the lists, the token
+        program, the blockhash), or every endpoint refused it. A send that failed otherwise (a timeout) may have gone out
+        all the same: 'sent', with its signature, known before sending, so the lookup decides, and a buy that landed
+        is not forgotten with its tokens."""
+        from .pumpfun import _no_key
+        why = lambda e: _no_key(f"{type(e).__name__}: {e}")[:300]                       # noqa: E731
+        try:
+            ixs, cu, extra = build(self._token_program(o["mint"]))
+            tx = compose(signer, ixs, self.rpc.blockhash(), self.kp, cu_limit=cu, tip_to=random.choice(TIP_ACCOUNTS),
+                         tip_lamports=TIP_LAMPORTS)
+        except Exception as e:  # noqa: BLE001 - this order's result: nothing went out
+            return {"status": "unsent", "err": why(e)}
+        ready = time.time()
+        try:
+            return {**extra, "status": "sent", "sig": self.rpc.send(tx), "ready": ready}
+        except Refused as e:
+            return {**extra, "status": "unsent", "err": why(e), "ready": ready}
+        except Exception as e:  # noqa: BLE001 - it may have gone out
+            return {**extra, "status": "sent", "sig": str(tx.signatures[0]), "err": why(e), "ready": ready}
 
     def _token_program(self, mint: str) -> str:
         tp = self.token_programs.get(mint)
@@ -250,18 +282,24 @@ class LiveFollow:
         with self.fill_lock:
             at, lists = self.lists.get(amm, (0.0, None))
             if lists is None or time.time() - at > LISTS_TTL_S:
-                acct = self.rpc.account(AMM_GLOBAL_CONFIG if amm else PUMP_GLOBAL)
-                if acct is None:
-                    raise ValueError("no global account")
-                lists = parse_global(acct[1], AMM_LISTS if amm else PUMP_LISTS)
-                self.lists[amm] = (time.time(), lists)
+                try:
+                    acct = self.rpc.account(AMM_GLOBAL_CONFIG if amm else PUMP_GLOBAL)
+                    if acct is None:
+                        raise ValueError("no global account")
+                    lists = parse_global(acct[1], AMM_LISTS if amm else PUMP_LISTS)
+                    self.lists[amm] = (time.time(), lists)
+                except Exception as e:  # noqa: BLE001 - they change once in months: the last ones beat a sell not sent
+                    if lists is None:
+                        raise
+                    log.info("live: the recipient lists could not be read again (%s): the last ones are used", type(e).__name__)
             return lists
 
     def _record(self, o: dict[str, Any], **kw: Any) -> None:
         o.update(kw)
         if "id" not in o:
+            mode = "live" if self.cfg.sends else self.cfg.mode     # exit's orders are live ones: counted, reloaded, shown
             o["id"] = self.c.execute("""INSERT INTO lorders(mode, wallet, mint, side, venue, trigger_slot, seen, status, err, want, tries)
-                                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (self.cfg.mode, o["wallet"], o["mint"], o["side"], o["venue"],
+                                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (mode, o["wallet"], o["mint"], o["side"], o["venue"],
                                         o["trigger_slot"], o["seen"], o["status"], o.get("err"), o.get("want"), o["tries"])).lastrowid
         else:
             self.c.execute("""UPDATE lorders SET venue=?, status=?, err=?, sig=?, sol=?, tok=?, want=?, units=?, slot=?, ready=?,
@@ -288,7 +326,7 @@ class LiveFollow:
         if not self.cfg.wallets and now - self.at["targets"] >= 60:
             self.targets = {w for (w,) in self.c.execute("SELECT wallet FROM follow WHERE golden_ever = 1")}
             self.at["targets"] = now
-        if self.cfg.mode != "live":
+        if not self.cfg.sends:
             return
         if now - self.at["hash"] >= 10:                     # a fresh blockhash kept ready: a send never waits for one
             self.at["hash"] = now
@@ -302,11 +340,15 @@ class LiveFollow:
                 self.jobs.append(({"side": "lookup", "mint": o["mint"], "id": o["id"]}, self.workers.submit(self._lookup, dict(o))))
         for m, p in list(self.pos.items()):
             if now - p["opened"] >= MAX_HOLD_S:
+                self.coins.pop(m, None)                     # priced on the chain: its last trade seen may be hours old, or the curve's
                 self._sell(m, None, "held too long")
 
     def _settled(self, o: dict[str, Any], res: dict[str, Any]) -> None:
         if o["side"] == "balance":
-            self.balance = res.get("balance", self.balance)
+            if "balance" in res:
+                from .pumpfun import set_meta
+                self.balance = res["balance"]
+                set_meta(self.c, "live_wallet", {"balance": self.balance, "at": int(time.time())})   # for the 30-min line
             return
         if o["side"] == "lookup":                             # a sent transaction looked up on the chain
             real = self.open.get(o["id"])
@@ -319,16 +361,37 @@ class LiveFollow:
                 self._failed(real, res.get("err") or res["status"])
             return
         o.update(res, done=time.time())
+        fill = o.pop("fill", None)
         if o["status"] == "sent":
             self.open[o["id"]] = o
             self._record(o)
-            log.info("live: %s %s sent: %s", o["side"], o["mint"], o["sig"])
-            if o.get("fill"):                                 # it landed before its send came back
-                self._fill(o, o.pop("fill"))
-        elif o["status"] == "failed":
+            self.pos.get(o["mint"], {}).pop("unsent", None)
+            if o.get("err"):
+                log.warning("live: %s %s may have gone out (%s): looked up as %s", o["side"], o["mint"], o["err"], o["sig"])
+            else:
+                log.info("live: %s %s sent: %s", o["side"], o["mint"], o["sig"])
+        if fill is not None:                                  # it landed before its job came back, whatever the job said
+            self._fill(o, fill)
+        elif o["status"] == "unsent" and o["side"] == "sell" and o["mint"] in self.pos:
+            self._unsent(o)
+        elif o["status"] in ("failed", "unsent"):
             self._failed(o, o.get("err") or "not sent")
-        else:
+        elif o["status"] != "sent":
             self._record(o)                                   # dry: what the simulation said
+
+    def _unsent(self, o: dict[str, Any]) -> None:
+        """A sell that never went out tries again, later each time, without spending one of its SELL_TRIES: a burst of
+        rate limits (or the public RPC's refusals after a restart) must not leave a copy STUCK with nothing sent."""
+        p = self.pos[o["mint"]]
+        n = p["unsent"] = p.get("unsent", 0) + 1
+        if n > UNSENT_MAX:
+            p.pop("unsent")
+            self._failed(o, f"not sent in {n} attempts: {o.get('err')}")
+            return
+        wait = min(RETRY_WAIT_S * 2 ** (n - 1), UNSENT_WAIT_S)
+        self._record(o)
+        self.retries.append((time.time() + wait, o["mint"], o["tries"]))
+        log.warning("live: sell of %s not sent (%s): try %d again in %.0f s", o["mint"], o.get("err"), o["tries"], wait)
 
     def _failed(self, o: dict[str, Any], err: str) -> None:
         self.open.pop(o["id"], None)
@@ -353,7 +416,33 @@ class LiveFollow:
         if o is not None:
             o["fill"] = fill                                  # landed before its send came back: settled together
             return
+        if side == "sell" and mint in self.pos:
+            self._sold_by_hand(mint, fill)
+            return
         log.warning("live: our wallet traded %s outside the copies (%s)", mint, side)
+
+    def _sold_by_hand(self, mint: str, fill: dict[str, Any]) -> None:
+        """Our wallet sold a coin a copy holds, with no sell of ours on its way: its owner sold it by hand (a STUCK copy,
+        or one let go of), or a sell given up on landed after all. The copy is closed, its retries dropped and its slot
+        freed: it would otherwise hold a slot for good, and be sold again after MAX_HOLD_S, paying fees for tokens gone.
+        A part sold leaves the copy open with the rest: the event says how many tokens went."""
+        from .pumpfun import TX_COST_SOL
+        p = self.pos[mint]
+        part = min(1.0, fill["tok"] / p["tok"]) if p["tok"] else 1.0
+        got = (fill["sol"] - fill["fee"]) / 1e9 - TX_COST_SOL
+        o = {"wallet": p["wallet"], "mint": mint, "side": "sell", "venue": None, "trigger_slot": None, "seen": time.time(), "tries": 0}
+        self._record(o, status="filled", err="sold outside the copies")
+        self._record(o, sol=got, tok=fill["tok"], pnl=got - p["cost"] * part, done=time.time())
+        if part < 1:
+            p.update(tok=p["tok"] - fill["tok"], cost=p["cost"] * (1 - part))
+            self.c.execute("UPDATE lpos SET tok = ?, cost = ? WHERE mint = ?", (p["tok"], p["cost"], mint))
+            log.warning("live: our wallet sold %d of the %d tokens of %s outside the copies: the copy goes on with the rest",
+                        fill["tok"], fill["tok"] + p["tok"], mint)
+            return
+        del self.pos[mint]
+        self.retries = [r for r in self.retries if r[1] != mint]
+        self.c.execute("DELETE FROM lpos WHERE mint = ?", (mint,))
+        log.warning("live: our wallet sold %s outside the copies for %.4f SOL (%+.4f SOL): its copy is closed", mint, got, got - p["cost"])
 
     def _fill(self, o: dict[str, Any], fill: dict[str, Any]) -> None:
         from .pumpfun import TX_COST_SOL
@@ -397,7 +486,8 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
     """For the log: the dry run (would the copies have gone through, and what would they have bought next to the paper
     copy of the same buy and to the price the wallet's buy left), and the live copies' results."""
     import collections
-    from .pumpfun import _pct, connect
+    import statistics
+    from .pumpfun import _pct, connect, get_meta
     c = connect(db_path, readonly=True)
     try:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'lorders'").fetchone():
@@ -408,6 +498,15 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
         live = c.execute("""SELECT side, status, COUNT(*), COALESCE(SUM(pnl), 0) FROM lorders WHERE mode = 'live'
                             GROUP BY side, status""").fetchall()
         held = c.execute("SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(SUM(stuck), 0) FROM lpos").fetchone()
+        wallet = get_meta(c, "live_wallet")
+        # each closed live copy next to the paper copy of the same buy: their profit over what each put in
+        pairs = c.execute("""SELECT s.pnl, s.pnl / b.sol, p.pnl, p.pnl / pb.sol
+                             FROM (SELECT wallet, mint, SUM(pnl) AS pnl FROM lorders WHERE mode = 'live' AND side = 'sell'
+                                   AND status = 'filled' GROUP BY wallet, mint) s
+                             JOIN lorders b ON b.mode = 'live' AND b.side = 'buy' AND b.status = 'filled' AND b.wallet = s.wallet AND b.mint = s.mint
+                             JOIN pfills pb ON pb.side = 'buy' AND pb.wallet = s.wallet AND pb.mint = s.mint
+                             JOIN pfills p ON p.side = 'sell' AND p.wallet = s.wallet AND p.mint = s.mint
+                             WHERE b.sol > 0 AND pb.sol > 0 AND s.mint NOT IN (SELECT mint FROM lpos)""").fetchall()
     finally:
         c.close()
     q = lambda xs, p: xs[min(len(xs) - 1, int(p * len(xs)))] if xs else None       # noqa: E731
@@ -433,11 +532,16 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
         for r in dry:
             by[r[0]].append(r)
         out += [line(f"dry run {w}", rs) for w, rs in sorted(by.items()) if len(rs) >= min_per_wallet]
-    if live:
+    if live or wallet:
         n = {(side, status): (k, pnl) for side, status, k, pnl in live}
         count = lambda side, st: n.get((side, st), (0, 0))[0]                       # noqa: E731
         out.append(f"live: buys {count('buy', 'filled')} filled, {count('buy', 'failed')} failed, {count('buy', 'skipped')} skipped"
-                   f" | sells {count('sell', 'filled')} filled, {count('sell', 'failed')} failed | realized "
+                   f" | sells {count('sell', 'filled')} filled, {count('sell', 'failed')} failed"
+                   + (f", {count('sell', 'unsent')} not sent" if count("sell", "unsent") else "") + " | realized "
                    f"{n.get(('sell', 'filled'), (0, 0))[1]:+.4f} SOL | {held[0]} open ({held[1]:.3f} SOL in)"
-                   + (f", {held[2]} STUCK: sell by hand" if held[2] else ""))
+                   + (f", {held[2]} STUCK: sell by hand" if held[2] else "")
+                   + (f" | wallet {wallet['balance']:.3f} SOL at {time.strftime('%H:%M', time.gmtime(wallet['at']))} UTC" if wallet else ""))
+    if pairs:
+        out.append(f"live vs paper on the same {len(pairs)} copies: live {sum(r[0] for r in pairs):+.4f} SOL, paper "
+                   f"{sum(r[2] for r in pairs):+.4f} SOL, live minus paper per copy median {statistics.median(r[1] - r[3] for r in pairs):+.1%}")
     return out

@@ -1,12 +1,15 @@
 import struct
+import time
 
 import pytest
 
 pytest.importorskip("solders")
 
-from hl_screener.pumptx import (AMM_LISTS, AMM_PROGRAM, PUMP_PROGRAM, TOKEN_2022_PROGRAM, canonical_pool, compose,  # noqa: E402
-                                curve_buy_ixs, curve_sell_ixs, parse_global, pool_buy_ixs, pool_sell_ixs, sim_error, sol_for,
-                                tokens_for)
+from solders.hash import Hash  # noqa: E402
+
+from hl_screener.pumptx import (AMM_LISTS, AMM_PROGRAM, PUMP_PROGRAM, TOKEN_2022_PROGRAM, Refused, Rpc, RpcError,  # noqa: E402
+                                canonical_pool, compose, curve_buy_ixs, curve_sell_ixs, parse_global, pool_buy_ixs, pool_sell_ixs,
+                                sim_error, sol_for, tokens_for)
 
 T22 = TOKEN_2022_PROGRAM
 
@@ -127,7 +130,8 @@ POOL_USER = "4jafoRx8VmqZvJ3ctmrXvURv74kDs2sc9zcCLhfGdZf5"
 
 def test_a_pumpswap_buy_is_the_one_a_real_wallet_sent_inside_a_wrap_and_unwrap():
     args = bytes.fromhex("b54c0500000000007dad730000000000")
-    ixs, _ = pool_buy_ixs(POOL_COIN, POOL_USER, *struct.unpack("<QQ", args), T22, {})
+    ixs, cu = pool_buy_ixs(POOL_COIN, POOL_USER, *struct.unpack("<QQ", args), T22, {})
+    assert cu == 200_000                                                         # a cashback pool buy used 151,241 (2026-10-07)
     swap = ixs[4]
     ours = POOL_BUY_TX[:19] + ["R " + POOL_BUY_TX[19].split()[1]] + POOL_BUY_TX[20:]   # volume tracking off: read-only
     assert str(swap.program_id) == AMM_PROGRAM and listed(swap) == ours
@@ -171,3 +175,51 @@ def test_a_failure_names_the_account_its_constraint_failed_on():
     assert sim_error(moved) == "ConstraintSeeds (creator_vault)"               # the coin's creator moved after the copied buy
     assert sim_error({"err": {}, "logs": ["Program log: AnchorError occurred. Error Code: TooLittleSolReceived. "
                                           "Error Number: 6003. Error Message: slippage."]}) == "TooLittleSolReceived"
+
+
+class Answer:
+    def __init__(self, status, body=None):
+        self.status_code, self.body = status, body
+
+    def json(self):
+        return self.body
+
+
+def test_an_endpoint_that_says_no_refused_the_transaction_and_one_that_did_not_answer_may_have_taken_it():
+    rpc = Rpc(send_urls=("https://a", "https://b"))
+    for status, body, refused in ((429, None, True), (400, None, True), (200, {"error": {"code": -32602}}, True), (503, None, False)):
+        rpc.local.http = type("Http", (), {"post": lambda self, *a, answer=Answer(status, body), **k: answer})()
+        with pytest.raises(RpcError) as e:
+            rpc.call("sendTransaction", [])
+        assert isinstance(e.value, Refused) is refused                           # a 5xx may come from in front of a sender that took it
+    tx = compose("FFWz3afFp6jNLACoyfAxCQVP7LVPQSwZupTKnTFRXSeh", [])
+
+    def answers(a, b):
+        def call(method, params, url=None):
+            e = {"https://a": a, "https://b": b}[url]
+            if e is not None:
+                raise e
+        return call
+    rpc.call = answers(Refused("sendTransaction: HTTP 429"), Refused("sendTransaction: {'code': -32602}"))
+    with pytest.raises(Refused):
+        rpc.send(tx)                                                             # every one said no: nothing went out
+    rpc.call = answers(Refused("sendTransaction: HTTP 429"), TimeoutError("read timed out"))
+    with pytest.raises(RpcError) as e:
+        rpc.send(tx)
+    assert not isinstance(e.value, Refused) and "read timed out" in str(e.value)   # one may have taken it: not refused
+    rpc.call = answers(Refused("sendTransaction: HTTP 429"), None)
+    assert rpc.send(tx) == str(tx.signatures[0])
+
+
+def test_a_blockhash_refresh_refused_keeps_the_last_one_while_it_can_still_land():
+    rpc = Rpc()
+
+    def refused(method, params, url=None):
+        raise Refused("getLatestBlockhash: HTTP 429")
+    rpc.call = refused
+    last = Hash.new_unique()
+    rpc._hash = (time.time() - 30, last)
+    assert rpc.blockhash() == last                                               # 30 s old: a transaction with it still lands
+    rpc._hash = (time.time() - 70, last)
+    with pytest.raises(Refused):
+        rpc.blockhash()                                                          # too old to land: the error, not a doomed send
