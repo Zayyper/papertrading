@@ -115,6 +115,7 @@ class _Reader:
 
 
 TRADE_TAIL = 8     # bytes pump.fun's upgrade of 2026-10-02 ~15:48 UTC appended, undocumented, to TradeEvent, BuyEvent, SellEvent
+CREATE_TAIL = 1    # the byte CreateV2 coins' CreateEvent carries past the published layout (2026-10-08 ~16:20 UTC on)
 
 
 def _whole(r: _Reader, tails: tuple[int, ...] = (0,)) -> bool:
@@ -180,7 +181,7 @@ def parse_create(b: bytes) -> dict[str, Any] | None:
         r.skip(8 + 8 + 1)                         # virtual_quote_reserves, creator_fee_bps, is_holder_reward
     except (struct.error, ValueError):
         return None
-    if not _whole(r):
+    if not _whole(r, (0, CREATE_TAIL)):
         return None
     return {"mint": mint, "user": user, "name": name[:64], "symbol": symbol[:32], "ts": ts, "sol_quote": quote == SOL_QUOTE,
             "token_program": token_program}

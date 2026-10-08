@@ -66,7 +66,20 @@ def test_parse_the_layout_or_its_known_tail_and_refuse_the_rest():
     c = parse_create(create_bytes(mint, user))
     assert c["mint"] == mint and c["user"] == user and c["symbol"] == "CAT" and c["sol_quote"]
     assert parse_create(create_bytes(mint, user)[:-1]) is None
-    assert parse_create(create_bytes(mint, user) + bytes(8)) is None                     # creations kept their layout
+    assert parse_create(create_bytes(mint, user) + bytes(1)) == c                         # CreateV2's tail of 2026-10-08
+    assert parse_create(create_bytes(mint, user) + bytes(2)) is None and parse_create(create_bytes(mint, user) + bytes(8)) is None
+
+
+def test_a_create_v2_event_from_mainnet_parses():
+    """pump.fun's CreateV2 coins (2026-10-08 ~16:20 UTC on) log a CreateEvent 1 byte longer than the published layout:
+    every one was refused, and no new coin was followed."""
+    import base64
+    import json
+    from pathlib import Path
+    fx = json.loads((Path(__file__).parent / "fixtures" / "pump_create_v2_2026-10-08.json").read_text(encoding="utf-8"))
+    c = parse_create(base64.b64decode(fx["event_b64"]))
+    assert c is not None and b58(c["mint"]) == fx["mint"] and b58(c["user"]) == fx["user"]
+    assert b58(c["token_program"]) == fx["token_program"] and c["sol_quote"]
 
 
 def test_todays_events_parse_with_the_field_pump_fun_appended():
