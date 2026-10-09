@@ -127,6 +127,24 @@ class FakeRpc:
         return {"value": 1_500_000_000}
 
 
+class LaggingRpc(FakeRpc):
+    """A public RPC node that does not know the cursor yet: asked for what came after it, it answers 'not found'."""
+
+    def call(self, method, params):
+        if method == "getSignaturesForAddress" and "until" in params[1]:
+            self.calls.append((method, params))
+            raise RpcError(f"getSignaturesForAddress: {{'code': -32020, 'message': 'Transaction {params[1]['until']} not found'}}")
+        return super().call(method, params)
+
+
+def test_a_node_that_does_not_know_the_cursor_yet_is_answered_from_the_newest_page(monkeypatch):
+    monkeypatch.setattr(lm.time, "sleep", lambda s: None)
+    newest = [{"signature": "C", "slot": 30}, {"signature": "B", "slot": 20}, {"signature": "A", "slot": 10}]
+    assert [s["signature"] for s in lm.Chain("", LaggingRpc({LEADER: list(newest)})).signatures(LEADER, until="B", until_slot=20)] == ["C"]
+    with pytest.raises(RuntimeError, match="not found"):                 # no slot to cut at: the error stands
+        lm.Chain("", LaggingRpc({LEADER: list(newest)})).signatures(LEADER, until="B")
+
+
 def sig_of(name: str) -> dict:
     tx = TXS[name]["tx"]
     return {"signature": TXS[name]["sig"], "slot": tx["slot"], "blockTime": tx["blockTime"], "err": tx["meta"]["err"]}

@@ -252,14 +252,23 @@ class Chain:
                 time.sleep(pause)
         raise RuntimeError(f"{method} failed {len(BACKOFF_S) + 1} times: {err}")
 
-    def signatures(self, addr: str, until: str | None = None, since: float | None = None) -> list[dict]:
-        """Signatures of `addr` newer than `until`, or than the unix time `since`: newest first."""
+    def signatures(self, addr: str, until: str | None = None, since: float | None = None,
+                   until_slot: int | None = None) -> list[dict]:
+        """Signatures of `addr` newer than `until`, or than the unix time `since`: newest first. A public RPC node that
+        does not know `until` yet ("Transaction ... not found": the nodes lag each other) is answered from the newest
+        page instead, cut at `until_slot`."""
         out: list[dict] = []
         before = None
         while True:
             opts = {"limit": 1000, "commitment": "confirmed", **({"until": until} if until else {}),
                     **({"before": before} if before else {})}
-            page = self.ask("getSignaturesForAddress", [addr, opts])
+            try:
+                page = self.ask("getSignaturesForAddress", [addr, opts])
+            except RuntimeError as e:
+                if not (until and until_slot is not None and "not found" in str(e)):
+                    raise
+                newest = self.ask("getSignaturesForAddress", [addr, {"limit": 1000, "commitment": "confirmed"}])
+                return [s for s in newest if (s.get("slot") or 0) > until_slot]
             out += page
             if len(page) < 1000 or (since and (page[-1].get("blockTime") or 0) < since):
                 break
@@ -273,6 +282,7 @@ class Watch:
         self.names = {wallet: "OURS", **{a: a[:6] for a in leaders if a != wallet}}
         self.book = Book()
         self.cursors: dict[str, str] = {}         # address -> newest signature seen, "" when it had none
+        self.cursor_slots: dict[str, int] = {}    # address -> that signature's slot
         self.todo: list[tuple[int, str, dict, int]] = []   # (slot, address, signature info, rounds tried)
         self.balance: float | None = None
         self.start_balance: float | None = None
@@ -288,6 +298,7 @@ class Watch:
         sigs = self.chain.signatures(addr, since=since) if since else []
         newest = sigs or self.chain.ask("getSignaturesForAddress", [addr, {"limit": 1, "commitment": "confirmed"}])
         self.cursors[addr] = newest[0]["signature"] if newest else ""
+        self.cursor_slots[addr] = (newest[0].get("slot") or 0) if newest else 0
         self._queue(addr, sigs)
 
     def _queue(self, addr: str, sigs: list[dict]) -> None:
@@ -308,9 +319,10 @@ class Watch:
                 if addr not in self.cursors:
                     self._begin(addr, None)
                     continue
-                sigs = self.chain.signatures(addr, until=self.cursors[addr] or None)
+                sigs = self.chain.signatures(addr, until=self.cursors[addr] or None, until_slot=self.cursor_slots.get(addr))
                 if sigs:
                     self.cursors[addr] = sigs[0]["signature"]
+                    self.cursor_slots[addr] = sigs[0].get("slot") or self.cursor_slots.get(addr, 0)
                 self._queue(addr, sigs)
             except Exception as e:  # noqa: BLE001
                 self._warn(f"reading {self.names[addr]}'s signatures: {e}")
