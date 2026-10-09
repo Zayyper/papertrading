@@ -84,10 +84,10 @@ def setup(tmp_path, mode, keypair=None, **cfg):
     return col, chain
 
 
-def trade(col, slot, mint, who, buy, cv, sol=10**9, tok=None):
+def trade(col, slot, mint, who, buy, cv, sol=10**9, tok=None, ts=1_790_000_000):
     tok = cv.buy(sol) if buy else tok
     got = sol if buy else cv.sell(tok)
-    col.on_logs(slot, logs(trade_bytes(mint, who, buy, got, tok, cv.vsol, cv.vtok, creator=CREATOR, fee_recipient=FEE_TO)))
+    col.on_logs(slot, logs(trade_bytes(mint, who, buy, got, tok, cv.vsol, cv.vtok, ts=ts, creator=CREATOR, fee_recipient=FEE_TO)))
     return tok
 
 
@@ -254,13 +254,13 @@ def test_a_buy_ready_too_late_is_not_sent_and_a_sell_goes_out_however_late(tmp_p
         return read(addr)
 
     chain.account = slow_read
-    trade(col, 11, MINT3, G, True, Curve())
+    trade(col, 11, MINT3, G, True, Curve(), ts=int(now[0]))   # block times go with this clock
     col.flush()
     assert not chain.sent and "not copying" in caplog.text
     assert col.c.execute("SELECT status, err FROM lorders WHERE mint = ?", (b58(MINT3),)).fetchone() == (
         "skipped", "too late: 4.0 s after its wallet's buy")
     cv = Curve()
-    trade(col, 12, MINT, G, True, cv)                   # its token program known from its creation: out at once
+    trade(col, 12, MINT, G, True, cv, ts=int(now[0]))   # its token program known from its creation: out at once
     assert len(chain.sent) == 1
     trade(col, 13, MINT, me, True, cv, sol=246_913_580)
     col.flush()
@@ -292,6 +292,22 @@ def test_a_dry_run_does_not_simulate_a_buy_that_reached_it_late(tmp_path):
     assert LiveCfg.from_env({}).max_age_s == MAX_AGE_S and LiveCfg.from_env({"PUMP_LIVE_MAX_AGE_S": "8"}).max_age_s == 8
     with pytest.raises(ValueError):
         LiveCfg.from_env({"PUMP_LIVE_MAX_AGE_S": "0"})
+    exiting = {"PUMP_LIVE": "exit", "PUMP_LIVE_KEY": "k", "PUMP_LIVE_WALLETS": "G", "PUMP_LIVE_MAX_AGE_S": "0"}
+    assert LiveCfg.from_env(exiting).mode == "exit"     # a bad buy setting does not keep exit from selling
+    col.c.close()
+
+
+def test_a_buy_the_feeds_thread_got_to_late_is_not_sent_though_its_slot_looks_new(tmp_path):
+    """Behind a stall (a database lock), the socket's backlog is handled late, slot clock and all: only the trade's own
+    block time, against the usual lag of the others, says how old it is."""
+    col, chain = setup(tmp_path, "dry")
+    t = int(time.time())
+    trade(col, 100, MINT3, X, True, Curve(), ts=t)      # the usual lag, about nothing
+    trade(col, 100, MINT, G, True, Curve(), ts=t)       # fresh: simulated
+    trade(col, 100, MINT2, G, True, Curve(), ts=t - 20) # its block 20 s ago, the same slot as far as the feed has shown
+    col.flush()
+    rows = col.c.execute("SELECT mint, status, err FROM lorders ORDER BY id").fetchall()
+    assert [r[:2] for r in rows] == [(b58(MINT), "sim_ok"), (b58(MINT2), "skipped")] and rows[1][2].startswith("too late: 1")
     col.c.close()
 
 
@@ -460,6 +476,20 @@ def test_a_followed_wallet_whose_connection_dropped_has_its_copies_read_once_it_
     col.flush()
     assert col.rpc.asked == [(b58(G), b58(MINT))] * 2               # live, then paper
     assert len(chain.sent) == 2 and col.stats["gap_sold"] == 2
+    col.c.close()
+
+
+def test_drops_every_few_minutes_queue_each_copy_once_and_real_money_is_read_first(tmp_path, monkeypatch):
+    """Connections drop every 1-5 min: a copy named by every drop and every reconnect would pile reads up faster than
+    one reader gets through them, with the live copy's read behind the paper backlog."""
+    from concurrent.futures import Future
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    col.gap_pool = types.SimpleNamespace(submit=lambda *a, **k: Future())   # the reader is busy: nothing is read yet
+    for _ in range(3):
+        col.check_gap("pool feed drop", {b58(MINT)})
+        col.check_gap("reconnect")
+    order = [(e[3][0], e[1]) for e in sorted(col.gap_first.queue)]
+    assert order == [("live", False), ("live", True), ("paper", False), ("paper", True)]   # each once a kind of check
     col.c.close()
 
 

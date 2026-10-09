@@ -90,8 +90,9 @@ class LiveCfg:
                   buy_slip=num("PUMP_LIVE_BUY_SLIP", 0.25), sell_slip=num("PUMP_LIVE_SELL_SLIP", 0.5),
                   rpc_url=env.get("PUMP_LIVE_RPC") or PUBLIC_RPC, send_urls=listed("PUMP_LIVE_SEND") or SENDERS,
                   sim_signer=env.get("PUMP_LIVE_SIM_SIGNER") or None, max_age_s=num("PUMP_LIVE_MAX_AGE_S", MAX_AGE_S))
-        if not 0 < cfg.stake_sol <= 5 or not 0 <= cfg.buy_slip < 1 or not 0 <= cfg.sell_slip < 1 or cfg.max_open < 1 \
-                or cfg.day_loss_sol <= 0 or not 0 < cfg.max_age_s <= 60:
+        buys = mode in ("dry", "live")                  # exit only sells: a bad buy setting must not keep its copies from getting out
+        if not 0 <= cfg.sell_slip < 1 or buys and (not 0 < cfg.stake_sol <= 5 or not 0 <= cfg.buy_slip < 1 or cfg.max_open < 1
+                                                   or cfg.day_loss_sol <= 0 or not 0 < cfg.max_age_s <= 60):
             raise ValueError("PUMP_LIVE_STAKE_SOL must be in (0, 5], the slippages in [0, 1), PUMP_LIVE_MAX_OPEN at least 1, "
                              "PUMP_LIVE_DAY_LOSS_SOL above 0 and PUMP_LIVE_MAX_AGE_S in (0, 60]")
         if cfg.sends and not ((env.get("PUMP_LIVE_KEY") or "").strip() and cfg.wallets):
@@ -146,6 +147,8 @@ class LiveFollow:
         self.retries: list[tuple[float, str, int]] = []   # (not before, mint, try) of the sells to send again
         self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0, "lists": 0.0}
         self.tip = 0                                   # the newest slot a trade came from: how far the chain went since a buy
+        self.lag = [float("inf"), float("inf"), 0.0]   # least (now - a trade's block time) this minute and the last, since:
+                                                       # the usual lag, the yardstick for a trade the feed's thread got to late
 
     # --- from the feed -------------------------------------------------------
     def on_create(self, mint: str, token_program: bytes) -> None:
@@ -156,6 +159,12 @@ class LiveFollow:
         """Every trade the collector sees: our own fills, the newest state of the coins we hold or may copy, and the
         chosen wallets' first buys and first sells."""
         self.tip = max(self.tip, slot)
+        if e.get("ts"):
+            now = time.time()
+            if now - self.lag[2] > 60:
+                self.lag = [now - e["ts"], self.lag[0], now]
+            else:
+                self.lag[0] = min(self.lag[0], now - e["ts"])
         if self.me is not None and user == self.me:
             self._own_fill(mint, e)
             return
@@ -167,7 +176,7 @@ class LiveFollow:
         if e["buy"]:
             if (user, mint) not in self.copied and mint not in self.pos and not self._busy(mint):
                 self.copied.add((user, mint))
-                self._buy(user, mint, slot)
+                self._buy(user, mint, slot, e.get("ts"))
         elif self.pos.get(mint, {}).get("wallet") == user:
             self._sell(mint, slot, "its wallet sold")
         else:
@@ -201,10 +210,10 @@ class LiveFollow:
         return self.c.execute("SELECT COALESCE(SUM(pnl), 0) FROM lorders WHERE side = 'sell' AND mode = 'live' AND done >= ?",
                               (now - now % 86_400,)).fetchone()[0]
 
-    def _buy(self, wallet: str, mint: str, slot: int) -> None:
+    def _buy(self, wallet: str, mint: str, slot: int, ts: int | None = None) -> None:
         coin = self.coins[mint]
         o = {"wallet": wallet, "mint": mint, "side": "buy", "venue": "pool" if coin["pool"] else "curve",
-             "trigger_slot": slot, "seen": time.time(), "tries": 1}
+             "trigger_slot": slot, "seen": time.time(), "tries": 1, "chain_ts": ts}
         why = ("winding down" if self.cfg.mode == "exit" else self._blocked()) if self.cfg.sends else None
         if why:
             self._record(o, status="skipped", err=why)
@@ -284,7 +293,10 @@ class LiveFollow:
         Sells always go out: getting out comes first."""
         if o["side"] != "buy":
             return None
-        age = max(time.time() - o["seen"], (self.tip - o["trigger_slot"]) * SLOT_S)
+        now = time.time()
+        age = max(now - o["seen"], (self.tip - o["trigger_slot"]) * SLOT_S)
+        if o.get("chain_ts"):                          # its block's time, less the usual lag and a second (whole seconds): a
+            age = max(age, now - o["chain_ts"] - min(self.lag[:2]) - 1)   # buy the feed's thread got to late, behind a stall
         if age <= self.cfg.max_age_s:
             return None
         log.info("live: not copying %s's buy of %s: ready %.1f s after it, over %g s", o["wallet"], o["mint"], age, self.cfg.max_age_s)

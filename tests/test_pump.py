@@ -690,6 +690,38 @@ def test_a_followed_wallets_trade_in_a_pool_we_do_not_follow_is_copied_and_the_p
     col.c.close()
 
 
+def test_a_wallet_we_hold_a_copy_of_is_read_past_the_cap_and_a_failed_read_checks_its_copies(tmp_path, monkeypatch):
+    """A coin we hold migrated while the feed was down: its wallet's sell comes in a pool we do not follow. It must not
+    be the trade the read cap turns away, and a read that fails must not leave the copy open until MAX_HOLD_S."""
+    import types
+
+    from hl_screener import pumpfun
+    monkeypatch.setattr(pumpfun, "POOL_READS", 0)          # the cap reached
+    monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0.01)
+    col = Collector(tmp_path / "pump.db")
+    W, V, pool = bytes([66]) * 32, bytes([67]) * 32, bytes([68]) * 32
+    for w in (W, V):
+        col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, NULL)", (b58(w),))
+    col.paper.reload()
+    col.paper.pos[(b58(W), "COIN")] = [10**12, 0.25, int(time.time())]   # a copy of W is open
+
+    def account(addr):
+        raise RuntimeError("HTTP 429")
+
+    col.rpc, checks = types.SimpleNamespace(account=account), []
+    col.check_gap = lambda why, mints=None, wallet=None: checks.append((why, mints, wallet))
+    B, Q = 10**15, 85 * 10**9
+    sell = lambda who, sig: col.on_logs(530, logs(amm_bytes(False, pool, who, 10**12, B, Q, 10**8, 2 * 10**5,   # noqa: E731
+                                                            10**8 - 2 * 10**5, 10**8 - 6 * 10**5), AMM_PROGRAM), sig)
+    sell(V, "sig-v")                                       # nothing of V's held: turned away by the cap
+    assert not col.finding and col.stats["pool_reads_full"] == 1
+    sell(W, "sig-w")                                       # W's, maybe the sell of our copy: read all the same
+    assert col.finding[b58(pool)][0].exception(timeout=5) is not None
+    col.on_logs(531, [], "sig-next")                       # the failed read is collected: W's copies are checked
+    assert checks == [("pool feed drop", None, b58(W))] and not col.finding
+    col.c.close()
+
+
 def test_a_pool_migrated_while_the_feed_was_down_is_read_through_a_lagging_node_and_stored(tmp_path, monkeypatch):
     from hl_screener import pumpfun
     from hl_screener.pumptx import canonical_pool
