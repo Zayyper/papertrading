@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .pumppools import WORKED_S
-from .pumptx import PUBLIC_RPC, Rpc, fresh_coin
+from .pumptx import PUBLIC_RPC, Rpc, canonical_pool, fresh_coin
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,8 @@ GAP_PACE_S = 0.5               # between two reads after a feed gap (a sold copy
                                # allows 40 per 10 s per method and 100 per 10 s in all, shared with the live copies' calls
 GAP_LOOK_BACK_S = 3 * 86_400   # copies opened longer ago are not checked: a wallet that never sells a dead coin would be read on every reconnect
 GAP_KEPT = 0.99                # a leader holding less than this share of the tokens we saw it buy sold while we were blind
+POOL_READS = 10                # pools read at once for followed wallets' trades in pools we do not follow (see _found): a bot
+                               # trading in hundreds of them must not queue reads on the public RPC's 40 per 10 s
 WAL_LIMIT = 64 * 2**20         # bytes the write-ahead log keeps after a checkpoint resets it
 SILENT_S = 30                  # this long without pump.fun's logs (they come many times a second), a connection is stalled,
                                # even with its slots still coming
@@ -648,8 +650,11 @@ class Collector:
         self.gap_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gapcheck")
         self.gap_job = None                                     # the newest gap check, running or waiting
         self.gap_out: queue.SimpleQueue = queue.SimpleQueue()   # (kind, wallet, mint, coin now) whose wallet sold, to the feed's thread
-        from .pumppools import PoolFeed                         # our pools only, one subscription each (see pumppools)
-        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=self._pinned_pools)
+        self.pool_reads = ThreadPoolExecutor(max_workers=1, thread_name_prefix="poolread")   # not behind a gap check's minutes
+        self.finding: dict[str, tuple[Any, list[tuple]]] = {}  # pool -> (the read of its coin, the trades waiting for it)
+        self.not_ours: set[str] = set()                         # pools read and found not a pump.fun coin's SOL pool
+        from .pumppools import PoolFeed                         # our pools and followed wallets, one subscription each (see pumppools)
+        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=lambda: self._pinned_pools() | self._watched())
         for pool, last in self.c.execute("""SELECT m.pool, (SELECT t.ts FROM trades t WHERE t.mint = m.id ORDER BY t.slot DESC LIMIT 1)
                                              FROM mints m WHERE m.pool IS NOT NULL AND m.ts >= ?""", (cutoff,)):
             self.pool_feed.add(pool, last or 0.0)
@@ -662,6 +667,14 @@ class Collector:
             open_ |= set(self.live.pos) | {o["mint"] for o in self.live._orders()}
         return {p for p, m in self.pools.items() if m in open_}
 
+    def _watched(self) -> set[str]:
+        """Wallets whose every trade must reach us, on a coin or pool we follow or not: the followed ones, paper and live,
+        and those a copy is open on (a sniper out of the top set still exits). Each has its own subscription."""
+        out = self.paper.follow | {w for w, _ in self.paper.pos}
+        if self.live is not None:
+            out |= self.live.targets | {p["wallet"] for p in self.live.pos.values()}
+        return out
+
     def wallet_id(self, addr: str) -> int:
         i = self.wallets.get(addr)
         if i is None:
@@ -670,7 +683,10 @@ class Collector:
         return i
 
     def on_logs(self, slot: int, logs: list[str], sig: str | None = None) -> None:
-        if sig:                                            # a transaction touching both programs arrives on both feeds
+        if self.finding:
+            self._found()                                  # pools read meanwhile: their waiting trades go before this one
+        if sig:                                            # a transaction touching both programs arrives on both feeds,
+                                                           # and a followed wallet's trade on its own subscription too
             if sig in self.sig_set:
                 return
             if len(self.sigs) == self.sigs.maxlen:
@@ -707,10 +723,17 @@ class Collector:
                     continue
                 pool = b58(e["pool"])
                 mint = self.pools.get(pool)
-                if mint is not None:                       # a pool of a token we track, after its graduation
+                if pool in self.finding:                   # its coin is being read: the trade waits behind the first, in order
+                    self.finding[pool][1].append((slot, b58(e["user"]), e))
+                elif mint is not None:                     # a pool of a token we track, after its graduation
                     self.stats["amm_trades"] += 1
                     self.pool_feed.touch(pool)
                     self._trade(slot, mint, b58(e["user"]), e)
+                elif pool not in self.not_ours and b58(e["user"]) in self._watched():
+                    if len(self.finding) < POOL_READS:
+                        self.finding[pool] = (self.pool_reads.submit(self._pool_mint, pool), [(slot, b58(e["user"]), e)])
+                    else:
+                        self.stats["pool_reads_full"] = self.stats.get("pool_reads_full", 0) + 1   # a followed trade not copied
             elif b[:8] == D_POOL:
                 e = parse_create_pool(b)
                 if e is None:
@@ -749,6 +772,55 @@ class Collector:
                     continue
                 if e["sol_quote"]:
                     self._trade(slot, b58(e["mint"]), b58(e["user"]), e)
+
+    def _pool_mint(self, pool: str) -> str | None:
+        """On a worker thread: the coin a PumpSwap pool trades, from the pool's account (base mint at byte 43), or None
+        when it is not the pool pump.fun migrates a coin into (another quote, another launchpad's token). A pool just
+        migrated can be unknown yet to a lagging node behind the public RPC: read up to 3 times, GAP_PACE_S apart."""
+        for n in range(3):
+            if n and self.halt.wait(GAP_PACE_S):
+                break                                      # the collector is stopping
+            try:
+                acct, why = self.rpc.account(pool), ValueError(f"no account {pool} on the RPC yet")
+            except Exception as e:  # noqa: BLE001 - read again; _found says it if every read fails
+                acct, why = None, e
+            if acct is not None:
+                mint = b58(acct[1][43:75]) if acct[0] == AMM_PROGRAM and len(acct[1]) >= 75 else None
+                return mint if mint and canonical_pool(mint) == pool else None
+        raise why
+
+    def _found(self) -> None:
+        """A followed wallet traded in a pool we do not follow: one quiet for over an hour and dropped, one migrated while
+        the feed was down, or a coin older than the ones we track. In the live test's first hours that was 3 of the
+        leader's 4 PumpSwap first buys, never seen. Its own subscription brings such a trade now, and the pool's account
+        names the coin (_pool_mint): the pool is followed from here on (an older coin's while a copy is open on it), and
+        the trades that waited go to the copies as the pool's feed would have brought them, so a first buy is copied at
+        the reserves it left. On the feed's thread."""
+        for pool in [p for p, (job, _) in self.finding.items() if job.done()]:
+            job, held = self.finding.pop(pool)
+            try:
+                mint = job.result()
+            except Exception as e:  # noqa: BLE001 - this read's failure: the wallet's next trade there reads it again
+                log.warning("could not read the PumpSwap pool %s (%s): %d trade(s) of followed wallets in it not copied",
+                            pool, _no_key(f"{type(e).__name__}: {e}")[:200], len(held))
+                continue
+            if mint is None:
+                self.not_ours.add(pool)                    # never read again
+                continue
+            self.pools[pool] = mint
+            if mint in self.mints:                         # a coin we track: followed and stored, as after its CreatePoolEvent
+                self.pool_feed.add(pool)
+                try:
+                    self.c.execute("UPDATE mints SET pool = ? WHERE addr = ?", (pool, mint))
+                except sqlite3.OperationalError as err:    # a full disk must not cost the trades below
+                    self._db_error(err)
+            else:                                          # an older one: subscribed only while a copy is open on it
+                self.pool_feed.kick.set()                  # (_pinned_pools), so a busy wallet cannot crowd out ours
+            self.stats["pools_found"] = self.stats.get("pools_found", 0) + 1
+            log.info("PumpSwap pool %s of %s found through %s's trade: followed from now on", pool, mint, held[0][1])
+            for slot, user, e in held:
+                self.stats["amm_trades"] += 1
+                self._trade(slot, mint, user, e)
 
     def _db_error(self, e: sqlite3.OperationalError) -> None:
         if time.time() - self.last_db_error >= 60:                # once a minute: a full disk fails every write

@@ -641,6 +641,112 @@ def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
     col.c.close()
 
 
+def test_a_followed_wallets_trade_in_a_pool_we_do_not_follow_is_copied_and_the_pool_followed(tmp_path):
+    """The live test's first hours: 3 of the leader's 4 PumpSwap first buys were in pools the collector did not follow
+    (quiet for over an hour, migrated while the feed was down, or a coin older than the tracked window): never seen.
+    The wallet's own subscription brings them; the pool's account names the coin."""
+    import threading
+    import types
+
+    from hl_screener.pumptx import canonical_pool
+    col = Collector(tmp_path / "pump.db")
+    W, X, mint, other = bytes([56]) * 32, bytes([57]) * 32, bytes([58]) * 32, bytes([59]) * 32
+    pool, odd = canonical_pool(b58(mint)), bytes([60]) * 32                 # an old coin's pool, and someone else's pool
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, NULL)", (b58(W),))
+    col.paper.reload()
+    reads, slow = [], threading.Event()
+
+    def account(addr):                                    # the pool's account: its base mint at byte 43
+        reads.append(addr)
+        slow.wait(5)
+        return AMM_PROGRAM, bytes(43) + (mint if addr == pool else other) + b58decode(WSOL) + bytes(186)
+
+    col.rpc = types.SimpleNamespace(account=account)
+    B, Q = 10**15, 85 * 10**9
+    B2, Q2 = B - 10**12, Q + 10**8 + 2 * 10**5            # what W's buy leaves
+    B3, Q3 = B2 - 10**11, Q2 + 10**7 + 2 * 10**4          # and X's after it
+    w_buy = logs(amm_bytes(True, b58decode(pool), W, 10**12, B, Q, 10**8, 2 * 10**5, 10**8 + 2 * 10**5, 10**8 + 5 * 10**5), AMM_PROGRAM)
+    x_buy = lambda slot, b, q, sig: col.on_logs(slot, logs(amm_bytes(True, b58decode(pool), X, 10**11, b, q, 10**7, 2 * 10**4,   # noqa: E731
+                                                                     10**7 + 2 * 10**4, 10**7 + 5 * 10**4), AMM_PROGRAM), sig)
+    col.on_logs(510, w_buy, "sig-w")                     # on W's own subscription: a pool nobody follows
+    col.on_logs(511, logs(amm_bytes(True, odd, X, 5, B, Q, 5, 0, 5, 5), AMM_PROGRAM), "sig-x-odd")   # X is not followed: not read
+    x_buy(512, B2, Q2, "sig-x1")                         # the pool's next trade, while its coin is read: it waits, in order
+    assert list(col.finding) == [pool] and len(col.finding[pool][1]) == 2 and col.pools == {}
+    slow.set()
+    col.finding[pool][0].result(timeout=5)
+    col.on_logs(510, w_buy, "sig-w")                     # the same transaction again, from the pool's own subscription
+    assert col.pools == {pool: b58(mint)} and col.stats["pools_found"] == 1 and col.stats["amm_trades"] == 2
+    assert pool in col.pool_feed.wanted() and pool not in col.pool_feed.seen   # an old coin's pool: there while a copy is open
+    x_buy(514, B3, Q3, "sig-x2")
+    (side, trigger, land, tok), = col.c.execute("SELECT side, trigger_slot, land_slot, tok FROM pfills").fetchall()
+    assert (side, trigger, land) == ("buy", 510, 514)    # W's first buy, copied once, at the reserves X's buy left after it
+    assert abs(tok - (B3 - Q3 * B3 / (Q3 + PAPER_STAKE_SOL * 10**9 / 1.005))) < 1
+    assert col.c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0   # a coin born before the window: not stored
+    col.on_logs(520, logs(amm_bytes(True, odd, W, 5, B, Q, 5, 0, 5, 5), AMM_PROGRAM), "sig-w-odd")   # not pump.fun's pool
+    col.finding[b58(odd)][0].result(timeout=5)
+    col.on_logs(521, logs(amm_bytes(True, odd, W, 5, B, Q, 5, 0, 5, 5), AMM_PROGRAM), "sig-w-odd2")
+    assert reads == [pool, b58(odd)] and b58(odd) not in col.pools and not col.finding   # read once, then left alone
+    assert col.c.execute("SELECT COUNT(*) FROM pfills").fetchone()[0] == 1
+    col.c.close()
+
+
+def test_a_pool_migrated_while_the_feed_was_down_is_read_through_a_lagging_node_and_stored(tmp_path, monkeypatch):
+    from hl_screener import pumpfun
+    from hl_screener.pumptx import canonical_pool
+
+    class Rpc:                                            # answers in turn: an account, None (unknown yet) or an error
+        def __init__(self, *answers):
+            self.answers = list(answers)
+
+        def account(self, addr):
+            a = self.answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+
+    monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0.01)
+    col = Collector(tmp_path / "pump.db")
+    W, dev, mint, unknown = bytes([61]) * 32, bytes([62]) * 32, bytes([63]) * 32, bytes([65]) * 32
+    pool = canonical_pool(b58(mint))
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, NULL)", (b58(W),))
+    col.paper.reload()
+    col.on_logs(400, logs(create_bytes(mint, dev)), "sig-create")   # a coin we track; its CreatePoolEvent came in a gap
+    other = lambda slot: col.on_logs(slot, logs(trade_bytes(bytes([64]) * 32, dev, True, 1, 1, 1, 1)), f"sig-{slot}")   # noqa: E731
+    col.rpc = Rpc(None, OSError("HTTP 429"), (AMM_PROGRAM, bytes(43) + mint + b58decode(WSOL) + bytes(186)))
+    col.on_logs(600, logs(amm_bytes(False, b58decode(pool), W, 10**12, 10**15, 85 * 10**9, 10**8, 2 * 10**5, 10**8 - 2 * 10**5,
+                                    10**8 - 6 * 10**5), AMM_PROGRAM), "sig-w")
+    col.finding[pool][0].result(timeout=5)              # not there yet, then refused, then read: the third time
+    other(601)                                           # any next message hands the read over
+    col.flush()
+    assert col.rpc.answers == [] and col.pools == {pool: b58(mint)} and pool in col.pool_feed.seen   # followed, stored
+    assert col.c.execute("SELECT pool FROM mints WHERE addr = ?", (b58(mint),)).fetchone()[0] == pool
+    assert col.c.execute("SELECT slot, buy FROM trades").fetchall() == [(600, 0)]
+    col.rpc = Rpc(None, None, None)                      # a pool no node knows: its trade is said and left
+    col.on_logs(602, logs(amm_bytes(True, unknown, W, 5, 10**15, 85 * 10**9, 5, 0, 5, 5), AMM_PROGRAM), "sig-w2")
+    assert isinstance(col.finding[b58(unknown)][0].exception(timeout=5), ValueError)
+    other(603)
+    assert not col.finding and not col.not_ours           # read again on the wallet's next trade there
+    col.c.close()
+
+
+def test_the_followed_wallets_are_subscribed_while_followed_or_holding_a_copy(tmp_path):
+    import types
+    col = Collector(tmp_path / "pump.db")
+    col.c.executemany("INSERT INTO follow(wallet, added_at, golden_ever, sniper_now) VALUES (?, 0, ?, ?)",
+                      [("G", 1, 0), ("S", 0, 1), ("S2", 0, 1)])
+    col.paper.reload()
+    col.paper.pos[("S2", "M")] = [1.0, 0.25, 0]           # S2 has a copy open
+    assert {"G", "S", "S2"} <= set(col.pool_feed.wanted())   # one subscription each, though none ever traded in a pool
+    col.c.execute("UPDATE follow SET sniper_now = 0")    # the snipers rotate out
+    col.paper.reload()
+    wanted = col.pool_feed.wanted()
+    assert "G" in wanted and "S" not in wanted and "S2" in wanted   # S2 still has its copy to exit
+    col.live = types.SimpleNamespace(targets={"L"}, pos={"M2": {"wallet": "L2"}}, _orders=lambda: [])
+    assert {"L", "L2"} <= set(col.pool_feed.wanted())    # the live copies' wallets too
+    col.live = None
+    col.c.close()
+
+
 def test_collector_stops_storing_while_the_disk_is_nearly_full(tmp_path):
     col = Collector(tmp_path / "pump.db")
     mint, dev, A = bytes([70]) * 32, bytes([71]) * 32, bytes([72]) * 32

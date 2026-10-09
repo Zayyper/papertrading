@@ -7,6 +7,8 @@ with one logsSubscribe each. The public RPC allows 100 subscription attempts per
 connection"), so the pools are spread over a few connections of up to POOL_PER_CONN, subscribed the moment their coin
 migrates (the CreatePoolEvent comes in on the pump.fun feed) and kept while they trade or hold an open paper copy.
 A connection whose attempts are used up is retired and its pools move to a fresh one.
+The followed wallets ride on the same connections, one subscription each (mentions: the wallet), pinned like a pool
+with a copy: a trade of theirs in a pool we do not follow still reaches us (pumpfun.Collector._found).
 """
 from __future__ import annotations
 
@@ -58,10 +60,11 @@ class PoolFeed:
             self.seen[pool] = time.time()
 
     def wanted(self, now: float | None = None) -> list[str]:
-        """The pools worth a subscription: traded within POOL_IDLE_S or holding a paper copy, most recent first."""
+        """The pools worth a subscription: traded within POOL_IDLE_S or pinned (holding a copy), most recent first. A
+        pinned key is wanted even if it never traded here: the followed wallets are pinned too (see the top)."""
         now, pinned = time.time() if now is None else now, self.pinned()
-        keep = [p for p, t in self.seen.items() if now - t < POOL_IDLE_S or p in pinned]
-        keep.sort(key=lambda p: (p not in pinned, -self.seen[p]))
+        keep = [p for p in self.seen.keys() | pinned if p in pinned or now - self.seen[p] < POOL_IDLE_S]
+        keep.sort(key=lambda p: (p not in pinned, -self.seen.get(p, 0.0)))
         return keep[:POOL_PER_CONN * POOL_CONNS]
 
     def place(self, want: list[str], open_conn: Callable[[], _Conn]) -> None:
