@@ -1230,6 +1230,12 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                         log.info("%s", line)
                     for line in paper_lines(db_path) + live_lines(db_path) + go_lines(db_path) + stake_sweep(db_path):   # forward test, live copies, the go-live rule, sizes
                         log.info("%s", line)
+                    try:                                             # the same copies, sold by rules of our own
+                        from .pumpexits import exit_sweep            # here: that module builds on this one
+                        for line in exit_sweep(db_path):
+                            log.info("%s", line)
+                    except Exception:  # noqa: BLE001
+                        log.exception("exit sweep failed")
                     checkpoint(db_path)                              # the long reads are over: let the log reset
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed")
