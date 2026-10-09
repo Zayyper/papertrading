@@ -139,7 +139,9 @@ bought came from elsewhere and earn it nothing in these numbers.
   are stored like curve trades, with the pool's effective reserves after the trade (the events
   carry the reserves before it, checked on 13,379 consecutive live trades), so prices, profits and
   copies run straight through graduation. Kept `PUMP_RETENTION_DAYS` (2, 3 until 2026-09-29), so the
-  wallet ranking now sees two days of trades.
+  wallet ranking now sees two days of trades. Each copied wallet also has a subscription of its own:
+  its trade in a pool the collector does not follow (quiet for over an hour, migrated while the feed
+  was down, a coin older than the window) is still copied, and that pool followed from then on.
 - **Feed delay** is measured on every trade against the chain's own slot clock (`slotSubscribe`):
   on the public endpoint, 1 slot (0.4 s) at the median, 90th and 99th percentile. The report's
   copier lands one slot after the measured median (at least 2 slots after the wallet); the paper
