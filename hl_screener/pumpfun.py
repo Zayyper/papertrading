@@ -673,8 +673,10 @@ class Collector:
         self.gap_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gapcheck")
         self.gap_job = None                                     # the newest gap check, running or waiting
         self.gap_out: queue.SimpleQueue = queue.SimpleQueue()   # (kind, wallet, mint, coin now) whose wallet sold, to the feed's thread
+        self.gap_first: queue.SimpleQueue = queue.SimpleQueue() # a pool connection's copies, read before the rest of any check
         from .pumppools import PoolFeed                         # our pools only, one subscription each (see pumppools)
-        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=self._pinned_pools)
+        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=self._pinned_pools,   # a pool with a copy, subscribed again
+                                  on_back=lambda pool: self.check_gap("pool feed drop", {self.pools.get(pool)}))   # after a drop
         for pool, last in self.c.execute("""SELECT m.pool, (SELECT t.ts FROM trades t WHERE t.mint = m.id ORDER BY t.slot DESC LIMIT 1)
                                              FROM mints m WHERE m.pool IS NOT NULL AND m.ts >= ?""", (cutoff,)):
             self.pool_feed.add(pool, last or 0.0)
@@ -873,30 +875,40 @@ class Collector:
         log.log(level, "disk %g of %g GB free: under %g GB the collector keeps %g h of trades, under %g GB it stops storing them",
                 free, self.stats.get("disk_total_gb") or 0, LOW_DISK_GB, LOW_DISK_KEEP_S / 3600, MIN_FREE_GB)
 
-    def check_gap(self, why: str) -> None:
+    def check_gap(self, why: str, mints: set[str | None] | None = None) -> None:
         """A copy exits on its wallet's first sell, and a sell made while the feed was down (a reconnect, a restart) is
         never seen: that copy would stay open. So after each gap one job reads what every copied wallet holds now, off
-        the feed's thread, and _flush closes the copies whose wallet sold. Copies older than GAP_LOOK_BACK_S are left alone."""
+        the feed's thread, and _flush closes the copies whose wallet sold. Copies older than GAP_LOOK_BACK_S are left alone.
+        A pool connection's drop names its coins (`mints`): their few copies are read next, ahead of the rest of a check
+        already running, which takes minutes with hundreds of copies open; one reader still, at one read per GAP_PACE_S."""
         since = time.time() - GAP_LOOK_BACK_S
         live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None else ())
                 if not p.get("stuck") and p["opened"] >= since]
         paper = [("paper", w, m) for (w, m), (_, _, opened) in self.paper.pos.items() if opened >= since]
         todo = [(kind, w, m, self.paper.own[(w, m)][2] if (w, m) in self.paper.own else 0.0)   # what we saw it buy
-                for kind, w, m in live + paper]
+                for kind, w, m in live + paper if mints is None or m in mints]
         if not todo:
             return
-        if self.gap_job is not None:
-            self.gap_job.cancel()                                 # one still waiting is replaced by this newer list
-        self.gap_job = self.gap_pool.submit(self._gap_job, todo, why)
+        if mints is not None:
+            for t in todo:
+                self.gap_first.put(t)
+            if self.gap_job is None or self.gap_job.running() or self.gap_job.done():   # none waiting, which would read
+                self.gap_job = self.gap_pool.submit(self._gap_job, [], why)            # them first: one that does
+        else:
+            if self.gap_job is not None:
+                self.gap_job.cancel()                             # one still waiting is replaced by this newer list
+            self.gap_job = self.gap_pool.submit(self._gap_job, todo, why)
         self.stats["gap_checks"] += 1
         log.info("gap check after the %s: reading what the wallets of %d open copies hold", why, len(todo))
 
     def _gap_job(self, todo: list[tuple[str, str, str, float]], why: str) -> None:
         """On the worker thread: each wallet's balance of the coin, one read every GAP_PACE_S, real money first, and for
         a paper copy whose wallet sold, the coin as the chain has it now, to price the exit (a few more reads, rare; a
-        live sell reads it itself). It touches the RPC and the queue only. A wallet that cannot be read keeps its copy."""
-        failed = []
-        for kind, wallet, mint, bought in todo:
+        live sell reads it itself). It touches the RPC and the queues only. A wallet that cannot be read keeps its copy."""
+        failed, todo, n = [], collections.deque(todo), 0
+        while todo or not self.gap_first.empty():
+            kind, wallet, mint, bought = todo.popleft() if self.gap_first.empty() else self.gap_first.get_nowait()
+            n += 1
             if self.halt.wait(GAP_PACE_S):
                 return                                            # the collector is stopping
             try:
@@ -912,7 +924,7 @@ class Collector:
                 self.gap_out.put((kind, wallet, mint, self._coin_now(mint) if kind == "paper" else None))
         if failed:
             log.warning("gap check after the %s: %d of %d wallets could not be read (%s): their copies stay open",
-                        why, len(failed), len(todo), _no_key(failed[0])[:200])
+                        why, len(failed), n, _no_key(failed[0])[:200])
 
     def _coin_now(self, mint: str) -> dict[str, Any] | None:
         """On the worker thread: the coin's curve or pool as the chain has it now, or None when it cannot be read."""
