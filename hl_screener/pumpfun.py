@@ -73,6 +73,8 @@ GAP_KEPT = 0.99                # a leader holding less than this share of the to
 POOL_READS = 10                # pools read at once for followed wallets' trades in pools we do not follow (see _found): a bot
                                # trading in hundreds of them must not queue reads on the public RPC's 40 per 10 s
 WAL_LIMIT = 64 * 2**20         # bytes the write-ahead log keeps after a checkpoint resets it
+DB_SLOW_S = 1.0                # the feed's thread waiting this long on the database between two writes is said in the log: everything
+                               # waits with it, with no drop (sells 19+ slots late, a fifth of them, in the live test of 2026-10-07..09)
 SILENT_S = 30                  # this long without pump.fun's logs (they come many times a second), a connection is stalled,
                                # even with its slots still coming
 FALLBACK_S = 900               # one stretch on the fallback feed
@@ -284,12 +286,12 @@ CREATE INDEX IF NOT EXISTS ix_launches_ts ON launches(ts);
 """
 
 
-def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
+def connect(path: str | Path, readonly: bool = False, factory: type[sqlite3.Connection] = sqlite3.Connection) -> sqlite3.Connection:
     p = Path(path)
     if readonly:
         return sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=30, check_same_thread=False)
     p.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(p, timeout=30, check_same_thread=False)
+    c = sqlite3.connect(p, timeout=30, check_same_thread=False, factory=factory)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute(f"PRAGMA journal_size_limit={WAL_LIMIT}")   # a reset log shrinks back: pruning once left gigabytes of it
@@ -616,11 +618,34 @@ def _no_key(text: str) -> str:
     return re.sub(r"(api[-_]?key=)[^&\s'\"]+", r"\1***", text)
 
 
+class _Clocked(sqlite3.Connection):
+    """The feed's connection, timed: `waited` adds up its calls until a flush reads it. Any write of the feed's thread (a
+    new wallet, a coin, a paper fill, a live order) waits for another connection's write transaction to end, up to the
+    30 s timeout, and every message waits with it."""
+    waited = 0.0
+
+    def _timed(self, call, *args):
+        t = time.monotonic()
+        try:
+            return call(*args)
+        finally:
+            self.waited += time.monotonic() - t
+
+    def execute(self, *args):
+        return self._timed(super().execute, *args)
+
+    def executemany(self, *args):
+        return self._timed(super().executemany, *args)
+
+    def commit(self):
+        return self._timed(super().commit)
+
+
 class Collector:
     def __init__(self, db_path: str | Path, ws_url: str = PUBLIC_WS, retention_days: float = 2.0, fallback_url: str | None = None,
                  rpc_url: str = PUBLIC_RPC):
         self.db_path = Path(db_path)
-        self.c = connect(self.db_path)
+        self.c = connect(self.db_path, factory=_Clocked)
         self.ws_url, self.fallback_url = ws_url, fallback_url or None
         self.retention_s = retention_days * 86_400
         self.wallets: dict[str, int] = dict(self.c.execute("SELECT addr, id FROM wallets"))
@@ -653,8 +678,10 @@ class Collector:
         self.pool_reads = ThreadPoolExecutor(max_workers=1, thread_name_prefix="poolread")   # not behind a gap check's minutes
         self.finding: dict[str, tuple[Any, list[tuple]]] = {}  # pool -> (the read of its coin, the trades waiting for it)
         self.not_ours: set[str] = set()                         # pools read and found not a pump.fun coin's SOL pool
+        self.gap_first: queue.SimpleQueue = queue.SimpleQueue() # a pool connection's copies, read before the rest of any check
         from .pumppools import PoolFeed                         # our pools and followed wallets, one subscription each (see pumppools)
-        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=lambda: self._pinned_pools() | self._watched())
+        self.pool_feed = PoolFeed(ws_url, self.on_logs, pinned=lambda: self._pinned_pools() | self._watched(),
+                                  on_back=self._back)           # one with a copy, subscribed again after a drop
         for pool, last in self.c.execute("""SELECT m.pool, (SELECT t.ts FROM trades t WHERE t.mint = m.id ORDER BY t.slot DESC LIMIT 1)
                                              FROM mints m WHERE m.pool IS NOT NULL AND m.ts >= ?""", (cutoff,)):
             self.pool_feed.add(pool, last or 0.0)
@@ -666,6 +693,17 @@ class Collector:
         if self.live is not None:
             open_ |= set(self.live.pos) | {o["mint"] for o in self.live._orders()}
         return {p for p, m in self.pools.items() if m in open_}
+
+    def _back(self, key: str) -> None:
+        """A pool or a followed wallet subscribed again after its connection ended: the copies it carries are read, their
+        wallet may have sold while we were blind (2026-10-08: a copy sold 27 min after it)."""
+        if key in self.pools:
+            mints = {self.pools[key]}
+        else:                                                   # a wallet: the coins it has copies open on
+            mints = {m for w, m in self.paper.pos if w == key}
+            if self.live is not None:
+                mints |= {m for m, p in self.live.pos.items() if p["wallet"] == key}
+        self.check_gap("pool feed drop", mints)
 
     def _watched(self) -> set[str]:
         """Wallets whose every trade must reach us, on a coin or pool we follow or not: the followed ones, paper and live,
@@ -847,7 +885,8 @@ class Collector:
 
     def flush(self) -> None:
         """Write the buffered trades and the paper follower's state. A write that fails (a full disk did, 17 restarts in
-        a row) drops that batch and keeps the feed going: the collector must outlive its own storage."""
+        a row) drops that batch and keeps the feed going: the collector must outlive its own storage. A batch another
+        connection kept the database locked for, past the timeout, is kept for the next flush: none of it was written."""
         try:
             self._flush()
         except sqlite3.OperationalError as e:
@@ -855,6 +894,10 @@ class Collector:
                 self.c.rollback()
             except sqlite3.Error:
                 pass
+            if "locked" in str(e):                                # only a transaction's first write waits for the lock: nothing undone
+                self.stats["db_locked"] = self.stats.get("db_locked", 0) + 1
+                log.warning("database locked by another connection: %d trades kept for the next write", len(self.buf))
+                return
             self.stats["skipped_low_disk"] = self.stats.get("skipped_low_disk", 0) + len(self.buf)
             self.buf.clear()
             self._db_error(e)
@@ -896,6 +939,11 @@ class Collector:
             self.last_paper = now
         set_meta(self.c, "stats", self.stats)
         self.c.commit()
+        waited, self.c.waited = self.c.waited, 0.0
+        if waited >= DB_SLOW_S:
+            self.stats["db_waits"] = self.stats.get("db_waits", 0) + 1
+            log.warning("the feed waited %.1f s on the database since its last write: another connection held the write lock "
+                        "(the maintenance thread?), and every trade and copy waited with it", waited)
 
     def _warn_disk(self) -> None:
         """Say it in the log before the disk fills: a warning an hour under DISK_WARN_GB, an error an hour under
@@ -910,30 +958,40 @@ class Collector:
         log.log(level, "disk %g of %g GB free: under %g GB the collector keeps %g h of trades, under %g GB it stops storing them",
                 free, self.stats.get("disk_total_gb") or 0, LOW_DISK_GB, LOW_DISK_KEEP_S / 3600, MIN_FREE_GB)
 
-    def check_gap(self, why: str) -> None:
+    def check_gap(self, why: str, mints: set[str | None] | None = None) -> None:
         """A copy exits on its wallet's first sell, and a sell made while the feed was down (a reconnect, a restart) is
         never seen: that copy would stay open. So after each gap one job reads what every copied wallet holds now, off
-        the feed's thread, and _flush closes the copies whose wallet sold. Copies older than GAP_LOOK_BACK_S are left alone."""
+        the feed's thread, and _flush closes the copies whose wallet sold. Copies older than GAP_LOOK_BACK_S are left alone.
+        A pool connection's drop names its coins (`mints`): their few copies are read next, ahead of the rest of a check
+        already running, which takes minutes with hundreds of copies open; one reader still, at one read per GAP_PACE_S."""
         since = time.time() - GAP_LOOK_BACK_S
         live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None else ())
                 if not p.get("stuck") and p["opened"] >= since]
         paper = [("paper", w, m) for (w, m), (_, _, opened) in self.paper.pos.items() if opened >= since]
         todo = [(kind, w, m, self.paper.own[(w, m)][2] if (w, m) in self.paper.own else 0.0)   # what we saw it buy
-                for kind, w, m in live + paper]
+                for kind, w, m in live + paper if mints is None or m in mints]
         if not todo:
             return
-        if self.gap_job is not None:
-            self.gap_job.cancel()                                 # one still waiting is replaced by this newer list
-        self.gap_job = self.gap_pool.submit(self._gap_job, todo, why)
+        if mints is not None:
+            for t in todo:
+                self.gap_first.put(t)
+            if self.gap_job is None or self.gap_job.running() or self.gap_job.done():   # none waiting, which would read
+                self.gap_job = self.gap_pool.submit(self._gap_job, [], why)            # them first: one that does
+        else:
+            if self.gap_job is not None:
+                self.gap_job.cancel()                             # one still waiting is replaced by this newer list
+            self.gap_job = self.gap_pool.submit(self._gap_job, todo, why)
         self.stats["gap_checks"] += 1
         log.info("gap check after the %s: reading what the wallets of %d open copies hold", why, len(todo))
 
     def _gap_job(self, todo: list[tuple[str, str, str, float]], why: str) -> None:
         """On the worker thread: each wallet's balance of the coin, one read every GAP_PACE_S, real money first, and for
         a paper copy whose wallet sold, the coin as the chain has it now, to price the exit (a few more reads, rare; a
-        live sell reads it itself). It touches the RPC and the queue only. A wallet that cannot be read keeps its copy."""
-        failed = []
-        for kind, wallet, mint, bought in todo:
+        live sell reads it itself). It touches the RPC and the queues only. A wallet that cannot be read keeps its copy."""
+        failed, todo, n = [], collections.deque(todo), 0
+        while todo or not self.gap_first.empty():
+            kind, wallet, mint, bought = todo.popleft() if self.gap_first.empty() else self.gap_first.get_nowait()
+            n += 1
             if self.halt.wait(GAP_PACE_S):
                 return                                            # the collector is stopping
             try:
@@ -949,7 +1007,7 @@ class Collector:
                 self.gap_out.put((kind, wallet, mint, self._coin_now(mint) if kind == "paper" else None))
         if failed:
             log.warning("gap check after the %s: %d of %d wallets could not be read (%s): their copies stay open",
-                        why, len(failed), len(todo), _no_key(failed[0])[:200])
+                        why, len(failed), n, _no_key(failed[0])[:200])
 
     def _coin_now(self, mint: str) -> dict[str, Any] | None:
         """On the worker thread: the coin's curve or pool as the chain has it now, or None when it cannot be read."""
@@ -1034,6 +1092,7 @@ class Collector:
             except (NotImplementedError, RuntimeError):   # Windows, or not the main thread: Ctrl+C still ends it
                 pass
         last_line, last_forget = time.time(), time.time()
+        self.c.waited = 0.0                                     # the start's own reads are not the feed waiting
         gap_from = None
         seen = (self.stats["trades"], self.stats["mints"], self.stats["parse_errors"])
         pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
@@ -1142,7 +1201,8 @@ def checkpoint(db_path: str | Path) -> tuple[int, int, int] | None:
     reads keep the log from resetting meanwhile; on 2026-09-25 the disk filled right after pruning began."""
     c = connect(db_path)
     try:
-        return c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        c.execute("PRAGMA wal_checkpoint(PASSIVE)")          # the bulk first, beside the feed's writes: TRUNCATE holds the write
+        return c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()   # lock while it copies, and the feed waits on it
     finally:
         c.close()
 
@@ -1580,7 +1640,6 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
         measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")
         if latency_slots is None:
             latency_slots = max(2, measured + 1) if measured is not None else 2
-        c.execute("UPDATE launches SET graduated = 1 WHERE graduated = 0 AND mint IN (SELECT addr FROM mints WHERE pool IS NOT NULL)")
         todo = c.execute("""SELECT m.id, m.addr, m.slot, m.ts, m.symbol, w.addr, m.creator, m.pool IS NOT NULL
                             FROM mints m JOIN wallets w ON w.id = m.creator
                             WHERE m.ts <= ? AND NOT EXISTS (SELECT 1 FROM launches l WHERE l.mint = m.addr)
@@ -1597,14 +1656,17 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
             for k in ("s30", "s60", *LATE_STATES):
                 flat += list(st[k]) if st and st[k] else [None, None]
             rows.append((*flat, LATE_DONE if st else None))
-        if rows:
-            c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         # launches settled before the snipers were recorded, while their trades are still here
         late = c.execute("""SELECT l.mint, m.id, m.slot, m.creator FROM launches l JOIN mints m ON m.addr = l.mint
                             WHERE l.buyers IS NULL LIMIT ?""", (limit,)).fetchall()
+        late = [(*_snipers_of(c, mid, slot, creator), addr) for addr, mid, slot, creator in late]
+        # written last, in one short transaction: its first statement used to take the write lock, kept through every
+        # launch's states and two scans of `launches`, and the feed's next write waited all along (2026-10-07..09)
+        c.execute("UPDATE launches SET graduated = 1 WHERE graduated = 0 AND mint IN (SELECT addr FROM mints WHERE pool IS NOT NULL)")
+        if rows:
+            c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         if late:
-            c.executemany("UPDATE launches SET buyers = ?, dev_buy = ? WHERE mint = ?",
-                          [(*_snipers_of(c, mid, slot, creator), addr) for addr, mid, slot, creator in late])
+            c.executemany("UPDATE launches SET buyers = ?, dev_buy = ? WHERE mint = ?", late)
         c.commit()
         _backfill_late(c, latency_slots, stake_sol, hold_s, limit)
         return len(rows)

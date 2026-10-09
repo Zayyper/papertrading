@@ -1,4 +1,6 @@
+import asyncio
 import dataclasses
+import json
 import time
 import types
 from concurrent.futures import Future
@@ -385,6 +387,107 @@ def test_a_wallet_still_holding_after_a_gap_keeps_its_copies_and_so_does_one_the
     col.rpc = Holdings({})
     col.check_gap("reconnect")
     assert col.rpc.asked == [] and col.stats["gap_checks"] == 2
+    col.c.close()
+
+
+class Subscribing:
+    """A pool connection's socket: the server confirms the subscription it is sent, then closes the connection."""
+    def __init__(self):
+        self.q = asyncio.Queue()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send(self, msg):
+        await self.q.put(json.dumps({"jsonrpc": "2.0", "result": 7, "id": json.loads(msg)["id"]}))
+        await self.q.put(None)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        msg = await self.q.get()
+        if msg is None:
+            raise ConnectionError("sent 1002 (protocol error) invalid status code; no close frame received")
+        return msg
+
+
+def test_a_pool_whose_connection_dropped_has_its_copies_read_once_it_is_subscribed_again(tmp_path, monkeypatch):
+    """DJfNX864 (2026-10-08): its pool's connection dropped, its wallet sold meanwhile, and our copy sold 27 min later,
+    when a check of everything happened to run. Now the pool's copies are read the moment it is subscribed again."""
+    from hl_screener.pumppools import _Conn
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    col.pools["POOL"] = b58(MINT)                                   # MINT trades on its PumpSwap pool now
+    col.paper.pos[(b58(G), b58(MINT2))] = [10**12, 0.25, int(time.time())]   # and a copy of a coin on the main feed
+    col.rpc = Holdings({(b58(G), b58(MINT)): 0})                    # the wallet sold all its MINT
+
+    def connection():                                               # placed on a connection, as PoolFeed.place does
+        c = _Conn()
+        c.pools.add("POOL")
+        c.queue.put_nowait("POOL")
+        asyncio.run(col.pool_feed._conn(c, types.SimpleNamespace(connect=lambda *a, **k: Subscribing())))
+
+    connection()                                                    # subscribed, then dropped: nothing to read yet
+    assert col.rpc.asked == [] and col.stats["gap_checks"] == 0
+    connection()                                                    # subscribed again: what we were blind to is read
+    col.flush()
+    assert col.rpc.asked == [(b58(G), b58(MINT))] * 2               # live, then paper; MINT2's copy is not read
+    assert len(chain.sent) == 2 and col.stats["gap_sold"] == 2      # the live copy's sell is out, the paper's on its way
+    assert [a["side"] for a in col.paper.pending[b58(MINT)]] == ["sell"]
+    col.c.close()
+
+
+def test_a_followed_wallet_whose_connection_dropped_has_its_copies_read_once_it_is_subscribed_again(tmp_path, monkeypatch):
+    """The followed wallets ride the pool feed too, one subscription each: back after a drop, the coins its copies are
+    on are read, and no one else's."""
+    from hl_screener.pumppools import _Conn
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    col.paper.pos[(b58(X), b58(MINT2))] = [10**12, 0.25, int(time.time())]   # another wallet's copy: not read
+    col.rpc = Holdings({(b58(G), b58(MINT)): 0})                    # G sold all its MINT while we were blind
+
+    def connection():
+        c = _Conn()
+        c.pools.add(b58(G))
+        c.queue.put_nowait(b58(G))
+        asyncio.run(col.pool_feed._conn(c, types.SimpleNamespace(connect=lambda *a, **k: Subscribing())))
+
+    connection()
+    assert col.rpc.asked == []
+    connection()
+    col.flush()
+    assert col.rpc.asked == [(b58(G), b58(MINT))] * 2               # live, then paper
+    assert len(chain.sent) == 2 and col.stats["gap_sold"] == 2
+    col.c.close()
+
+
+def test_a_pools_copies_are_read_before_the_rest_of_a_check_already_running(tmp_path, monkeypatch):
+    """A check of every copy reads one every GAP_PACE_S, minutes for hundreds of them, after each main-feed reconnect
+    (every 1-5 min): a pool's few copies queued behind it would be read minutes late."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    col.pools["POOL"] = b58(MINT3)
+    col.paper.pos[(b58(G), b58(MINT3))] = [10**12, 0.25, int(time.time())]
+    col.gap_pool = ThreadPoolExecutor(max_workers=1)                # a real worker, one read at a time
+    rpc, first, go = Holdings({(b58(G), b58(m)): bought for m in (MINT, MINT3)}), threading.Event(), threading.Event()
+    read = rpc.call
+
+    def slow(*args, **kwargs):                                      # the full check's first read takes a while
+        if not rpc.asked:
+            first.set()
+            go.wait(5)
+        return read(*args, **kwargs)
+
+    rpc.call, col.rpc = slow, rpc
+    col.check_gap("reconnect")                                      # every copy: the live one first, then the paper ones
+    assert first.wait(5)
+    col.check_gap("pool feed drop", {b58(MINT3)})                   # meanwhile a pool connection dropped and is back
+    go.set()
+    col.gap_pool.shutdown(wait=True)
+    assert rpc.asked == [(b58(G), b58(m)) for m in (MINT, MINT3, MINT, MINT3)]   # the pool's copy second, not last
     col.c.close()
 
 

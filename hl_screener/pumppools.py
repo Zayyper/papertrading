@@ -32,6 +32,7 @@ WORKED_S = 30                   # a connection that lived this long was let in a
 class _Conn:
     def __init__(self) -> None:
         self.pools: set[str] = set()           # every pool this connection was asked to follow
+        self.subs: dict[int, str] = {}          # subscription request id -> its pool, until the server confirms it
         self.attempts = 0
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self.task: asyncio.Task | None = None
@@ -40,9 +41,10 @@ class _Conn:
 
 class PoolFeed:
     def __init__(self, url: str, on_logs: Callable[[int, list[str], str | None], None],
-                 pinned: Callable[[], set[str]] = set) -> None:
-        self.url, self.on_logs, self.pinned = url, on_logs, pinned
+                 pinned: Callable[[], set[str]] = set, on_back: Callable[[str], None] = lambda pool: None) -> None:
+        self.url, self.on_logs, self.pinned, self.on_back = url, on_logs, pinned, on_back
         self.seen: dict[str, float] = {}      # pool -> when it last traded, or was added
+        self.blind: set[str] = set()          # pools with a copy open whose connection ended, until subscribed again
         self.conns: list[_Conn] = []
         self.next_send = 0.0
         self.fails, self.wait_until = 0, 0.0
@@ -131,12 +133,19 @@ class PoolFeed:
                                 self.on_logs(res["context"]["slot"], res["value"]["logs"], res["value"].get("signature"))
                         elif "error" in msg:
                             log.warning("pool subscription refused: %s", str(msg["error"])[:160])
+                        elif msg.get("id") in c.subs:              # subscribed: a pool blind since its connection ended is
+                            pool = c.subs.pop(msg["id"])           # back, and its wallet may have sold meanwhile (DJfNX864,
+                            if pool in self.blind:                 # 2026-10-08: our copy sold 27 min after it)
+                                self.blind.discard(pool)
+                                self.on_back(pool)
                 finally:
                     sender.cancel()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - the manager puts its pools on another connection
             why = f"{type(e).__name__}: {str(e)[:120]}"
+        finally:
+            self.blind |= c.pools & self.pinned()      # dropped, retired or stopped: its pools with a copy go unseen
         self.stats["pool_drops"] += 1                  # ended either way: its pools go to another connection
         lived = time.time() - c.opened
         self.fails = 0 if lived >= WORKED_S else self.fails + 1
@@ -152,5 +161,6 @@ class PoolFeed:
             if self.next_send - 1 / SUB_PER_S > now:
                 await asyncio.sleep(self.next_send - 1 / SUB_PER_S - now)
             n += 1
+            c.subs[n] = pool
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": n, "method": "logsSubscribe",
                                       "params": [{"mentions": [pool]}, {"commitment": "confirmed"}]}))
