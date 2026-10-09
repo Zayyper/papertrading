@@ -71,6 +71,8 @@ GAP_PACE_S = 0.5               # between two reads after a feed gap (a sold copy
 GAP_LOOK_BACK_S = 3 * 86_400   # copies opened longer ago are not checked: a wallet that never sells a dead coin would be read on every reconnect
 GAP_KEPT = 0.99                # a leader holding less than this share of the tokens we saw it buy sold while we were blind
 WAL_LIMIT = 64 * 2**20         # bytes the write-ahead log keeps after a checkpoint resets it
+DB_SLOW_S = 1.0                # the feed's thread waiting this long on the database between two writes is said in the log: everything
+                               # waits with it, with no drop (sells 19+ slots late, a fifth of them, in the live test of 2026-10-07..09)
 SILENT_S = 30                  # this long without pump.fun's logs (they come many times a second), a connection is stalled,
                                # even with its slots still coming
 FALLBACK_S = 900               # one stretch on the fallback feed
@@ -282,12 +284,12 @@ CREATE INDEX IF NOT EXISTS ix_launches_ts ON launches(ts);
 """
 
 
-def connect(path: str | Path, readonly: bool = False) -> sqlite3.Connection:
+def connect(path: str | Path, readonly: bool = False, factory: type[sqlite3.Connection] = sqlite3.Connection) -> sqlite3.Connection:
     p = Path(path)
     if readonly:
         return sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=30, check_same_thread=False)
     p.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(p, timeout=30, check_same_thread=False)
+    c = sqlite3.connect(p, timeout=30, check_same_thread=False, factory=factory)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute(f"PRAGMA journal_size_limit={WAL_LIMIT}")   # a reset log shrinks back: pruning once left gigabytes of it
@@ -614,11 +616,34 @@ def _no_key(text: str) -> str:
     return re.sub(r"(api[-_]?key=)[^&\s'\"]+", r"\1***", text)
 
 
+class _Clocked(sqlite3.Connection):
+    """The feed's connection, timed: `waited` adds up its calls until a flush reads it. Any write of the feed's thread (a
+    new wallet, a coin, a paper fill, a live order) waits for another connection's write transaction to end, up to the
+    30 s timeout, and every message waits with it."""
+    waited = 0.0
+
+    def _timed(self, call, *args):
+        t = time.monotonic()
+        try:
+            return call(*args)
+        finally:
+            self.waited += time.monotonic() - t
+
+    def execute(self, *args):
+        return self._timed(super().execute, *args)
+
+    def executemany(self, *args):
+        return self._timed(super().executemany, *args)
+
+    def commit(self):
+        return self._timed(super().commit)
+
+
 class Collector:
     def __init__(self, db_path: str | Path, ws_url: str = PUBLIC_WS, retention_days: float = 2.0, fallback_url: str | None = None,
                  rpc_url: str = PUBLIC_RPC):
         self.db_path = Path(db_path)
-        self.c = connect(self.db_path)
+        self.c = connect(self.db_path, factory=_Clocked)
         self.ws_url, self.fallback_url = ws_url, fallback_url or None
         self.retention_s = retention_days * 86_400
         self.wallets: dict[str, int] = dict(self.c.execute("SELECT addr, id FROM wallets"))
@@ -775,7 +800,8 @@ class Collector:
 
     def flush(self) -> None:
         """Write the buffered trades and the paper follower's state. A write that fails (a full disk did, 17 restarts in
-        a row) drops that batch and keeps the feed going: the collector must outlive its own storage."""
+        a row) drops that batch and keeps the feed going: the collector must outlive its own storage. A batch another
+        connection kept the database locked for, past the timeout, is kept for the next flush: none of it was written."""
         try:
             self._flush()
         except sqlite3.OperationalError as e:
@@ -783,6 +809,10 @@ class Collector:
                 self.c.rollback()
             except sqlite3.Error:
                 pass
+            if "locked" in str(e):                                # only a transaction's first write waits for the lock: nothing undone
+                self.stats["db_locked"] = self.stats.get("db_locked", 0) + 1
+                log.warning("database locked by another connection: %d trades kept for the next write", len(self.buf))
+                return
             self.stats["skipped_low_disk"] = self.stats.get("skipped_low_disk", 0) + len(self.buf)
             self.buf.clear()
             self._db_error(e)
@@ -824,6 +854,11 @@ class Collector:
             self.last_paper = now
         set_meta(self.c, "stats", self.stats)
         self.c.commit()
+        waited, self.c.waited = self.c.waited, 0.0
+        if waited >= DB_SLOW_S:
+            self.stats["db_waits"] = self.stats.get("db_waits", 0) + 1
+            log.warning("the feed waited %.1f s on the database since its last write: another connection held the write lock "
+                        "(the maintenance thread?), and every trade and copy waited with it", waited)
 
     def _warn_disk(self) -> None:
         """Say it in the log before the disk fills: a warning an hour under DISK_WARN_GB, an error an hour under
@@ -962,6 +997,7 @@ class Collector:
             except (NotImplementedError, RuntimeError):   # Windows, or not the main thread: Ctrl+C still ends it
                 pass
         last_line, last_forget = time.time(), time.time()
+        self.c.waited = 0.0                                     # the start's own reads are not the feed waiting
         gap_from = None
         seen = (self.stats["trades"], self.stats["mints"], self.stats["parse_errors"])
         pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
@@ -1070,7 +1106,8 @@ def checkpoint(db_path: str | Path) -> tuple[int, int, int] | None:
     reads keep the log from resetting meanwhile; on 2026-09-25 the disk filled right after pruning began."""
     c = connect(db_path)
     try:
-        return c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        c.execute("PRAGMA wal_checkpoint(PASSIVE)")          # the bulk first, beside the feed's writes: TRUNCATE holds the write
+        return c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()   # lock while it copies, and the feed waits on it
     finally:
         c.close()
 
@@ -1502,7 +1539,6 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
         measured = (get_meta(c, "stats", {}) or {}).get("lag_p50")
         if latency_slots is None:
             latency_slots = max(2, measured + 1) if measured is not None else 2
-        c.execute("UPDATE launches SET graduated = 1 WHERE graduated = 0 AND mint IN (SELECT addr FROM mints WHERE pool IS NOT NULL)")
         todo = c.execute("""SELECT m.id, m.addr, m.slot, m.ts, m.symbol, w.addr, m.creator, m.pool IS NOT NULL
                             FROM mints m JOIN wallets w ON w.id = m.creator
                             WHERE m.ts <= ? AND NOT EXISTS (SELECT 1 FROM launches l WHERE l.mint = m.addr)
@@ -1519,14 +1555,17 @@ def settle_launches(db_path: str | Path, latency_slots: int | None = None, stake
             for k in ("s30", "s60", *LATE_STATES):
                 flat += list(st[k]) if st and st[k] else [None, None]
             rows.append((*flat, LATE_DONE if st else None))
-        if rows:
-            c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         # launches settled before the snipers were recorded, while their trades are still here
         late = c.execute("""SELECT l.mint, m.id, m.slot, m.creator FROM launches l JOIN mints m ON m.addr = l.mint
                             WHERE l.buyers IS NULL LIMIT ?""", (limit,)).fetchall()
+        late = [(*_snipers_of(c, mid, slot, creator), addr) for addr, mid, slot, creator in late]
+        # written last, in one short transaction: its first statement used to take the write lock, kept through every
+        # launch's states and two scans of `launches`, and the feed's next write waited all along (2026-10-07..09)
+        c.execute("UPDATE launches SET graduated = 1 WHERE graduated = 0 AND mint IN (SELECT addr FROM mints WHERE pool IS NOT NULL)")
+        if rows:
+            c.executemany(f"INSERT OR IGNORE INTO launches ({','.join(LAUNCH_COLS)}) VALUES ({','.join('?' * len(LAUNCH_COLS))})", rows)
         if late:
-            c.executemany("UPDATE launches SET buyers = ?, dev_buy = ? WHERE mint = ?",
-                          [(*_snipers_of(c, mid, slot, creator), addr) for addr, mid, slot, creator in late])
+            c.executemany("UPDATE launches SET buyers = ?, dev_buy = ? WHERE mint = ?", late)
         c.commit()
         _backfill_late(c, latency_slots, stake_sol, hold_s, limit)
         return len(rows)

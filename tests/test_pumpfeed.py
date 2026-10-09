@@ -200,6 +200,60 @@ def test_a_full_disk_drops_the_batch_but_never_stops_the_collector(tmp_path):
     real.close()
 
 
+def test_settling_launches_leaves_the_write_lock_free_while_it_computes(tmp_path, monkeypatch):
+    """settle_launches held the write lock from its first statement to its commit, through every launch's states: the
+    feed's next write waited on it all along (sells up to 630 slots late, 2026-10-07..09)."""
+    from test_pump import create_bytes, logs, trade_bytes
+
+    from hl_screener import pumpfun
+    db, then = tmp_path / "pump.db", int(time.time()) - 3600     # an hour ago: its window has closed
+    col = Collector(db)
+    col.on_logs(1000, logs(create_bytes(bytes([90]) * 32, bytes([91]) * 32, ts=then)))
+    col.on_logs(1001, logs(trade_bytes(bytes([90]) * 32, bytes([92]) * 32, True, 10**9, 10**12, 31 * 10**9, 10**15, ts=then)))
+    col.flush()
+    col.c.execute("PRAGMA busy_timeout = 50")                         # a feed write that has to wait fails here instead
+    real, fed = pumpfun.strategy_states, []
+
+    def computing(*args, **kwargs):                                   # meanwhile the feed brings a new coin by a new wallet
+        col.on_logs(2000, logs(create_bytes(bytes([93]) * 32, bytes([94]) * 32)))
+        col.flush()
+        fed.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pumpfun, "strategy_states", computing)
+    assert pumpfun.settle_launches(db, latency_slots=2, hold_s=300) == 1 and fed
+    assert col.c.execute("SELECT COUNT(*) FROM mints").fetchone()[0] == 2
+    col.c.close()
+
+
+def test_a_batch_the_database_stays_locked_for_is_kept_and_a_long_wait_is_said(tmp_path, monkeypatch, caplog):
+    import threading
+
+    from test_pump import create_bytes, logs, trade_bytes
+
+    from hl_screener import pumpfun
+    monkeypatch.setattr(pumpfun, "DB_SLOW_S", 0.2)                    # 1 s, scaled down
+    db, mint, maker = tmp_path / "pump.db", bytes([95]) * 32, bytes([96]) * 32
+    col = Collector(db)
+    caplog.set_level("WARNING", logger="hl_screener.pumpfun")
+    col.on_logs(10, logs(create_bytes(mint, maker)))
+    col.flush()
+    other = sqlite3.connect(db, isolation_level=None, check_same_thread=False)   # the maintenance thread, mid-write,
+    other.execute("BEGIN IMMEDIATE")
+    col.c.execute("PRAGMA busy_timeout = 50")                         # past the feed's timeout (30 s in life)
+    col.on_logs(11, logs(trade_bytes(mint, maker, True, 10**9, 10**12, 31 * 10**9, 10**15)))   # a wallet known: no write
+    col.flush()
+    assert len(col.buf) == 1 and col.stats["db_locked"] == 1          # not dropped as a full disk's batch is
+    assert "skipped_low_disk" not in col.stats
+    col.c.execute("PRAGMA busy_timeout = 30000")
+    threading.Timer(0.3, other.commit).start()                        # its write ends 0.3 s later
+    col.flush()                                                       # waited out, written, and said
+    assert col.buf == [] and col.c.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+    assert "s on the database since its last write" in caplog.text and col.stats["db_waits"] == 1
+    other.close()
+    col.c.close()
+
+
 def test_the_log_warns_hourly_before_the_disk_fills_and_errs_at_once_when_pruning_starts(tmp_path, monkeypatch, caplog):
     from hl_screener import pumpfun
     disk = {"disk_free_gb": 8.0, "disk_total_gb": 40.0}
