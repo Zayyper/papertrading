@@ -267,7 +267,7 @@ def copied(tmp_path, monkeypatch):
     cv = Curve()
     bought = trade(col, 11, MINT, G, True, cv)
     trade(col, 12, MINT, me, True, cv, sol=246_913_580)    # our live buy lands
-    trade(col, 14, MINT, X, True, cv)                      # and so does the paper copy
+    trade(col, 15, MINT, X, True, cv)                      # and so does the paper copy, 4 slots behind the wallet
     col.flush()
     assert (b58(G), b58(MINT)) in col.paper.pos and b58(MINT) in col.live.pos and len(chain.sent) == 1
     return col, chain, bought
@@ -496,8 +496,8 @@ def test_exit_mode_sells_the_open_copies_and_copies_nothing_new(tmp_path):
 def test_the_live_line_shows_the_wallet_and_live_against_paper_on_the_same_copies(tmp_path):
     col, chain, cv, me, mine = held(tmp_path)
     w = b58(G)
-    for m, live_pnl, paper_pnl in ((b58(MINT2), 0.01, 0.03), (b58(MINT3), -0.05, -0.04)):
-        col.c.execute("INSERT INTO lorders(mode, wallet, mint, side, status, sol) VALUES ('live', ?, ?, 'buy', 'filled', 0.25)", (w, m))
+    for m, live_pnl, paper_pnl in ((b58(MINT2), 0.002, 0.03), (b58(MINT3), -0.01, -0.04)):
+        col.c.execute("INSERT INTO lorders(mode, wallet, mint, side, status, sol) VALUES ('live', ?, ?, 'buy', 'filled', 0.05)", (w, m))
         col.c.execute("INSERT INTO lorders(mode, wallet, mint, side, status, pnl, done) VALUES ('live', ?, ?, 'sell', 'filled', ?, 0)",
                       (w, m, live_pnl))
         col.c.execute("INSERT INTO pfills(wallet, mint, side, sol) VALUES (?, ?, 'buy', 0.25)", (w, m))
@@ -505,7 +505,9 @@ def test_the_live_line_shows_the_wallet_and_live_against_paper_on_the_same_copie
     col.c.commit()
     lines = live_lines(tmp_path / "pump.db")
     assert "wallet 1.000 SOL at " in lines[-2]                       # as last read, and when
-    assert lines[-1] == "live vs paper on the same 2 copies: live -0.0400 SOL, paper -0.0100 SOL, live minus paper per copy median -6.0%"
+    # live 0.05 SOL a copy, paper 0.25: the 2 x 0.001505 SOL of fees a round weigh 6.0% on one and 1.2% on the other
+    assert lines[-1] == ("live vs paper on the same 2 copies: live -0.0080 SOL, paper -0.0100 SOL, live minus paper per copy median -6.0%, "
+                         "-1.2% with the paper at the live stake")
     col.c.close()
 
 

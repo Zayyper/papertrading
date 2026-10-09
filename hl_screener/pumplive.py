@@ -487,7 +487,7 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
     copy of the same buy and to the price the wallet's buy left), and the live copies' results."""
     import collections
     import statistics
-    from .pumpfun import _pct, connect, get_meta
+    from .pumpfun import TX_COST_SOL, _pct, connect, get_meta
     c = connect(db_path, readonly=True)
     try:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'lorders'").fetchone():
@@ -500,7 +500,7 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
         held = c.execute("SELECT COUNT(*), COALESCE(SUM(cost), 0), COALESCE(SUM(stuck), 0) FROM lpos").fetchone()
         wallet = get_meta(c, "live_wallet")
         # each closed live copy next to the paper copy of the same buy: their profit over what each put in
-        pairs = c.execute("""SELECT s.pnl, s.pnl / b.sol, p.pnl, p.pnl / pb.sol
+        pairs = c.execute("""SELECT s.pnl, s.pnl / b.sol, p.pnl, p.pnl / pb.sol, b.sol, pb.sol
                              FROM (SELECT wallet, mint, SUM(pnl) AS pnl FROM lorders WHERE mode = 'live' AND side = 'sell'
                                    AND status = 'filled' GROUP BY wallet, mint) s
                              JOIN lorders b ON b.mode = 'live' AND b.side = 'buy' AND b.status = 'filled' AND b.wallet = s.wallet AND b.mint = s.mint
@@ -542,6 +542,9 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
                    + (f", {held[2]} STUCK: sell by hand" if held[2] else "")
                    + (f" | wallet {wallet['balance']:.3f} SOL at {time.strftime('%H:%M', time.gmtime(wallet['at']))} UTC" if wallet else ""))
     if pairs:
+        fees = 2 * TX_COST_SOL      # a round's signatures, priority fees and tips: the same SOL on any size, so a smaller copy pays more of itself
+        same = [r[1] - (r[3] + fees / r[5] - fees / r[4]) for r in pairs]
         out.append(f"live vs paper on the same {len(pairs)} copies: live {sum(r[0] for r in pairs):+.4f} SOL, paper "
-                   f"{sum(r[2] for r in pairs):+.4f} SOL, live minus paper per copy median {statistics.median(r[1] - r[3] for r in pairs):+.1%}")
+                   f"{sum(r[2] for r in pairs):+.4f} SOL, live minus paper per copy median {statistics.median(r[1] - r[3] for r in pairs):+.1%}"
+                   f", {statistics.median(same):+.1%} with the paper at the live stake")
     return out

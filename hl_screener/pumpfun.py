@@ -59,6 +59,8 @@ PRIORITY_SOL = 0.0005          # compute-unit price a fill that cannot wait has 
 TIP_SOL = 0.001                # Jito tip: what buys a place at the top of the block
 TX_COST_SOL = BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL   # charged on the copy's buy and again on its sell
 PAPER_STAKE_SOL = 0.25         # each live paper copy (0.1 until 2026-09-26): the size stake_sweep found best for every golden wallet
+PAPER_BUY_SLOTS = 4            # where the live copies landed behind their wallet, p50 of 36 rounds (2026-10-07..09): buys 4
+PAPER_SELL_SLOTS = 3           # slots, sells 3; the replay's 2 was a slot or two kinder than the chain
 LAMPORTS = 1e9
 MIN_FREE_GB = 1.0              # below this much free disk, trades are not stored: the server's last space is the system's
 LOW_DISK_GB = 3.0              # below this much, prune down to LOW_DISK_KEEP_S of history instead of the full retention
@@ -323,14 +325,15 @@ class PaperFollow:
     """Forward test of the golden wallets, out-of-sample by construction: a wallet is followed only from the
     moment a report flags it, and kept after that. Its first buy of each token is copied with `stake_sol`,
     landing `latency_slots` after it, or right after the newest slot the feed has shown if the feed lags more;
-    the copy is sold when the wallet first sells, the same way. Priced on the live curve at the wallet's own
-    fee rate plus `tx_cost_sol` per transaction (signature, priority fee, tip): the report's replay rules,
-    so the two compare directly.
+    the copy is sold when the wallet first sells, landing `sell_latency_slots` after it. Priced on the live curve
+    at the wallet's own fee rate plus `tx_cost_sol` per transaction (signature, priority fee, tip): the report's
+    replay rules, at the delays the live copies met rather than the replay's 2 slots.
     Nothing is ever sent to Solana."""
 
-    def __init__(self, c: sqlite3.Connection, latency_slots: int = 2, stake_sol: float = PAPER_STAKE_SOL, tx_cost_sol: float = TX_COST_SOL):
+    def __init__(self, c: sqlite3.Connection, latency_slots: int = PAPER_BUY_SLOTS, stake_sol: float = PAPER_STAKE_SOL,
+                 tx_cost_sol: float = TX_COST_SOL, sell_latency_slots: int = PAPER_SELL_SLOTS):
         from .pumpmature import MC_LEVELS                      # here: that module builds on this one
-        self.c, self.L, self.stake, self.tx = c, latency_slots, stake_sol, tx_cost_sol
+        self.c, self.L, self.Ls, self.stake, self.tx = c, latency_slots, sell_latency_slots, stake_sol, tx_cost_sol
         self.follow: set[str] = set()
         self.mature_only: set[str] = set()                     # followed only for buying past $100k: only those buys are copied
         self.mature_mcap = MC_LEVELS["mc100k"]
@@ -423,7 +426,8 @@ class PaperFollow:
         rate = e["fee"] / e["sol"] if e["sol"] else FEE
         if e["buy"] and e["fee"] == 0:                          # a PumpSwap buy logs no fee: it pays what the coin's sells pay
             rate = self.sell_rate.get(mint, FEE)
-        self.pending.setdefault(mint, []).append({"wallet": user, "side": side, "trigger": slot, "land": max(slot + self.L, self.tip + 1),
+        late = self.L if e["buy"] else self.Ls
+        self.pending.setdefault(mint, []).append({"wallet": user, "side": side, "trigger": slot, "land": max(slot + late, self.tip + 1),
                                                   "rate": rate, "leader_px": leader_px, "t": time.time()})
 
     def _run_due(self, mint: str, acts: list[dict[str, Any]], due: list[bool], timed_out: bool = False) -> None:
@@ -522,7 +526,7 @@ class PaperFollow:
             r["win_rate"] = r["wins"] / r["closed"] if r["closed"] else None
         cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
         recent = [dict(zip(cols, r)) for r in self.c.execute(f"SELECT {', '.join(cols)} FROM pfills ORDER BY id DESC LIMIT 50")]
-        return {"at": int(time.time()), "stake_sol": self.stake, "latency_slots": self.L, "tx_cost_sol": self.tx,
+        return {"at": int(time.time()), "stake_sol": self.stake, "latency_slots": self.L, "sell_latency_slots": self.Ls, "tx_cost_sol": self.tx,
                 "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL},
                 "snipers": self.sniper_cfg, "pending": sum(len(v) for v in self.pending.values()),
                 "wallets": sorted(rows.values(), key=lambda r: r["added_at"] or 0), "open": open_, "recent": recent}

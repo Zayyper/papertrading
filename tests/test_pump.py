@@ -215,15 +215,16 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
         states[(m, slot)] = (cv.vsol, cv.vtok)
         col.on_logs(slot, logs(b))
 
-    trade(100, G, True, 10**9)            # the followed wallet buys: the copy lands at slot 102 or later
+    trade(100, G, True, 10**9)            # the followed wallet buys: the copy lands at slot 104 or later, as live buys did
     trade(101, X, True, 2 * 10**9)        # not due yet
-    trade(103, Y, True, 10**9)            # due: the copy buys at the state X left
-    trade(104, G, True, 10**9)            # a second buy of the same token is not copied
-    trade(120, G, False, None)            # the wallet sells: the copy sells at slot 122 or later
-    trade(125, Z, True, 10**9)            # due: the copy sells at the state G's sell left
+    trade(103, Y, True, 10**9)            # nor yet
+    trade(104, G, True, 10**9)            # due: the copy buys at the state Y left; this second buy is not copied
+    trade(120, G, False, None)            # the wallet sells: the copy sells at slot 123 or later
+    trade(122, X, False, None)            # not due yet
+    trade(125, Z, True, 10**9)            # due: the copy sells at the state X's sell left
     fills = col.c.execute("SELECT side, trigger_slot, land_slot, pnl, timed_out FROM pfills ORDER BY id").fetchall()
-    assert [f[:3] for f in fills] == [("buy", 100, 102), ("sell", 120, 122)]
-    assert abs(fills[1][3] - copy_trade(states[(mint, 101)], states[(mint, 120)], PAPER_STAKE_SOL, TX_COST_SOL)) < 1e-6
+    assert [f[:3] for f in fills] == [("buy", 100, 104), ("sell", 120, 123)]
+    assert abs(fills[1][3] - copy_trade(states[(mint, 103)], states[(mint, 122)], PAPER_STAKE_SOL, TX_COST_SOL)) < 1e-6
 
     quiet, cv2 = bytes([10]) * 32, Curve()
     trade(200, G, True, 10**9, m=quiet, cv=cv2)   # nothing trades after this: the timeout lands the copy
@@ -630,12 +631,12 @@ def test_collector_follows_graduated_tokens_onto_pumpswap(tmp_path):
     col.on_logs(510, w_buy, "sig-w")                     # the same transaction again, from the other subscription
     col.on_logs(511, logs(amm_bytes(True, bytes([99]) * 32, X, 5, B, Q, 5, 0, 5, 5), AMM_PROGRAM), "sig-other-pool")
     B2, Q2 = B - 10**12, Q + 10**8 + 2 * 10**5
-    col.on_logs(513, logs(amm_bytes(True, pool, X, 10**11, B2, Q2, 10**7, 2 * 10**4, 10**7 + 2 * 10**4, 10**7 + 5 * 10**4), AMM_PROGRAM), "sig-x")
+    col.on_logs(514, logs(amm_bytes(True, pool, X, 10**11, B2, Q2, 10**7, 2 * 10**4, 10**7 + 2 * 10**4, 10**7 + 5 * 10**4), AMM_PROGRAM), "sig-x")
     col.flush()
     rows = col.c.execute("SELECT slot, sol, tok, fee, vsol, vtok FROM trades ORDER BY slot").fetchall()
     assert rows[0] == (510, 10**8, 10**12, 5 * 10**5, Q2, B2) and len(rows) == 2 and col.stats["amm_trades"] == 2
     copy = col.c.execute("SELECT side, trigger_slot, land_slot FROM pfills").fetchall()
-    assert copy == [("buy", 510, 512)]                   # W's PumpSwap buy was copied at the pool's reserves
+    assert copy == [("buy", 510, 514)]                   # W's PumpSwap buy was copied at the pool's reserves
     assert col._pinned_pools() == {b58(pool)}            # a pool with an open copy keeps its subscription
     col.c.close()
 
