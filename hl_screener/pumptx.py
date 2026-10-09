@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
+SLOT_S = 0.22                  # a slot's length: 265-280 a minute on mainnet, measured 2026-10-09 (0.4 earlier in Solana's life)
 SYSTEM_PROGRAM = "11111111111111111111111111111111"
 TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"      # every coin created with create_v2

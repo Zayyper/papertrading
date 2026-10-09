@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .pumppools import WORKED_S
-from .pumptx import PUBLIC_RPC, Rpc, canonical_pool, fresh_coin
+from .pumptx import PUBLIC_RPC, SLOT_S, Rpc, canonical_pool, fresh_coin
 
 log = logging.getLogger(__name__)
 
@@ -448,7 +448,7 @@ class PaperFollow:
         """Copies on a token that went quiet land at its current state: nothing traded since."""
         now = time.time()
         for mint, acts in list(self.pending.items()):
-            self._run_due(mint, acts, [now - a["t"] > (a["land"] - a["trigger"]) * 0.4 + 2 for a in acts], timed_out=True)
+            self._run_due(mint, acts, [now - a["t"] > (a["land"] - a["trigger"]) * SLOT_S + 2 for a in acts], timed_out=True)
 
     def sell_now(self, wallet: str, mint: str) -> bool:
         """Sell a copy whose wallet sold unseen (while the feed was down): at the coin's next trade, or at its last known
@@ -1433,7 +1433,7 @@ def strategy_states(c: sqlite3.Connection, mint: int, cslot: int, cts: int, crea
                                    SUM(CASE WHEN buy THEN sol ELSE -sol END) OVER (ORDER BY slot, rowid) AS bought
                             FROM trades WHERE mint = ? AND slot <= ?)
                         WHERE slot >= ? ORDER BY slot, r""",
-                     (mint, cslot + max(1, int(hold_s / 0.4)), cslot + latency_slots)).fetchall()
+                     (mint, cslot + max(1, int(hold_s / SLOT_S)), cslot + latency_slots)).fetchall()
 
     def land(i: int) -> tuple[int, int]:
         """The reserves our order reaches: the last state before it lands, `latency_slots` after path[i]."""

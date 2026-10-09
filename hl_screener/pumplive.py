@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
+from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, SLOT_S, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
                      buy_ixs, coin_of, compose, fresh_coin, own_trade, parse_global, sell_ixs, sim_error, sol_for, tokens_for)
 
 log = logging.getLogger(__name__)
@@ -56,7 +56,6 @@ MAX_AGE_S = 2.0          # a buy not ready to go out this long after its wallet'
                          # landed 4 slots (~0.9 s) behind their wallet at p50, but a quarter 13+ (~2.9 s) and one 804 (~3.5 min),
                          # held up by RPC reads (2026-10-07..09). 2 s, ~9 slots before the send, keeps the usual ones with room
                          # for a slow read and drops the slow quarter, bought after the price had moved, maybe after the wallet's sell
-SLOT_S = 0.22            # a slot's length: 265-280 a minute on mainnet, measured 2026-10-09 (0.4 earlier in Solana's life)
 
 
 @dataclass(frozen=True)
