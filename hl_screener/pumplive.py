@@ -51,7 +51,12 @@ UNSENT_MAX = 8           # a sell that could not go out (an RPC read or every se
 UNSENT_WAIT_S = 30.0     # RETRY_WAIT_S doubling up to this, about 2.5 min in all, before the attempt counts as one of its tries
 MAX_HOLD_S = 12 * 3600   # a copy whose wallet never sells (it moved its tokens?) is sold after this long
 RESERVE_SOL = 0.02       # left in the wallet for fees and new token accounts' rent
-LISTS_TTL_S = 3600       # fee and buyback recipient lists, re-read this often
+LISTS_TTL_S = 3600       # fee and buyback recipient lists, re-read this often, in the background
+MAX_AGE_S = 2.0          # a buy not ready to go out this long after its wallet's is not sent (PUMP_LIVE_MAX_AGE_S): the live copies
+                         # landed 4 slots (~0.9 s) behind their wallet at p50, but a quarter 13+ (~2.9 s) and one 804 (~3.5 min),
+                         # held up by RPC reads (2026-10-07..09). 2 s, ~9 slots before the send, keeps the usual ones with room
+                         # for a slow read and drops the slow quarter, bought after the price had moved, maybe after the wallet's sell
+SLOT_S = 0.22            # a slot's length: 265-280 a minute on mainnet, measured 2026-10-09 (0.4 earlier in Solana's life)
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,7 @@ class LiveCfg:
     rpc_url: str = PUBLIC_RPC                  # reads, simulations, blockhashes, lookups
     send_urls: tuple[str, ...] = SENDERS
     sim_signer: str | None = None              # dry: simulate as this address (a funded wallet), else as the copied wallet
+    max_age_s: float = MAX_AGE_S               # buys older than this when ready are not sent, nor simulated; sells always go out
 
     @property
     def sends(self) -> bool:
@@ -84,11 +90,11 @@ class LiveCfg:
                   max_open=int(num("PUMP_LIVE_MAX_OPEN", 3)), day_loss_sol=num("PUMP_LIVE_DAY_LOSS_SOL", 0.5),
                   buy_slip=num("PUMP_LIVE_BUY_SLIP", 0.25), sell_slip=num("PUMP_LIVE_SELL_SLIP", 0.5),
                   rpc_url=env.get("PUMP_LIVE_RPC") or PUBLIC_RPC, send_urls=listed("PUMP_LIVE_SEND") or SENDERS,
-                  sim_signer=env.get("PUMP_LIVE_SIM_SIGNER") or None)
+                  sim_signer=env.get("PUMP_LIVE_SIM_SIGNER") or None, max_age_s=num("PUMP_LIVE_MAX_AGE_S", MAX_AGE_S))
         if not 0 < cfg.stake_sol <= 5 or not 0 <= cfg.buy_slip < 1 or not 0 <= cfg.sell_slip < 1 or cfg.max_open < 1 \
-                or cfg.day_loss_sol <= 0:
-            raise ValueError("PUMP_LIVE_STAKE_SOL must be in (0, 5], the slippages in [0, 1), PUMP_LIVE_MAX_OPEN at least 1 "
-                             "and PUMP_LIVE_DAY_LOSS_SOL above 0")
+                or cfg.day_loss_sol <= 0 or not 0 < cfg.max_age_s <= 60:
+            raise ValueError("PUMP_LIVE_STAKE_SOL must be in (0, 5], the slippages in [0, 1), PUMP_LIVE_MAX_OPEN at least 1, "
+                             "PUMP_LIVE_DAY_LOSS_SOL above 0 and PUMP_LIVE_MAX_AGE_S in (0, 60]")
         if cfg.sends and not ((env.get("PUMP_LIVE_KEY") or "").strip() and cfg.wallets):
             raise ValueError(f"PUMP_LIVE={mode} needs PUMP_LIVE_KEY and PUMP_LIVE_WALLETS")
         return cfg
@@ -108,8 +114,8 @@ def load_keypair(env: dict[str, str] | None = None):
 class LiveFollow:
     """The executor. The database, the orders and the positions are only touched on the feed's thread (on_trade,
     tick); building, simulating, sending and looking up run on worker threads, which share nothing with it but two
-    read-mostly caches (token programs, recipient lists) filled under a lock, and hand their results back through
-    tick(). `keypair` is required in live mode and ignored otherwise."""
+    read-mostly caches (token programs, recipient lists) filled under a lock and the newest slot seen, and hand their
+    results back through tick(). `keypair` is required in live mode and ignored otherwise."""
 
     def __init__(self, c, cfg: LiveCfg, rpc: Rpc | None = None, workers=None, keypair=None) -> None:
         import threading
@@ -139,7 +145,8 @@ class LiveFollow:
         self.lists: dict[bool, tuple[float, dict[str, list[str]]]] = {}
         self.balance: float | None = None
         self.retries: list[tuple[float, str, int]] = []   # (not before, mint, try) of the sells to send again
-        self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0}
+        self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0, "lists": 0.0}
+        self.tip = 0                                   # the newest slot a trade came from: how far the chain went since a buy
 
     # --- from the feed -------------------------------------------------------
     def on_create(self, mint: str, token_program: bytes) -> None:
@@ -149,6 +156,7 @@ class LiveFollow:
     def on_trade(self, slot: int, mint: str, user: str, e: dict[str, Any]) -> None:
         """Every trade the collector sees: our own fills, the newest state of the coins we hold or may copy, and the
         chosen wallets' first buys and first sells."""
+        self.tip = max(self.tip, slot)
         if self.me is not None and user == self.me:
             self._own_fill(mint, e)
             return
@@ -231,12 +239,15 @@ class LiveFollow:
         return ixs, cu, {"want": want, "venue": "pool" if coin["pool"] else "curve"}
 
     def _send(self, o: dict[str, Any], signer: str, build) -> dict[str, Any]:
-        """On a worker thread: build, then simulate (dry) or sign and send (live)."""
+        """On a worker thread: build, then simulate (dry) or sign and send (live), unless it is a buy ready too late."""
         if self.cfg.sends:
             return self._send_live(o, signer, build)
         ixs, cu, extra = build(self._token_program(o["mint"]))
         tip = random.choice(TIP_ACCOUNTS)
         ready = time.time()
+        late = self._too_late(o)
+        if late:
+            return {"status": "skipped", "err": late, "ready": ready}
         res = self.rpc.simulate(compose(signer, ixs, cu_limit=cu, tip_to=tip, tip_lamports=TIP_LAMPORTS))
         got, ok = own_trade(res.get("logs") or [], signer), res.get("err") is None
         return {**extra, "status": "sim_ok" if ok else "sim_err", "err": None if ok else sim_error(res), "ready": ready,
@@ -257,12 +268,28 @@ class LiveFollow:
         except Exception as e:  # noqa: BLE001 - this order's result: nothing went out
             return {"status": "unsent", "err": why(e)}
         ready = time.time()
+        late = self._too_late(o)
+        if late:
+            return {"status": "skipped", "err": late, "ready": ready}
         try:
             return {**extra, "status": "sent", "sig": self.rpc.send(tx), "ready": ready}
         except Refused as e:
             return {**extra, "status": "unsent", "err": why(e), "ready": ready}
         except Exception as e:  # noqa: BLE001 - it may have gone out
             return {**extra, "status": "sent", "sig": str(tx.signatures[0]), "err": why(e), "ready": ready}
+
+    def _too_late(self, o: dict[str, Any]) -> str | None:
+        """On a worker thread, as a buy is about to go out: its age, by our clock since its wallet's buy reached us, or by
+        the slots trades came from since (a buy that reached us late), whichever says older: the clock falls a little
+        short of the real age, the slots come close to it. Past cfg.max_age_s it is another trade: the price has moved and the wallet may be selling already.
+        Sells always go out: getting out comes first."""
+        if o["side"] != "buy":
+            return None
+        age = max(time.time() - o["seen"], (self.tip - o["trigger_slot"]) * SLOT_S)
+        if age <= self.cfg.max_age_s:
+            return None
+        log.info("live: not copying %s's buy of %s: ready %.1f s after it, over %g s", o["wallet"], o["mint"], age, self.cfg.max_age_s)
+        return f"too late: {age:.1f} s after its wallet's buy"
 
     def _token_program(self, mint: str) -> str:
         tp = self.token_programs.get(mint)
@@ -276,12 +303,16 @@ class LiveFollow:
                     tp = self.token_programs[mint] = acct[0]
         return tp
 
-    def _lists(self, amm: bool) -> dict[str, list[str]]:
-        """The fee and buyback recipient lists of pump.fun's global account, or PumpSwap's global config, read once an
-        hour: under a lock, so a burst of copies asks the RPC once."""
+    def _lists(self, amm: bool, max_age_s: float = float("inf")) -> dict[str, list[str]]:
+        """The fee and buyback recipient lists of pump.fun's global account, or PumpSwap's global config. tick() reads
+        them in the background at the start and once an hour after (`max_age_s`): a copy takes the last ones read, and
+        reads them itself only when no read has worked yet, under a lock, so a burst of copies asks the RPC once."""
+        at, lists = self.lists.get(amm, (0.0, None))
+        if lists is not None and time.time() - at <= max_age_s:
+            return lists                                    # a copy's way: no lock, no read
         with self.fill_lock:
             at, lists = self.lists.get(amm, (0.0, None))
-            if lists is None or time.time() - at > LISTS_TTL_S:
+            if lists is None or time.time() - at > max_age_s:
                 try:
                     acct = self.rpc.account(AMM_GLOBAL_CONFIG if amm else PUMP_GLOBAL)
                     if acct is None:
@@ -326,6 +357,9 @@ class LiveFollow:
         if not self.cfg.wallets and now - self.at["targets"] >= 60:
             self.targets = {w for (w,) in self.c.execute("SELECT wallet FROM follow WHERE golden_ever = 1")}
             self.at["targets"] = now
+        if now - self.at["lists"] >= 60:                    # the recipient lists read here, off the send path: at the start, then
+            self.at["lists"] = now                          # once they are LISTS_TTL_S old (a minute after a read that failed)
+            self.workers.submit(lambda: [self._lists(amm, LISTS_TTL_S) for amm in (False, True)])
         if not self.cfg.sends:
             return
         if now - self.at["hash"] >= 10:                     # a fresh blockhash kept ready: a send never waits for one
@@ -492,7 +526,8 @@ def live_lines(db_path, min_per_wallet: int = 5) -> list[str]:
     try:
         if not c.execute("SELECT 1 FROM sqlite_master WHERE name = 'lorders'").fetchone():
             return []
-        dry = c.execute("""SELECT d.wallet, d.status = 'sim_ok', d.err, d.tok, d.want, d.ready - d.seen, d.slot - d.trigger_slot, p.tok, d.seen
+        dry = c.execute("""SELECT d.wallet, d.status = 'sim_ok', CASE d.status WHEN 'skipped' THEN 'too late' ELSE d.err END,
+                                  d.tok, d.want, d.ready - d.seen, d.slot - d.trigger_slot, p.tok, d.seen
                            FROM lorders d LEFT JOIN pfills p ON p.wallet = d.wallet AND p.mint = d.mint AND p.side = 'buy'
                            WHERE d.mode = 'dry' AND d.side = 'buy' AND d.status != 'pending'""").fetchall()
         live = c.execute("""SELECT side, status, COUNT(*), COALESCE(SUM(pnl), 0) FROM lorders WHERE mode = 'live'

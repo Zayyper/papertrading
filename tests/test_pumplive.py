@@ -1,5 +1,6 @@
 import dataclasses
 import time
+import types
 from concurrent.futures import Future
 
 import pytest
@@ -11,7 +12,7 @@ from solders.keypair import Keypair  # noqa: E402
 from test_pump import Curve, b58decode, create_bytes, logs, trade_bytes  # noqa: E402
 
 from hl_screener.pumpfun import FEE, GAP_LOOK_BACK_S, TX_COST_SOL, Collector, b58  # noqa: E402
-from hl_screener.pumplive import MAX_HOLD_S, SELL_TRIES, LiveCfg, LiveFollow, live_lines, load_keypair  # noqa: E402
+from hl_screener.pumplive import MAX_AGE_S, MAX_HOLD_S, SELL_TRIES, SLOT_S, LiveCfg, LiveFollow, live_lines, load_keypair  # noqa: E402
 from hl_screener.pumptx import AMM_GLOBAL_CONFIG, PUMP_GLOBAL, PUMP_PROGRAM, TOKEN_2022_PROGRAM, Refused, RpcError, sol_for  # noqa: E402
 
 G, X, MINT, MINT2, MINT3 = bytes([80]) * 32, bytes([81]) * 32, bytes([9]) * 32, bytes([10]) * 32, bytes([11]) * 32
@@ -234,6 +235,61 @@ def test_a_day_of_losses_or_a_thin_wallet_stops_new_copies(tmp_path):
     trade(col, 13, MINT2, G, True, Curve())             # ... and leaves 0.25 for the next, short of stake and reserve
     assert len(chain.sent) == 1
     assert col.c.execute("SELECT err FROM lorders WHERE mint = ? AND status = 'skipped'", (b58(MINT2),)).fetchone() == ("balance 0.250 SOL",)
+    col.c.close()
+
+
+def test_a_buy_ready_too_late_is_not_sent_and_a_sell_goes_out_however_late(tmp_path, monkeypatch, caplog):
+    kp = Keypair()                                      # a throwaway key: never funded, nothing leaves the test
+    me = bytes(kp.pubkey())
+    col, chain = setup(tmp_path, "live", wallets=frozenset({b58(G)}), keypair=kp)
+    now = [time.time()]
+    monkeypatch.setattr("hl_screener.pumplive.time", types.SimpleNamespace(time=lambda: now[0]))
+    caplog.set_level("INFO", logger="hl_screener.pumplive")
+    read, latest = chain.account, chain.blockhash
+
+    def slow_read(addr):                                # a coin born before this start: its token program read, in 4 s
+        now[0] += 4
+        return read(addr)
+
+    chain.account = slow_read
+    trade(col, 11, MINT3, G, True, Curve())
+    col.flush()
+    assert not chain.sent and "not copying" in caplog.text
+    assert col.c.execute("SELECT status, err FROM lorders WHERE mint = ?", (b58(MINT3),)).fetchone() == (
+        "skipped", "too late: 4.0 s after its wallet's buy")
+    cv = Curve()
+    trade(col, 12, MINT, G, True, cv)                   # its token program known from its creation: out at once
+    assert len(chain.sent) == 1
+    trade(col, 13, MINT, me, True, cv, sol=246_913_580)
+    col.flush()
+    assert b58(MINT) in col.live.pos
+
+    def slow_hash(max_age_s=20.0):                      # a minute on the way: a sell goes out all the same
+        now[0] += 60
+        return latest(max_age_s)
+
+    chain.blockhash = slow_hash
+    trade(col, 20, MINT, G, False, cv, tok=10**12)
+    col.flush()
+    assert len(chain.sent) == 2 and sells(col) == [("sent", 1)]
+    col.c.close()
+
+
+def test_a_dry_run_does_not_simulate_a_buy_that_reached_it_late(tmp_path):
+    col, chain = setup(tmp_path, "dry")
+    n = int(MAX_AGE_S / SLOT_S)                         # the most slots a buy may reach us late and still go out
+    trade(col, 100, MINT3, X, True, Curve())            # the feed has shown slot 100 when the wallet's buys reach it:
+    trade(col, 100 - n, MINT, G, True, Curve())         # n slots late, simulated
+    trade(col, 99 - n, MINT2, G, True, Curve())         # one more, too late
+    col.flush()
+    assert len(chain.sims) == 1
+    assert col.c.execute("SELECT mint, status, err FROM lorders ORDER BY id").fetchall() == [
+        (b58(MINT), "sim_ok", None), (b58(MINT2), "skipped", f"too late: {(n + 1) * SLOT_S:.1f} s after its wallet's buy")]
+    col.c.commit()
+    assert "failed too late x1" in live_lines(tmp_path / "pump.db", min_per_wallet=1)[0]
+    assert LiveCfg.from_env({}).max_age_s == MAX_AGE_S and LiveCfg.from_env({"PUMP_LIVE_MAX_AGE_S": "8"}).max_age_s == 8
+    with pytest.raises(ValueError):
+        LiveCfg.from_env({"PUMP_LIVE_MAX_AGE_S": "0"})
     col.c.close()
 
 

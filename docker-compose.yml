@@ -34,6 +34,7 @@ services:
       PUMP_LIVE_BUY_SLIP: ${PUMP_LIVE_BUY_SLIP:-}     # blank = 0.25: a buy fails rather than get 25 % fewer tokens than priced
       PUMP_LIVE_SELL_SLIP: ${PUMP_LIVE_SELL_SLIP:-}   # blank = 0.5: sell tries 1-2 take up to 50 % less SOL than priced; the last try takes any price
       PUMP_LIVE_SIM_SIGNER: ${PUMP_LIVE_SIM_SIGNER:-} # dry only: simulate as this funded address; blank = as the copied wallet
+      PUMP_LIVE_MAX_AGE_S: ${PUMP_LIVE_MAX_AGE_S:-}   # blank = 2: a buy not ready 2 s after its wallet's is not sent (nor simulated); sells always go out
     volumes:
       - hl-data:/app/data
 
