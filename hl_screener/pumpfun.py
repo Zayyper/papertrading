@@ -991,11 +991,14 @@ class Collector:
                     self.gap_queued.add((*t[:3], every))
                     self.gap_first.put((t[0] != "live", every, next(self.gap_seq), t))
                     fresh += 1
+        if not fresh:
+            return                                            # all waiting already, with a reader on its way
         if self.gap_job is None or self.gap_job.running() or self.gap_job.done():   # none waiting, which would read
             self.gap_job = self.gap_pool.submit(self._gap_job, why)                # them: one that does
         self.stats["gap_checks"] += 1
-        log.info("gap check after the %s: reading what the wallets of %d open copies hold%s", why, fresh,
-                 f" ({len(todo) - fresh} already waiting)" if fresh < len(todo) else "")
+        log.log(logging.INFO if every else logging.DEBUG,     # a connection's drop: every minute or so, too many to log
+                "gap check after the %s: reading what the wallets of %d open copies hold%s", why, fresh,
+                f" ({len(todo) - fresh} already waiting)" if fresh < len(todo) else "")
 
     def _gap_job(self, why: str) -> None:
         """On the worker thread: each wallet's balance of the coin, one read every GAP_PACE_S, real money first, and for
