@@ -528,10 +528,11 @@ def test_maker_wallets_are_linked_by_the_crew_that_snipes_them():
 
 def test_a_copy_pays_signature_priority_and_tip_on_both_transactions():
     entry, exit_ = (31 * 10**9, 10**15), (36 * 10**9, 9 * 10**14)
-    assert abs(TX_COST_SOL - (BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL)) < 1e-12 and TX_COST_SOL >= 0.001
+    from hl_screener.pumptx import PRIORITY_LAMPORTS, SWQOS_MIN_TIP, TIP_LAMPORTS
+    assert abs(TX_COST_SOL - (BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL)) < 1e-12           # what the live copies pay, each
+    assert (PRIORITY_SOL, TIP_SOL) == (PRIORITY_LAMPORTS / 1e9, TIP_LAMPORTS / 1e9) and TIP_LAMPORTS >= SWQOS_MIN_TIP
     free = copy_trade(entry, exit_, 0.1, 0.0)
     assert abs(free - copy_trade(entry, exit_, 0.1, TX_COST_SOL) - 2 * TX_COST_SOL) < 1e-12   # in and out
-    assert 2 * TX_COST_SOL / 0.1 > 0.02                          # over 2% of the stake: it has to show up in the ranking
 
 
 def test_the_fee_free_mayhem_agent_is_not_a_sniper_to_copy(tmp_path):
@@ -732,6 +733,40 @@ def test_each_paper_buy_is_held_again_per_exit_rule_of_our_own_and_sold_by_it(tm
     lines = forward_lines(tmp_path / "pump.db")
     assert lines[0].startswith("exit forward all followed (1 wallets, since 2026-10-10): tp100_sl50 +")
     assert "(sold with the wallet " in lines[0] and "on 1 of them)" in lines[0] and len(lines) == 1   # under FORWARD_MIN a rule
+    col.c.close()
+
+
+def test_the_paper_does_not_make_the_buys_the_live_copies_would_not(tmp_path):
+    """2026-10-10: a buy the feed brought too late is not sent by the live copies, and one whose price ran past their
+    limit before it landed fails on chain, paying its fee: the paper skips the first and fails the second the same way,
+    and its report counts them, so its numbers are the live copies' own."""
+    from hl_screener.pumpfun import paper_lines
+    col = Collector(tmp_path / "pump.db")
+    G, X, Y = (bytes([i]) * 32 for i in (94, 95, 96))
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, 0.5)", (b58(G),))
+    col.paper.reload()
+    curves, now = {}, int(time.time())
+
+    def buy(slot, m, who, sol, ts=now):
+        cv = curves.setdefault(m, Curve())
+        tok = cv.buy(sol)
+        col.on_logs(slot, logs(trade_bytes(m, who, True, sol, tok, cv.vsol, cv.vtok, ts=ts)))
+
+    late, ran, fine = bytes([97]) * 32, bytes([98]) * 32, bytes([99]) * 32
+    buy(100, fine, Y, 10**7)                               # trades on time: the usual lag
+    buy(101, late, G, 10**9, ts=now - 5)                   # its block 5 s ago: past the live copies' 2 s, no copy
+    buy(102, ran, G, 10**9)                                # copied ...
+    buy(103, ran, X, 30 * 10**9)                           # ... but the price runs away before it lands
+    buy(106, ran, Y, 10**7)                                # landed: 25 %+ fewer tokens than priced, it fails
+    buy(107, fine, G, 10**9)
+    buy(111, fine, Y, 10**7)                               # an ordinary copy
+    rows = col.c.execute("SELECT mint, side, pnl FROM pfills ORDER BY id").fetchall()
+    assert [(m, s) for m, s, _ in rows] == [(b58(late), "skip"), (b58(ran), "fail"), (b58(fine), "buy")]
+    assert abs(rows[1][2] + BASE_FEE_SOL + PRIORITY_SOL) < 1e-12 and set(col.paper.pos) == {(b58(G), b58(fine))}
+    col.c.commit()
+    assert paper_lines(tmp_path / "pump.db")[-1] == ("paper as live (2026-10-10 on): 1 buys too late to send and 1 past the "
+                                                     f"price limit, not made ({BASE_FEE_SOL + PRIORITY_SOL:.4f} SOL of "
+                                                     "failed transactions' fees), over 1 wallets")
     col.c.close()
 
 

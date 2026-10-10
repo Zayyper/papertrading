@@ -728,9 +728,9 @@ def test_the_live_line_shows_the_wallet_and_live_against_paper_on_the_same_copie
     col.c.commit()
     lines = live_lines(tmp_path / "pump.db")
     assert "wallet 1.000 SOL at " in lines[-2]                       # as last read, and when
-    # live 0.05 SOL a copy, paper 0.25: the 2 x 0.001505 SOL of fees a round weigh 6.0% on one and 1.2% on the other
+    # live 0.05 SOL a copy, paper 0.25: the 2 x 0.000215 SOL of fees a round weigh 0.86% on one and 0.17% on the other
     assert lines[-1] == ("live vs paper on the same 2 copies: live -0.0080 SOL, paper -0.0100 SOL, live minus paper per copy median -6.0%, "
-                         "-1.2% with the paper at the live stake")
+                         "-5.3% with the paper at the live stake")
     col.c.close()
 
 
@@ -738,12 +738,13 @@ def test_every_live_setting_reaches_the_container_and_sends_go_to_helius_alone_b
     import re
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
-    code = "".join((root / "hl_screener" / f).read_text(encoding="utf-8") for f in ("pumplive.py", "pumpfun.py"))
+    code = "".join((root / "hl_screener" / f).read_text(encoding="utf-8") for f in ("pumplive.py", "pumpfun.py", "pumptx.py"))
     names = set(re.findall(r'"(PUMP_[A-Z_]+)"', code))
-    assert {"PUMP_LIVE_SEND", "PUMP_LIVE_BUY_SLIP", "PUMP_LIVE_SELL_SLIP", "PUMP_GAP_RPC"} <= names
+    assert {"PUMP_LIVE_SEND", "PUMP_LIVE_BUY_SLIP", "PUMP_LIVE_SELL_SLIP", "PUMP_GAP_RPC", "PUMP_LIVE_TIP_SOL"} <= names
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
     assert [n for n in sorted(names) if f"{n}: ${{{n}:-" not in compose] == []     # Coolify passes only what is listed
-    assert LiveCfg.from_env({}).send_urls == ("https://sender.helius-rpc.com/fast",)   # Jito alone wants its own tip
+    # a tip under Sender Max's 0.001 SOL goes to its SWQOS-only mode (2026-10-10); Jito alone would want its own tip
+    assert LiveCfg.from_env({}).send_urls == ("https://sender.helius-rpc.com/fast?swqos_only=true",)
     assert LiveCfg.from_env({"PUMP_LIVE_SEND": "https://a, https://b"}).send_urls == ("https://a", "https://b")
 
 

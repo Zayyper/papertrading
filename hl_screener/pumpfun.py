@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .pumppools import WORKED_S
-from .pumptx import PUBLIC_RPC, SLOT_S, Rpc, canonical_pool, fresh_coin
+from .pumptx import PRIORITY_LAMPORTS, PUBLIC_RPC, SLOT_S, TIP_LAMPORTS, Rpc, canonical_pool, fresh_coin
 
 log = logging.getLogger(__name__)
 
@@ -55,8 +55,8 @@ FEE = 0.0125                   # 0.95 % protocol + 0.30 % creator per side, the 
 # what a copied transaction costs on top of pump.fun's fee. A copy that wants the next block pays for it:
 # the signature fee is fixed, the priority fee and the tip are auctions, so these are assumptions, not quotes.
 BASE_FEE_SOL = 0.000005        # Solana's signature fee, 5,000 lamports
-PRIORITY_SOL = 0.0005          # compute-unit price a fill that cannot wait has to pay
-TIP_SOL = 0.001                # Jito tip: what buys a place at the top of the block
+PRIORITY_SOL = PRIORITY_LAMPORTS / 1e9   # the live copies' own (pumptx): 0.0005 SOL until 2026-10-10, 0.0002 since
+TIP_SOL = TIP_LAMPORTS / 1e9   # Helius Sender's tip: 0.001 SOL until 2026-10-10 (Sender Max), 0.00001 since (SWQOS-only)
 TX_COST_SOL = BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL   # charged on the copy's buy and again on its sell
 PAPER_STAKE_SOL = 0.25         # each live paper copy (0.1 until 2026-09-26): the size stake_sweep found best for every golden wallet
 PAPER_BUY_SLOTS = 4            # where the live copies landed behind their wallet, p50 of 36 rounds (2026-10-07..09): buys 4
@@ -337,13 +337,23 @@ class PaperFollow:
     Each buy is also held once more per exit rule of our own (`exits`, pumpexits.FORWARD), sold by that rule rather
     than with the wallet: a take-profit or stop-loss watched on every trade, or the clock. Same buy, same pricing, same
     delay to land: the exit alone differs.
+    And what the live copies meet, the paper meets too (2026-10-10): a trade the feed brought late lands its copy that
+    much later (its block time against the usual lag, as the live age check counts it); a buy older than `max_age_s`
+    then is not made, as live does not send it (side 'skip'); a buy whose tokens came in `buy_slip` short of what the
+    trade it copies left fails as the live transaction would, paying its fee (side 'fail').
     Nothing is ever sent to Solana."""
 
     def __init__(self, c: sqlite3.Connection, latency_slots: int = PAPER_BUY_SLOTS, stake_sol: float = PAPER_STAKE_SOL,
-                 tx_cost_sol: float = TX_COST_SOL, sell_latency_slots: int = PAPER_SELL_SLOTS, exits: tuple[str, ...] | None = None):
+                 tx_cost_sol: float = TX_COST_SOL, sell_latency_slots: int = PAPER_SELL_SLOTS, exits: tuple[str, ...] | None = None,
+                 max_age_s: float | None = None, buy_slip: float | None = None):
         from .pumpexits import FORWARD, rule_spec              # here: those modules build on this one
+        from .pumplive import MAX_AGE_S
         from .pumpmature import MC_LEVELS
+        from .pumptx import Lag
         self.c, self.L, self.Ls, self.stake, self.tx = c, latency_slots, sell_latency_slots, stake_sol, tx_cost_sol
+        self.max_age = max_age_s if max_age_s is not None else float(os.environ.get("PUMP_LIVE_MAX_AGE_S") or MAX_AGE_S)
+        self.buy_slip = buy_slip if buy_slip is not None else float(os.environ.get("PUMP_LIVE_BUY_SLIP") or 0.25)
+        self.lag = Lag()
         self.exits = {name: rule_spec(name) for name in (FORWARD if exits is None else exits)}
         self.xpos: dict[str, dict[tuple[str, str], list]] = {}  # mint -> (wallet, rule) -> [tok, cost, opened]
         self.xpending: dict[str, list[dict[str, Any]]] = {}     # mint -> their sales on the way
@@ -411,6 +421,7 @@ class PaperFollow:
 
     def on_trade(self, slot: int, mint: str, user: str, e: dict[str, Any]) -> None:
         self.tip = max(self.tip, slot)
+        behind = self.lag.see(e.get("ts"), time.time())        # seconds the feed brought this trade late
         acts = self.pending.get(mint)
         if acts:                                                # copies due: land at the state before this trade
             self._run_due(mint, acts, [slot >= a["land"] for a in acts])
@@ -424,7 +435,7 @@ class PaperFollow:
             if tp is not None:
                 worth = (e["vsol"] - e["vsol"] * e["vtok"] / (e["vtok"] + tok)) * (1 - self.sell_rate.get(mint, FEE)) / LAMPORTS
                 if not (1 - sl) * cost < worth < (1 + tp) * cost:   # worth after the fee, before the transaction, as the sweep
-                    self._exit(mint, w, rule, slot)
+                    self._exit(mint, w, rule, slot, int(-(-behind // SLOT_S)))
         key, side = (user, mint), ("buy" if e["buy"] else "sell")
         mine = [a for a in self.pending.get(mint, ()) if a["wallet"] == user]
         following = user in self.follow
@@ -450,9 +461,15 @@ class PaperFollow:
         rate = e["fee"] / e["sol"] if e["sol"] else FEE
         if e["buy"] and e["fee"] == 0:                          # a PumpSwap buy logs no fee: it pays what the coin's sells pay
             rate = self.sell_rate.get(mint, FEE)
-        late = self.L if e["buy"] else self.Ls
-        self.pending.setdefault(mint, []).append({"wallet": user, "side": side, "trigger": slot, "land": max(slot + late, self.tip + 1),
-                                                  "rate": rate, "leader_px": leader_px, "t": time.time()})
+        land = max(slot + (self.L if e["buy"] else self.Ls) + int(-(-behind // SLOT_S)), self.tip + 1)   # late in, late out
+        act = {"wallet": user, "side": side, "trigger": slot, "land": land, "rate": rate, "leader_px": leader_px, "t": time.time()}
+        if e["buy"]:
+            if max(behind, (self.tip - slot) * SLOT_S) > self.max_age:   # the live copies' age check: not sent, so no copy
+                self.c.execute("INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, ts) VALUES (?,?,?,?,?,?)",
+                               (user, mint, "skip", slot, land, int(time.time())))
+                return
+            act["want"] = e["vtok"] - e["vsol"] * e["vtok"] / (e["vsol"] + self.stake * LAMPORTS / (1 + rate))   # the live limit's base
+        self.pending.setdefault(mint, []).append(act)
 
     def _run_due(self, mint: str, acts: list[dict[str, Any]], due: list[bool], timed_out: bool = False) -> None:
         """Run the queue up to its last due action, in order, so a copied sell never runs before its buy."""
@@ -466,11 +483,12 @@ class PaperFollow:
         for a in acts[:last + 1]:
             self._execute(a, mint, timed_out)
 
-    def _exit(self, mint: str, wallet: str, rule: str, slot: int) -> None:
-        """One of our own exits is due: its sale lands `Ls` slots after `slot`, as a copied sell does. Once. A queue of
-        its own: each such sale is on a position of its own, so none waits for, or hurries, the copies' queue."""
+    def _exit(self, mint: str, wallet: str, rule: str, slot: int, late: int = 0) -> None:
+        """One of our own exits is due: its sale lands `Ls` slots after `slot` (and `late` more, the feed's delay), as a
+        copied sell does. Once. A queue of its own: each such sale is on a position of its own, so none waits for, or
+        hurries, the copies' queue."""
         if not any(a["side"] == f"x:{rule}" and a["wallet"] == wallet for a in self.xpending.get(mint, ())):
-            self.xpending.setdefault(mint, []).append({"wallet": wallet, "side": f"x:{rule}", "trigger": slot, "land": slot + self.Ls,
+            self.xpending.setdefault(mint, []).append({"wallet": wallet, "side": f"x:{rule}", "trigger": slot, "land": slot + self.Ls + late,
                                                        "rate": self.sell_rate.get(mint, FEE), "leader_px": 0.0, "t": time.time()})
 
     def _run_exits(self, mint: str, due: list[bool], timed_out: bool = False) -> None:
@@ -515,6 +533,10 @@ class PaperFollow:
         if a["side"] == "buy":
             tok = vtok - vsol * vtok / (vsol + self.stake * LAMPORTS / (1 + a["rate"]))
             if tok <= 0:
+                return
+            if a.get("want") and tok < a["want"] * (1 - self.buy_slip):   # past the live buy's limit: that transaction fails,
+                self.c.execute("""INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, ts, tok, pnl)   -- paying its fee
+                                  VALUES (?,?,?,?,?,?,?,?)""", (*key, "fail", a["trigger"], a["land"], now, tok, -(BASE_FEE_SOL + PRIORITY_SOL)))
                 return
             sol, pnl, px = self.stake, None, self.stake * LAMPORTS / tok
             slip = (px / a["leader_px"] - 1) * 1e4 if a["leader_px"] > 0 else None
@@ -1300,6 +1322,10 @@ def paper_lines(db_path: str | Path) -> list[str]:
                                 FROM pfills b JOIN follow f ON f.wallet = b.wallet AND f.golden_ever = 1
                                 LEFT JOIN pfills s ON s.wallet = b.wallet AND s.mint = b.mint AND s.side = 'sell'
                                 WHERE b.side = 'buy' AND ABS(b.sol - ?) < 1e-9 GROUP BY b.wallet ORDER BY b.wallet""", (stake,)).fetchall()
+        # the buys the live copies would not have made (2026-10-10 on): too late to send, or past their price limit
+        lost = {w: (sk, fl, fee) for w, sk, fl, fee in c.execute(
+            """SELECT wallet, SUM(side = 'skip'), SUM(side = 'fail'), -COALESCE(SUM(CASE WHEN side = 'fail' THEN pnl END), 0)
+               FROM pfills WHERE side IN ('skip', 'fail') GROUP BY wallet""")}
     finally:
         c.close()
     ws = summ.get("wallets") or []
@@ -1321,8 +1347,15 @@ def paper_lines(db_path: str | Path) -> list[str]:
             out.append(f"paper bought past $100k {r['wallet']}: {r['copied']} copies ({r['closed']} closed), {r['total']:+.3f} SOL "
                        f"= {_pct(r['roi'])} per copy, won {rate(r['wins'] or 0, r['closed'])}; itself {_pct(r['own_roi'])}")
     for w, n, closed, pnl, won in at_stake:
+        sk, fl, fee = lost.get(w, (0, 0, 0.0))
         out.append(f"paper golden {w} at {stake:g} SOL: {n} copies ({closed} closed), {pnl:+.3f} SOL = "
-                   f"{_pct(pnl / (closed * stake) if closed else None)} per closed copy, won {rate(won, closed)}")
+                   f"{_pct(pnl / (closed * stake) if closed else None)} per closed copy, won {rate(won, closed)}"
+                   + (f"; not made as live would not: {sk} too late to send, {fl} past the price limit ({fee:.4f} SOL of fees)"
+                      if sk or fl else ""))
+    if lost:
+        sk, fl, fee = (sum(v[i] for v in lost.values()) for i in range(3))
+        out.append(f"paper as live (2026-10-10 on): {sk} buys too late to send and {fl} past the price limit, not made "
+                   f"({fee:.4f} SOL of failed transactions' fees), over {len(lost)} wallets")
     return out
 
 

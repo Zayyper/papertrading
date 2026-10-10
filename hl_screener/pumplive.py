@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from .pumpexits import HOLDS, TPSL, rule_spec
-from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, SLOT_S, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
+from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, SENDER_MAX_TIP, Lag, SLOT_S, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
                      buy_ixs, coin_of, compose, fresh_coin, own_trade, parse_global, sell_ixs, sim_error, sol_for, tokens_for)
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ log = logging.getLogger(__name__)
 # keyless, free, needs the 0.001 SOL tip, 1 a second per IP. Jito's own endpoint left out (2026-10-07): it wants a tip to
 # one of its accounts, Helius forwards to Jito already, and its 200 could hide a Helius refusal as 'sent' for 90 s.
 SENDERS = ("https://sender.helius-rpc.com/fast",)
+if TIP_LAMPORTS < SENDER_MAX_TIP:              # 2026-10-10: tips under Sender Max's go to its SWQOS-only mode, 0.000005 SOL+
+    SENDERS = ("https://sender.helius-rpc.com/fast?swqos_only=true",)
 LIVE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS lorders (id INTEGER PRIMARY KEY, mode TEXT, wallet TEXT, mint TEXT, side TEXT, venue TEXT,
     trigger_slot INTEGER, seen REAL, ready REAL, done REAL, slot INTEGER, sig TEXT, status TEXT, err TEXT, sol REAL,
@@ -157,8 +159,7 @@ class LiveFollow:
         self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0, "lists": 0.0}
         self.rule = rule_spec(cfg.exit) if cfg.exit != "wallet" else None   # (take profit, stop, seconds) of our own exit
         self.tip = 0                                   # the newest slot a trade came from: how far the chain went since a buy
-        self.lag = [float("inf"), float("inf"), 0.0]   # least (now - a trade's block time) this minute and the last, since:
-                                                       # the usual lag, the yardstick for a trade the feed's thread got to late
+        self.lag = Lag()                               # how late the feed's thread got to a trade, by its block time
 
     # --- from the feed -------------------------------------------------------
     def on_create(self, mint: str, token_program: bytes) -> None:
@@ -169,12 +170,7 @@ class LiveFollow:
         """Every trade the collector sees: our own fills, the newest state of the coins we hold or may copy, and the
         chosen wallets' first buys and first sells."""
         self.tip = max(self.tip, slot)
-        if e.get("ts"):
-            now = time.time()
-            if now - self.lag[2] > 60:
-                self.lag = [now - e["ts"], self.lag[0], now]
-            else:
-                self.lag[0] = min(self.lag[0], now - e["ts"])
+        self.lag.see(e.get("ts"), time.time())
         if self.me is not None and user == self.me:
             self._own_fill(mint, e)
             return
@@ -324,8 +320,7 @@ class LiveFollow:
             return None
         now = time.time()
         age = max(now - o["seen"], (self.tip - o["trigger_slot"]) * SLOT_S)
-        if o.get("chain_ts"):                          # its block's time, less the usual lag and a second (whole seconds): a
-            age = max(age, now - o["chain_ts"] - min(self.lag[:2]) - 1)   # buy the feed's thread got to late, behind a stall
+        age = max(age, self.lag.behind(o.get("chain_ts"), now))   # by its block's time: a buy the feed's thread got to late
         if age <= self.cfg.max_age_s:
             return None
         log.info("live: not copying %s's buy of %s: ready %.1f s after it, over %g s", o["wallet"], o["mint"], age, self.cfg.max_age_s)

@@ -368,8 +368,10 @@ def test_a_golden_wallet_is_copied_again_at_every_stake(tmp_path):
             for s in SWEEP_STAKES}
     assert stake_sweep(db, latency_slots=2) == ["stake sweep G (1 copies on the stored trades): " + ", ".join(
         f"{s:g} SOL {_pct(want[s])} [n/a/{_pct(want[s], 0)}] won 100%" for s in SWEEP_STAKES)]
-    assert want[0.25] > want[0.1]                            # the fixed cost weighs less on a bigger copy ...
-    assert want[1.0] < want[0.25]                            # ... until the copy moves the curve itself
+    old = {s: copy_trade((36 * sol, k // (36 * sol)), (44 * sol, k // (44 * sol)), s, 0.001505, 1 / 80, 1 / 80) / s
+           for s in SWEEP_STAKES}                            # Sender Max's 0.001 SOL tip + 0.0005 priority, until 2026-10-10:
+    assert old[0.25] > old[0.1]                              # the fixed cost weighed less on a bigger copy ...
+    assert want[0.1] > want[0.25] > want[1.0]                # ... SWQOS-only's few cents do not: the copy's own move counts
 
 
 def test_a_pool_is_followed_while_it_trades_or_holds_a_copy():

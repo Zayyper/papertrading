@@ -9,6 +9,7 @@ caller passes one.
 from __future__ import annotations
 
 import base64
+import os
 import random
 import struct
 import threading
@@ -45,14 +46,41 @@ AMM_LISTS = {"fee": ((57, 8),), "reserved": ((385, 1), (418, 7)), "buyback": ((6
 # compute-unit limits: the most seen on mainnet on 2026-09-26, x1.3; a cashback pool buy used 151,241 (2026-10-07), so
 # PumpSwap buys get 200,000. The priority fee is set for the whole limit: a higher one costs nothing more.
 CURVE_BUY_CU, CURVE_SELL_CU, POOL_BUY_CU, POOL_SELL_CU = 130_000, 90_000, 200_000, 145_000
-# around each swap, the paper copies' costs (pumpfun.PRIORITY_SOL, TIP_SOL): Helius Sender's minimum tip, to its accounts
-PRIORITY_LAMPORTS = 500_000
-TIP_LAMPORTS = 1_000_000
+# around each swap, and what the paper copies pay (pumpfun.PRIORITY_SOL, TIP_SOL): a priority fee and a tip to Helius
+# Sender's accounts. Until 2026-10-10 0.0005 + 0.001 SOL (Sender Max's least tip), 6 % of a 0.05 SOL round trip in the
+# live test; since then Sender's SWQOS-only mode (one route, no buffer), whose least tip is 0.000005 SOL. Set by
+# PUMP_LIVE_TIP_SOL and PUMP_LIVE_PRIORITY_SOL, read once here so the live copies and the paper pay the same.
+SWQOS_MIN_TIP = 5_000          # lamports: Sender refuses less
+SENDER_MAX_TIP = 1_000_000     # Sender Max, every route, wants this much; below it a send goes to the SWQOS-only endpoint
+TIP_LAMPORTS = max(SWQOS_MIN_TIP, round(float(os.environ.get("PUMP_LIVE_TIP_SOL") or 0.00001) * 1e9))
+PRIORITY_LAMPORTS = max(0, round(float(os.environ.get("PUMP_LIVE_PRIORITY_SOL") or 0.0002) * 1e9))
 TIP_ACCOUNTS = ("4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE", "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
                 "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta", "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
                 "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD", "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
                 "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF", "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
                 "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey", "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or")
+
+
+class Lag:
+    """How late a trade reaches us, by its block time (whole seconds): now less that time, less the usual lag (the least
+    of this minute's and the last's, so a stall's backlog never becomes the norm) and a second for the rounding. The
+    live copies' age check and the paper's landing both read it: behind a database stall the slots handled look new."""
+
+    def __init__(self) -> None:
+        self.v = [float("inf"), float("inf"), 0.0]
+
+    def see(self, ts: int | None, now: float) -> float:
+        """Learn from one trade's block time; how late that trade is (0 when on time, or with no time)."""
+        if not ts:
+            return 0.0
+        if now - self.v[2] > 60:
+            self.v = [now - ts, self.v[0], now]
+        else:
+            self.v[0] = min(self.v[0], now - ts)
+        return self.behind(ts, now)
+
+    def behind(self, ts: int | None, now: float) -> float:
+        return max(0.0, now - ts - min(self.v[:2]) - 1) if ts else 0.0
 
 
 def pk(s):
