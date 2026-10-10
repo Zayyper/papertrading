@@ -223,3 +223,22 @@ def test_a_blockhash_refresh_refused_keeps_the_last_one_while_it_can_still_land(
     rpc._hash = (time.time() - 70, last)
     with pytest.raises(Refused):
         rpc.blockhash()                                                          # too old to land: the error, not a doomed send
+
+
+def test_a_default_key_logged_as_fee_recipient_is_no_recipient():
+    """2026-10-10 23:03 UTC, the first live buy of 3gHrfi's copies: the trade it copied logged the default key as its
+    fee recipient, the buy named it, and pump.fun failed it (ConstraintMut, fee_recipient). Such a key, logged or in an
+    empty slot of the global's list, is no recipient: one from the list is named instead, on a buy as on a sell."""
+    from hl_screener.pumptx import DEFAULT_KEY, PUMP_LISTS, _fee_to, curve_buy_ixs, curve_sell_ixs, parse_global
+    fee, res, bb = ("4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE", "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+                    "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta")
+    g = {"fee": [fee], "reserved": [res], "buyback": [bb]}
+    assert _fee_to({"fee_recipient": DEFAULT_KEY}, g) == fee and _fee_to({"fee_recipient": DEFAULT_KEY, "mayhem": True}, g) == res
+    assert _fee_to({"fee_recipient": bb}, g) == bb                    # a real one logged is still the one named
+    coin = {"mint": "BtAMWjq6e82fyCD5f6hw6WPunArrF6ZiNZdTqjmppump", "creator": "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+            "fee_recipient": DEFAULT_KEY, "mayhem": False, "cashback": False, "pool": None}
+    tp = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    for ixs, _ in (curve_buy_ixs(coin, bb, 10**8, 1, tp, g), curve_sell_ixs(coin, bb, 10**6, 0, tp, g)):
+        swap = [ix for ix in ixs if str(ix.program_id) == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"][0]
+        assert str(swap.accounts[1].pubkey) == fee and swap.accounts[1].is_writable
+    assert all(v == [] for v in parse_global(bytes(1000), PUMP_LISTS).values())   # empty slots are dropped

@@ -158,11 +158,16 @@ def parse_global(raw: bytes, lists: dict[str, tuple] = PUMP_LISTS) -> dict[str, 
     fails with NotAuthorized), `buyback` for the account every trade has had to name since 2026-04-28. pump.fun's
     global account with PUMP_LISTS, PumpSwap's global config with AMM_LISTS."""
     from .pumpfun import b58
-    return {name: [b58(raw[at + 32 * i:at + 32 * (i + 1)]) for at, n in spans for i in range(n)] for name, spans in lists.items()}
+    keys = {name: [b58(raw[at + 32 * i:at + 32 * (i + 1)]) for at, n in spans for i in range(n)] for name, spans in lists.items()}
+    return {name: [k for k in ks if k != DEFAULT_KEY] for name, ks in keys.items()}   # an empty slot is no recipient
 
 
 def _fee_to(coin: dict[str, Any], g: dict[str, list[str]]) -> str:
-    return coin.get("fee_recipient") or random.choice(g["reserved" if coin.get("mayhem") else "fee"])
+    """The fee recipient a trade names: the one the copied trade's event logged, else one of the global's list. Since
+    2026-10-10 some events log the default key there (seen on a curve coin): named as the recipient, pump.fun fails
+    the trade with ConstraintMut (fee_recipient), the first live buy of 3gHrfi's copies. Such a key is no recipient."""
+    logged = coin.get("fee_recipient")
+    return logged if logged and logged != DEFAULT_KEY else random.choice(g["reserved" if coin.get("mayhem") else "fee"])
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +179,8 @@ def _curve_common(coin: dict[str, Any], user: str, tp: str, g: dict[str, list[st
     head = [_meta(PUMP_GLOBAL), _meta(_fee_to(coin, g), True), _meta(mint), _meta(curve, True), _meta(ata(curve, mint, tp), True),
             _meta(ata(me, mint, tp), True), _meta(me, True, True), _meta(SYSTEM_PROGRAM)]
     vault = _meta(pda([b"creator-vault", coin["creator"]], PUMP_PROGRAM), True)
-    tail = [_meta(pda([b"bonding-curve-v2", mint], PUMP_PROGRAM)), _meta(coin.get("buyback") or random.choice(g["buyback"]), True)]
+    buyback = coin.get("buyback") if coin.get("buyback") not in (None, DEFAULT_KEY) else random.choice(g["buyback"])
+    tail = [_meta(pda([b"bonding-curve-v2", mint], PUMP_PROGRAM)), _meta(buyback, True)]
     return mint, me, head, vault, tail
 
 
@@ -224,8 +230,8 @@ def _pool_head(coin: dict[str, Any], me, mint, tp: str, g: dict[str, list[str]])
 def _pool_tail(coin: dict[str, Any], mint, g: dict[str, list[str]]) -> list:
     """The accounts the 2026-04-28 upgrade appended: pool_v2 (when the coin has a creator), then a buyback recipient
     and its wrapped-SOL account. Without them: BuybackFeeRecipientMissing."""
-    buyback = coin.get("buyback") or random.choice(g["buyback"])
-    v2 = [_meta(pda([b"pool-v2", mint], AMM_PROGRAM))] if coin["creator"] != DEFAULT_KEY else []
+    buyback = coin.get("buyback") if coin.get("buyback") not in (None, DEFAULT_KEY) else random.choice(g["buyback"])
+    v2 =[_meta(pda([b"pool-v2", mint], AMM_PROGRAM))] if coin["creator"] != DEFAULT_KEY else []
     return v2 + [_meta(buyback), _meta(ata(buyback, WSOL), True)]
 
 
