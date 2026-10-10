@@ -52,8 +52,18 @@ CURVE_BUY_CU, CURVE_SELL_CU, POOL_BUY_CU, POOL_SELL_CU = 130_000, 90_000, 200_00
 # PUMP_LIVE_TIP_SOL and PUMP_LIVE_PRIORITY_SOL, read once here so the live copies and the paper pay the same.
 SWQOS_MIN_TIP = 5_000          # lamports: Sender refuses less
 SENDER_MAX_TIP = 1_000_000     # Sender Max, every route, wants this much; below it a send goes to the SWQOS-only endpoint
-TIP_LAMPORTS = max(SWQOS_MIN_TIP, round(float(os.environ.get("PUMP_LIVE_TIP_SOL") or 0.00001) * 1e9))
-PRIORITY_LAMPORTS = max(0, round(float(os.environ.get("PUMP_LIVE_PRIORITY_SOL") or 0.0002) * 1e9))
+def env_num(name: str, default: float, most: float) -> float:
+    """A number the collector reads from its environment: the default when blank, not a number or negative (a typo must
+    not stop it: open copies still have to be sold), never above `most`."""
+    try:
+        v = float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+    return min(v, most) if v >= 0 else default
+
+
+TIP_LAMPORTS = max(SWQOS_MIN_TIP, round(env_num("PUMP_LIVE_TIP_SOL", 0.00001, 0.01) * 1e9))
+PRIORITY_LAMPORTS = round(env_num("PUMP_LIVE_PRIORITY_SOL", 0.0002, 0.005) * 1e9)
 TIP_ACCOUNTS = ("4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE", "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
                 "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta", "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
                 "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD", "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",

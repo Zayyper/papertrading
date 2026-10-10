@@ -58,6 +58,7 @@ BASE_FEE_SOL = 0.000005        # Solana's signature fee, 5,000 lamports
 PRIORITY_SOL = PRIORITY_LAMPORTS / 1e9   # the live copies' own (pumptx): 0.0005 SOL until 2026-10-10, 0.0002 since
 TIP_SOL = TIP_LAMPORTS / 1e9   # Helius Sender's tip: 0.001 SOL until 2026-10-10 (Sender Max), 0.00001 since (SWQOS-only)
 TX_COST_SOL = BASE_FEE_SOL + PRIORITY_SOL + TIP_SOL   # charged on the copy's buy and again on its sell
+OLD_TX_COST_SOL = 0.001505     # what it was until the SWQOS-only switch; meta 'tx_costs' keeps [since, cost] from then on
 PAPER_STAKE_SOL = 0.25         # each live paper copy (0.1 until 2026-09-26): the size stake_sweep found best for every golden wallet
 PAPER_BUY_SLOTS = 4            # where the live copies landed behind their wallet, p50 of 36 rounds (2026-10-07..09): buys 4
 PAPER_SELL_SLOTS = 3           # slots, sells 3; the replay's 2 was a slot or two kinder than the chain
@@ -324,6 +325,16 @@ def get_meta(c: sqlite3.Connection, key: str, default: Any = None) -> Any:
     return json.loads(row[0]) if row else default
 
 
+def tx_costs(c: sqlite3.Connection) -> list[list[float]]:
+    """[since, SOL a transaction] each time that cost changed; OLD_TX_COST_SOL from the start until the first change."""
+    return get_meta(c, "tx_costs") or [[0, OLD_TX_COST_SOL]]
+
+
+def tx_cost_at(costs: list[list[float]], ts: float | None) -> float:
+    """What a transaction cost at `ts`; today's when `ts` is unknown."""
+    return costs[-1][1] if ts is None else next((v for since, v in reversed(costs) if ts >= since), costs[0][1])
+
+
 # ---------------------------------------------------------------------------
 # paper follower: the golden wallets, followed live
 # ---------------------------------------------------------------------------
@@ -349,11 +360,14 @@ class PaperFollow:
         from .pumpexits import FORWARD, rule_spec              # here: those modules build on this one
         from .pumplive import MAX_AGE_S
         from .pumpmature import MC_LEVELS
-        from .pumptx import Lag
+        from .pumptx import Lag, env_num
         self.c, self.L, self.Ls, self.stake, self.tx = c, latency_slots, sell_latency_slots, stake_sol, tx_cost_sol
-        self.max_age = max_age_s if max_age_s is not None else float(os.environ.get("PUMP_LIVE_MAX_AGE_S") or MAX_AGE_S)
-        self.buy_slip = buy_slip if buy_slip is not None else float(os.environ.get("PUMP_LIVE_BUY_SLIP") or 0.25)
+        self.max_age = max_age_s if max_age_s is not None else env_num("PUMP_LIVE_MAX_AGE_S", MAX_AGE_S, 60)
+        self.buy_slip = buy_slip if buy_slip is not None else env_num("PUMP_LIVE_BUY_SLIP", 0.25, 0.99)
         self.lag = Lag()
+        costs = tx_costs(c)                                     # when the cost of a transaction changed: each fill is
+        if abs(costs[-1][1] - self.tx) > 1e-12:                 # counted at the cost of its day (pumpexits, live_lines)
+            set_meta(c, "tx_costs", costs + [[int(time.time()), self.tx]])
         self.exits = {name: rule_spec(name) for name in (FORWARD if exits is None else exits)}
         self.xpos: dict[str, dict[tuple[str, str], list]] = {}  # mint -> (wallet, rule) -> [tok, cost, opened]
         self.xpending: dict[str, list[dict[str, Any]]] = {}     # mint -> their sales on the way
@@ -370,7 +384,7 @@ class PaperFollow:
         self.own = {(w, m): [cost, proceeds, tok] for w, m, cost, proceeds, tok in c.execute("SELECT wallet, mint, cost, proceeds, tok FROM opos")}
         self.reload()
         self.pos = {(w, m): [tok, cost, opened] for w, m, tok, cost, opened in c.execute("SELECT wallet, mint, tok, cost, opened FROM ppos")}
-        self.copied = set(c.execute("SELECT DISTINCT wallet, mint FROM pfills WHERE side = 'buy'"))
+        self.copied = set(c.execute("SELECT DISTINCT wallet, mint FROM pfills WHERE side IN ('buy', 'skip', 'fail')"))   # tried once
         self.pending: dict[str, list[dict[str, Any]]] = {}
         self.curve: dict[str, tuple[int, int, float]] = {}     # mint -> reserves after its last trade, when seen
         self.tip = 0                                            # newest slot the feed has shown

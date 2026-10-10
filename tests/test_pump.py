@@ -767,7 +767,19 @@ def test_the_paper_does_not_make_the_buys_the_live_copies_would_not(tmp_path):
     assert paper_lines(tmp_path / "pump.db")[-1] == ("paper as live (2026-10-10 on): 1 buys too late to send and 1 past the "
                                                      f"price limit, not made ({BASE_FEE_SOL + PRIORITY_SOL:.4f} SOL of "
                                                      "failed transactions' fees), over 1 wallets")
+    from hl_screener.pumpfun import PaperFollow
+    assert {(b58(G), b58(late)), (b58(G), b58(ran))} <= PaperFollow(col.c).copied   # after a restart: tried, not a first buy
     col.c.close()
+
+
+def test_a_typo_in_a_setting_falls_back_and_each_fill_counts_the_fees_of_its_day(monkeypatch):
+    from hl_screener.pumpfun import tx_cost_at
+    from hl_screener.pumptx import env_num
+    for typed, got in (("abc", 0.0002), ("-1", 0.0002), ("1", 0.005), ("", 0.0002), ("0.0003", 0.0003)):
+        monkeypatch.setenv("PUMP_TEST_SOL", typed)           # a typo must not stop the collector: open copies need selling
+        assert env_num("PUMP_TEST_SOL", 0.0002, 0.005) == got
+    costs = [[0, 0.001505], [1000, 0.000215]]               # Sender Max's, then SWQOS-only's
+    assert (tx_cost_at(costs, 999), tx_cost_at(costs, 1000), tx_cost_at(costs, None)) == (0.001505, 0.000215, 0.000215)
 
 
 def test_a_wallet_we_hold_a_copy_of_is_read_past_the_cap_and_a_failed_read_checks_its_copies(tmp_path, monkeypatch):

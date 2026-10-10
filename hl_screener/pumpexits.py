@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .pumpfun import (LAMPORTS, PAPER_BUY_SLOTS, PAPER_SELL_SLOTS, PAPER_STAKE_SOL, TX_COST_SOL, _fee_known, _fee_rate, _pct,
-                      _rules_line, _rules_on, _state_before, _value, connect, copy_trade)
+                      _rules_line, _rules_on, _state_before, _value, connect, copy_trade, tx_cost_at, tx_costs)
 
 HOLDS = {"hold10s": 10, "hold30s": 30, "hold1m": 60, "hold2m": 120, "hold5m": 300, "hold10m": 600}
 TPSL = {"tp10_sl10": (0.1, 0.1), "tp20_sl10": (0.2, 0.1), "tp20_sl20": (0.2, 0.2), "tp30_sl15": (0.3, 0.15),
@@ -46,14 +46,16 @@ def rule_spec(name: str) -> tuple[float | None, float | None, int]:
     return None, None, HOLDS[name]
 
 
-def forward_lines(db_path: str | Path, tx_cost_sol: float = TX_COST_SOL) -> list[str]:
+def forward_lines(db_path: str | Path, tx_cost_sol: float | None = None) -> list[str]:
     """The paper's own exits on the copies they closed, each next to the same copies sold with their wallet: all
     followed wallets pooled, then each with FORWARD_MIN+ closed a rule. Out-of-sample from 2026-10-10, unlike the sweep."""
     c = connect(db_path, readonly=True)
     try:
-        rows = c.execute("""SELECT x.wallet, substr(x.side, 3), x.sol - x.pnl - 2 * ?, x.pnl, s.pnl
-                            FROM pfills x LEFT JOIN pfills s ON s.wallet = x.wallet AND s.mint = x.mint AND s.side = 'sell'
-                            WHERE x.side LIKE 'x:%'""", (tx_cost_sol,)).fetchall()
+        costs = tx_costs(c) if tx_cost_sol is None else [[0, tx_cost_sol]]
+        rows = [(w, rule, sol - pnl - 2 * tx_cost_at(costs, ts), pnl, wallet_pnl) for w, rule, sol, pnl, wallet_pnl, ts in c.execute(
+            """SELECT x.wallet, substr(x.side, 3), x.sol, x.pnl, s.pnl, x.ts
+               FROM pfills x LEFT JOIN pfills s ON s.wallet = x.wallet AND s.mint = x.mint AND s.side = 'sell'
+               WHERE x.side LIKE 'x:%'""")]                  # the stake back: what was sold, less profit and the fees of its day
     finally:
         c.close()
     if not rows:
