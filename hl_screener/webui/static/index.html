@@ -17,6 +17,7 @@
 <header class="topnav">
   <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">HL niche screener</span></div>
   <nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab" role="tab" data-view="live">Live</button>
     <button class="tab" role="tab" data-view="run">Run</button>
     <button class="tab" role="tab" data-view="results">Results</button>
     <button class="tab" role="tab" data-view="paper">Paper</button>
@@ -29,6 +30,40 @@
 </header>
 
 <main>
+
+  <!-- ============================ LIVE ============================ -->
+  <section class="view" id="view-live">
+    <div class="live-head">
+      <div class="live-figures">
+        <p class="eyebrow">Live copies · <span id="live-wallet" class="mono"></span></p>
+        <div class="live-balance"><span id="live-bal">—</span><span class="unit">SOL</span></div>
+        <div class="live-change" id="live-change"></div>
+        <div class="live-meta" id="live-meta"></div>
+      </div>
+      <div class="live-ctl">
+        <span id="live-state" class="badge">loading</span>
+        <button class="btn live-stop" id="live-stop" type="button" title="No new copies, and every open copy sold at once">STOP</button>
+        <button class="btn btn-secondary" id="live-resume" type="button" hidden>Resume copying</button>
+        <p class="caption" id="live-stop-note"></p>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">Wallet balance</div>
+        <div class="panel-actions">
+          <div class="seg" id="live-range" role="group" aria-label="Time range">
+            <button type="button" data-h="1">1H</button><button type="button" data-h="4">4H</button><button type="button" data-h="24" class="active">1D</button><button type="button" data-h="168">1W</button>
+          </div>
+        </div>
+      </div>
+      <div class="chart" id="live-chart"></div>
+    </div>
+    <div class="tiles live-tiles" id="live-tiles"></div>
+    <h2 class="section-title">Open copies</h2>
+    <div class="panel tight"><div class="table-wrap" id="live-open"></div></div>
+    <h2 class="section-title">Orders <span class="caption">newest first · times in your clock</span></h2>
+    <div class="panel tight"><div class="table-wrap" id="live-orders" style="max-height: 520px"></div></div>
+  </section>
 
   <!-- ============================ RUN ============================ -->
   <section class="view" id="view-run">

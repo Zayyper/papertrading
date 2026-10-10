@@ -269,6 +269,26 @@ textarea.editor { font: var(--type-mono); min-height: 600px; resize: vertical; t
 }
 .toast.err { border-color: var(--color-semantic-danger); }
 
+/* ---- live copies: the wallet in time, and STOP ------------------------------------ */
+.live-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-lg); flex-wrap: wrap; margin-bottom: var(--space-md); }
+.live-figures { min-width: 0; }
+.live-balance { font-size: 44px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 4px; }
+.live-balance .unit { font-size: 18px; font-weight: 500; color: var(--color-ink-subtle); margin-left: 8px; }
+.live-change { font: var(--type-body); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.live-meta { font: var(--type-caption); color: var(--color-ink-subtle); margin-top: 6px; max-width: 70ch; }
+.live-ctl { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+.live-ctl .caption { margin: 0; max-width: 32ch; text-align: right; color: var(--color-ink-subtle); }
+.btn.live-stop { background: var(--color-semantic-danger); color: #fff; font-size: 22px; font-weight: 700; letter-spacing: .12em;
+  min-width: 190px; min-height: 64px; border-radius: var(--rounded-lg); box-shadow: 0 6px 20px rgba(229, 72, 77, .35); }
+.btn.live-stop:hover:not(:disabled) { filter: brightness(1.08); }
+.btn.live-stop:active:not(:disabled) { transform: translateY(1px); }
+.live-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.chart .mark { stroke: var(--color-surface-1); stroke-width: 1.5; }
+.chart .mark.buy { fill: var(--color-primary); }
+.chart .mark.pos { fill: var(--color-semantic-success); }
+.chart .mark.neg { fill: var(--color-semantic-danger); }
+.muted { color: var(--color-ink-subtle); }
+
 /* ---- responsive (DESIGN.md: 3-up → 2-up at 1024 → 1-up below 768) ------------ */
 @media (max-width: 1024px) {
   .grid-4, .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -283,7 +303,13 @@ textarea.editor { font: var(--type-mono); min-height: 600px; resize: vertical; t
   .tabs { margin-left: 0; }
   .tab { padding: 6px 10px; }
   .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
-  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tiles, .live-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .live-head { flex-direction: column; }
+  .live-ctl { width: 100%; align-items: stretch; }
+  .live-ctl .badge { align-self: flex-start; }
+  .live-ctl .caption { text-align: left; max-width: none; }
+  .btn.live-stop { width: 100%; }
+  .live-balance { font-size: 38px; }
   .toolbar input { min-width: 0; width: 100%; }
   .panel-title .mono { max-width: 100%; }
 }

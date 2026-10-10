@@ -58,10 +58,118 @@
     $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
     $$(".tab").forEach((t) => { const on = t.dataset.view === name; t.classList.toggle("active", on); t.setAttribute("aria-selected", on); });
     if (name === "results") refreshRuns().then(redrawCharts);
+    if (name === "live") startLivePolling(); else stopLivePolling();
     if (name === "paper") startPaperPolling(); else stopPaperPolling();
     if (name === "pump" || name === "strategy") startPumpPolling(); else stopPumpPolling();
     if (name === "config" && !state.config) loadConfig();
     if (name === "design") renderDesign();
+  }
+
+  // ---------------------------------------------------------------- live copies
+  // The live copies' wallet in time and the STOP button. The page only reads what the collector writes (/api/live);
+  // STOP and RESUME leave or remove a flag the collector checks every second: the page never trades itself.
+  const live = { timer: null, hours: store.get("liveHours", 24), data: null };
+  function startLivePolling() { stopLivePolling(); loadLive(); live.timer = setInterval(loadLive, 5000); }
+  function stopLivePolling() { clearInterval(live.timer); live.timer = null; }
+  async function loadLive() {
+    try { live.data = await api("GET", `/api/live?hours=${live.hours}`); } catch (e) { toast(e.message); return; }
+    renderLive(live.data);
+  }
+  const solSigned = (x, nd = 4) => isNum(x) ? `<span class="${signCls(x)}">${x > 0 ? "+" : x < 0 ? "−" : ""}${Math.abs(x).toFixed(nd)}</span>` : "n/a";
+  const clockOf = (s) => isNum(s) ? new Date(s * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+  const dayOf = (s) => isNum(s) ? new Date(s * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+
+  function renderLive(d) {
+    const cfg = d.cfg || {}, mode = d.exists ? (cfg.mode || "off") : "off", bal = d.balance || [], orders = d.orders || [];
+    const last = d.wallet && isNum(d.wallet.balance) ? d.wallet.balance : bal.length ? bal[bal.length - 1][1] : null;
+    const first = bal.length ? bal[0][1] : null;
+    $("#live-bal").textContent = isNum(last) ? last.toFixed(4) : "—";
+    $("#live-change").innerHTML = isNum(last) && isNum(first) && bal.length > 1 ? `${solSigned(last - first)} SOL since ${dayOf(bal[0][0])}` : "";
+    $("#live-wallet").textContent = cfg.me ? shortAddr(cfg.me) : "no live wallet";
+    const who = (cfg.wallets || []).map(shortAddr).join(", ") || "the golden wallets";
+    $("#live-meta").textContent = !d.exists ? "The pump collector is not running yet." : mode === "off" ? "Live copies are off." :
+      `copying ${who} · ${cfg.stake_sol} SOL a copy · out ${!cfg.exit || cfg.exit === "wallet" ? "with the wallet" : "by " + cfg.exit} · ` +
+      `at most ${cfg.max_open} open · new copies stop after ${cfg.day_loss_sol} SOL lost in a day`;
+    const stopped = !!d.stopped, state = $("#live-state");
+    state.textContent = stopped ? "stopped" : mode;
+    state.className = "badge " + (stopped ? "stopped" : mode === "live" ? "running" : "");
+    $("#live-stop").hidden = stopped;
+    $("#live-resume").hidden = !stopped;
+    $("#live-stop-note").textContent = stopped ? `Stopped ${dayOf(d.stopped_at)}: no new copies; open ones are sold at once.` : "";
+
+    const sells = orders.filter((o) => o.side === "sell" && o.status === "filled" && isNum(o.pnl));
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const today = sells.filter((o) => (o.done || 0) * 1000 >= midnight.getTime());
+    const sum = (xs) => xs.reduce((a, o) => a + o.pnl, 0);
+    const failed = orders.filter((o) => o.status === "failed" || o.status === "expired").length;
+    const tile = (label, value, sub) => `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
+    $("#live-tiles").innerHTML =
+      tile("Today", `${solSigned(sum(today))}`, `${today.length} round${today.length === 1 ? "" : "s"} closed`) +
+      tile("All rounds", `${solSigned(sum(sells))}`, `${sells.length} closed, ${sells.filter((o) => o.pnl > 0).length} up`) +
+      tile("Open", `${(d.open || []).length}`, `${fmtNum((d.open || []).reduce((a, p) => a + (p.cost || 0), 0), 3)} SOL in`) +
+      tile("Failed / expired", `${failed}`, `of the last ${orders.length} orders`);
+
+    drawBalance($("#live-chart"), bal, orders);
+    const now = d.now || Date.now() / 1000;
+    sortableTable($("#live-open"), [
+      { key: "mint", label: "Coin", render: (p) => `<a class="mono" href="https://pump.fun/coin/${encodeURIComponent(p.mint)}" target="_blank" rel="noopener">${esc(shortAddr(p.mint))}</a>` },
+      { key: "opened", label: "Held", num: true, render: (p) => elapsed(now - p.opened) },
+      { key: "cost", label: "Cost SOL", num: true, render: (p) => fmtNum(p.cost, 4) },
+      { key: "stuck", label: "", render: (p) => p.stuck ? `<span class="neg">STUCK: sell by hand</span>` : "" },
+    ], d.open || [], { empty: "No copy open." });
+    sortableTable($("#live-orders"), [
+      { key: "id", label: "Time", render: (o) => esc(clockOf(o.done || o.seen)) },
+      { key: "side", label: "Side", render: (o) => `<span class="${o.side === "buy" ? "" : "muted"}">${esc(o.side)}</span>` },
+      { key: "mint", label: "Coin", render: (o) => `<a class="mono" href="https://pump.fun/coin/${encodeURIComponent(o.mint)}" target="_blank" rel="noopener">${esc(shortAddr(o.mint))}</a>` },
+      { key: "pnl", label: "P&L", num: true, render: (o) => isNum(o.pnl) ? solSigned(o.pnl) : "" },
+      { key: "status", label: "Status", render: (o) => o.sig ? `<a href="https://solscan.io/tx/${encodeURIComponent(o.sig)}" target="_blank" rel="noopener">${esc(o.status)}</a>` : esc(o.status) },
+      { key: "sol", label: "SOL", num: true, render: (o) => fmtNum(o.sol, 4) },
+      { key: "slot", label: "Slots late", num: true, title: "slots between the copied wallet's trade and ours", render: (o) => isNum(o.slot) && isNum(o.trigger_slot) ? fmtInt(o.slot - o.trigger_slot) : "" },
+      { key: "err", label: "Note", render: (o) => `<span class="muted">${esc(o.err || "")}</span>` },
+    ], orders, { sortKey: "id", empty: "No live order yet." });
+  }
+
+  function drawBalance(container, bal, orders) {
+    if (bal.length < 2) { container.innerHTML = `<div class="empty">The wallet's balance is read every 30 s while live copies run; the line starts with the second reading.</div>`; return; }
+    const pts = bal.map(([t, v]) => ({ t, v })), W = chartWidth(container), H = 260, m = { l: 58, r: 16, t: 18, b: 28 };
+    const x0 = pts[0].t, x1 = Math.max(pts[pts.length - 1].t, x0 + 1);
+    const vs = pts.map((p) => p.v), lo = Math.min(...vs), hi = Math.max(...vs), pad = (hi - lo) * 0.12 || 0.002;
+    const y0 = lo - pad, y1 = hi + pad;
+    const X = (t) => m.l + (t - x0) / (x1 - x0) * (W - m.l - m.r), Y = (v) => m.t + (y1 - v) / (y1 - y0) * (H - m.t - m.b);
+    const at = (t) => { let best = pts[0]; for (const p of pts) if (p.t <= t) best = p; return best.v; };   // the balance as last read before t
+    const yt = niceTicks(y0, y1, 4), xt = timeTicks(x0, x1, Math.max(2, Math.floor((W - m.l - m.r) / 120)));
+    const marks = orders.filter((o) => o.status === "filled" && isNum(o.done) && o.done >= x0 && o.done <= x1);
+    let s = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="The live wallet's SOL balance over time, buys and sells marked">`;
+    s += `<g class="grid">${yt.map((v) => `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/>`).join("")}</g>`;
+    s += `<g class="axis">${yt.map((v) => `<text x="${m.l - 8}" y="${(Y(v) + 4).toFixed(1)}" text-anchor="end">${v.toFixed(3)}</text>`).join("")}`;
+    s += xt.map((t, i) => `<text x="${X(t).toFixed(1)}" y="${H - 8}" text-anchor="${i === 0 ? "start" : i === xt.length - 1 ? "end" : "middle"}">${esc(x1 - x0 > 86400 ? dayOf(t) : clockOf(t).slice(0, 5))}</text>`).join("") + `</g>`;
+    s += `<path class="series" d="${pts.map((p, i) => (i ? "L" : "M") + X(p.t).toFixed(1) + " " + Y(p.v).toFixed(1)).join(" ")}"/>`;
+    s += marks.map((o) => `<circle class="mark ${o.side === "buy" ? "buy" : o.pnl > 0 ? "pos" : "neg"}" r="4" cx="${X(o.done).toFixed(1)}" cy="${Y(at(o.done)).toFixed(1)}"><title>${esc(o.side)} ${esc(shortAddr(o.mint))} ${clockOf(o.done)}${isNum(o.pnl) ? ` ${o.pnl > 0 ? "+" : ""}${o.pnl.toFixed(4)} SOL` : ""}</title></circle>`).join("");
+    s += `<line class="crosshair" data-ch x1="0" x2="0" y1="${m.t}" y2="${H - m.b}" visibility="hidden"/><circle class="dot" data-dot r="4.5" visibility="hidden"/>`;
+    s += `<rect class="hit" x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}"/></svg><div class="tooltip" hidden></div>`;
+    container.innerHTML = s;
+    const svg = container.querySelector("svg"), tip = container.querySelector(".tooltip"), ch = svg.querySelector("[data-ch]"), dot = svg.querySelector("[data-dot]");
+    const show = (clientX, clientY) => {
+      const r = svg.getBoundingClientRect(), t = x0 + ((clientX - r.left) * W / r.width - m.l) / (W - m.l - m.r) * (x1 - x0);
+      let best = pts[0]; for (const p of pts) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+      ch.setAttribute("x1", X(best.t)); ch.setAttribute("x2", X(best.t)); ch.removeAttribute("visibility");
+      dot.setAttribute("cx", X(best.t)); dot.setAttribute("cy", Y(best.v)); dot.removeAttribute("visibility");
+      tooltipAt(container, tip, clientX, clientY, `<b>${esc(dayOf(best.t))}</b><br>${best.v.toFixed(4)} SOL`);
+    };
+    svg.addEventListener("mousemove", (e) => show(e.clientX, e.clientY));
+    svg.addEventListener("touchmove", (e) => { const t = e.touches[0]; if (t) show(t.clientX, t.clientY); }, { passive: true });
+    svg.addEventListener("mouseleave", () => { tip.hidden = true; ch.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); });
+  }
+
+  async function setLiveStop(stop) {
+    if (!stop && !confirm("Resume copying with real money?")) return;
+    const btn = stop ? $("#live-stop") : $("#live-resume");
+    btn.disabled = true;
+    try {
+      await api("POST", stop ? "/api/live/stop" : "/api/live/resume", {});
+      toast(stop ? "Stopped: no new copies; open ones are sold within seconds." : "Resumed: copies are made again.", "ok");
+    } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+    loadLive();
   }
 
   // ---------------------------------------------------------------- jobs
@@ -1087,6 +1195,16 @@
 
   // ---------------------------------------------------------------- wiring
   $$(".tab").forEach((t) => t.addEventListener("click", () => showView(t.dataset.view)));
+  $("#live-stop").addEventListener("click", () => setLiveStop(true));
+  $("#live-resume").addEventListener("click", () => setLiveStop(false));
+  $$("#live-range button").forEach((b) => {
+    b.classList.toggle("active", Number(b.dataset.h) === live.hours);
+    b.addEventListener("click", () => {
+      live.hours = Number(b.dataset.h); store.set("liveHours", live.hours);
+      $$("#live-range button").forEach((x) => x.classList.toggle("active", x === b));
+      loadLive();
+    });
+  });
 
   $$("form.action").forEach((f) => f.addEventListener("submit", (e) => {
     e.preventDefault();

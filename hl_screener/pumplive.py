@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS lorders (id INTEGER PRIMARY KEY, mode TEXT, wallet TE
 CREATE INDEX IF NOT EXISTS ix_lorders ON lorders(wallet, mint);
 CREATE INDEX IF NOT EXISTS ix_lorders_day ON lorders(mode, side, done);
 CREATE TABLE IF NOT EXISTS lpos (mint TEXT PRIMARY KEY, wallet TEXT, tok INTEGER, cost REAL, opened INTEGER, stuck INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS lbal (ts INTEGER, sol REAL);   -- the wallet's balance each time it is read: the page's chart
 """
 FILL_WAIT_S = 15         # a sent transaction the feed has not shown by then is looked up on the chain
 LOOK_EVERY_S = 5         # and again this often (getTransaction: 10 calls per 10 s on the public RPC)
@@ -127,9 +128,10 @@ class LiveFollow:
     read-mostly caches (token programs, recipient lists) filled under a lock and the newest slot seen, and hand their
     results back through tick(). `keypair` is required in live mode and ignored otherwise."""
 
-    def __init__(self, c, cfg: LiveCfg, rpc: Rpc | None = None, workers=None, keypair=None) -> None:
+    def __init__(self, c, cfg: LiveCfg, rpc: Rpc | None = None, workers=None, keypair=None, stop_file=None) -> None:
         import threading
         from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
         if cfg.sends and keypair is None:
             raise ValueError("live copies need the wallet's keypair")
         self.c, self.cfg = c, cfg
@@ -160,6 +162,14 @@ class LiveFollow:
         self.rule = rule_spec(cfg.exit) if cfg.exit != "wallet" else None   # (take profit, stop, seconds) of our own exit
         self.tip = 0                                   # the newest slot a trade came from: how far the chain went since a buy
         self.lag = Lag()                               # how late the feed's thread got to a trade, by its block time
+        # the page's STOP (2026-10-11): while this file exists no copy is made and the open ones are sold at once; the
+        # page's RESUME deletes it. A file on the data volume both containers share: the page never touches the trades.
+        self.stop_file = Path(stop_file) if stop_file else None
+        self.stopped = False
+        from .pumpfun import set_meta                  # what the page shows: the settings, never the key nor a keyed URL
+        set_meta(c, "live_cfg", {"mode": cfg.mode, "me": self.me, "wallets": sorted(cfg.wallets), "stake_sol": cfg.stake_sol,
+                                 "max_open": cfg.max_open, "day_loss_sol": cfg.day_loss_sol, "exit": cfg.exit,
+                                 "max_age_s": cfg.max_age_s, "since": int(time.time())})
 
     # --- from the feed -------------------------------------------------------
     def on_create(self, mint: str, token_program: bytes) -> None:
@@ -239,7 +249,8 @@ class LiveFollow:
         coin = self.coins[mint]
         o = {"wallet": wallet, "mint": mint, "side": "buy", "venue": "pool" if coin["pool"] else "curve",
              "trigger_slot": slot, "seen": time.time(), "tries": 1, "chain_ts": ts}
-        why = ("winding down" if self.cfg.mode == "exit" else self._blocked()) if self.cfg.sends else None
+        why = ("winding down" if self.cfg.mode == "exit" else "stopped from the page" if self.stopped else self._blocked()) \
+            if self.cfg.sends else "stopped from the page" if self.stopped else None
         if why:
             self._record(o, status="skipped", err=why)
             log.info("live: not copying %s's buy of %s: %s", wallet, mint, why)
@@ -384,6 +395,14 @@ class LiveFollow:
                 from .pumpfun import _no_key                  # a requests error names the URL, and PUMP_LIVE_RPC may carry a key
                 res = {"status": "sim_err" if self.cfg.mode == "dry" else "failed", "err": _no_key(f"{type(e).__name__}: {e}")[:300]}
             self._settled(o, res)
+        if self.stop_file is not None and self.stop_file.exists() != self.stopped:   # the page's STOP or RESUME
+            self.stopped = not self.stopped
+            if self.stopped:
+                log.warning("live: STOPPED from the page: no new copies, the %d open ones sold now", len(self.pos))
+                for m in list(self.pos):
+                    self._sell(m, None, "stopped from the page")
+            else:
+                log.warning("live: resumed from the page: copies are made again")
         now = time.time()
         due, self.retries = [r for r in self.retries if r[0] <= now], [r for r in self.retries if r[0] > now]
         for _, mint, tries in due:
@@ -420,6 +439,7 @@ class LiveFollow:
                 from .pumpfun import set_meta
                 self.balance = res["balance"]
                 set_meta(self.c, "live_wallet", {"balance": self.balance, "at": int(time.time())})   # for the 30-min line
+                self.c.execute("INSERT INTO lbal VALUES (?, ?)", (int(time.time()), self.balance))   # and the page's chart
             return
         if o["side"] == "lookup":                             # a sent transaction looked up on the chain
             real = self.open.get(o["id"])
@@ -528,6 +548,8 @@ class LiveFollow:
             log.info("live: bought %s for %.4f SOL", o["mint"], cost)
             if o.get("sell_after") is not None:
                 self._sell(o["mint"], o["sell_after"], "its wallet sold first")
+            elif self.stopped:                              # it was on its way when the page said STOP
+                self._sell(o["mint"], None, "stopped from the page")
         else:
             p = self.pos.pop(o["mint"], None) or {"cost": 0.0}
             got = (fill["sol"] - fill["fee"]) / 1e9 - TX_COST_SOL

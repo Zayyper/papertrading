@@ -165,6 +165,49 @@ class App:
         finally:
             c.close()
 
+    # ---- live copies (pumplive): what the wallet does, and the STOP button -------------------------------------
+    def live_stop_file(self) -> Path:
+        cfg, _ = self.cfg()
+        return self.root / cfg.data_dir / "pump" / "live_stop"   # pumpfun.collect hands the same path to LiveFollow
+
+    def live_view(self, hours: float = 48) -> dict[str, Any]:
+        """The live copies for the Live tab: their settings, the wallet's balance over time, every order, the open
+        copies, and whether the page's STOP is on. Read-only: the collector writes, the page only reads."""
+        cfg, _ = self.cfg()
+        db, stop = self.root / cfg.data_dir / "pump" / "pump.db", self.live_stop_file()
+        out: dict[str, Any] = {"now": time.time(), "stopped": stop.exists(), "stopped_at": stop.stat().st_mtime if stop.exists() else None}
+        if not db.exists():
+            return {**out, "exists": False}
+        from ..pumpfun import connect, get_meta
+        c = connect(db, readonly=True)
+        try:
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            out.update(exists=True, cfg=get_meta(c, "live_cfg"), wallet=get_meta(c, "live_wallet"), balance=[], orders=[], open=[])
+            since = time.time() - hours * 3600
+            if "lbal" in tables:
+                out["balance"] = _thin(c.execute("SELECT ts, sol FROM lbal WHERE ts >= ? ORDER BY ts", (since,)).fetchall())
+            if "lorders" in tables:
+                cols = ("id", "side", "mint", "wallet", "status", "err", "sol", "pnl", "seen", "done", "trigger_slot", "slot", "tries", "sig")
+                out["orders"] = [dict(zip(cols, r)) for r in c.execute(
+                    f"SELECT {', '.join(cols)} FROM lorders WHERE mode = 'live' ORDER BY id DESC LIMIT 300")]
+            if "lpos" in tables:
+                cols = ("mint", "wallet", "cost", "opened", "stuck")
+                out["open"] = [dict(zip(cols, r)) for r in c.execute(f"SELECT {', '.join(cols)} FROM lpos ORDER BY opened")]
+            return out
+        finally:
+            c.close()
+
+    def live_stop(self, stop: bool) -> dict[str, Any]:
+        """STOP leaves a file the collector checks every second (no new copies, the open ones sold at once); RESUME
+        removes it. The page never signs, sends or sells anything itself."""
+        f = self.live_stop_file()
+        if stop:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(time.strftime("%Y-%m-%d %H:%M:%S UTC stopped from the page\n", time.gmtime()), encoding="utf-8")
+        else:
+            f.unlink(missing_ok=True)
+        return {"ok": True, "stopped": f.exists()}
+
     def start_service(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         leaders = (body.get("leaders") or "").strip()
         if not leaders:
@@ -516,6 +559,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(app.pump_view())
         if path == "/api/pump/paper":
             return self._json(app.pump_view(("paper",), series=True))
+        if path == "/api/live":
+            try:
+                hours = min(24 * 30, max(1, float(q.get("hours", ["48"])[0] or 48)))
+            except ValueError:
+                hours = 48
+            return self._json(app.live_view(hours))
         if path == "/api/paper":
             since = int(q.get("log_since", ["0"])[0] or 0)
             return self._json(app.paper_view(since))
@@ -527,6 +576,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         app = self.app
+        if path in ("/api/live/stop", "/api/live/resume"):
+            # JSON only: a form on another site cannot send it without a preflight this server never answers, so a page
+            # elsewhere riding on the browser's saved password cannot press STOP, nor RESUME
+            self._body()                                  # read, whatever it is: an unread body breaks the next request
+            if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                return self._error(415, "send JSON")
+            return self._json(app.live_stop(path.endswith("/stop")))
         if path == "/api/jobs":
             try:
                 body = json.loads(self._body() or b"{}")

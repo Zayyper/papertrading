@@ -1401,7 +1401,8 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
     try:
         live = LiveCfg.from_env()
         if live.mode != "off":
-            col.live = LiveFollow(col.c, live, keypair=load_keypair() if live.sends else None)
+            col.live = LiveFollow(col.c, live, keypair=load_keypair() if live.sends else None,
+                                  stop_file=Path(db_path).parent / "live_stop")   # the page's STOP button (webui)
             who = ", ".join(sorted(live.wallets)) or "the golden wallets"
             print(f"live copies: {live.mode}{f' from {col.live.me}' if col.live.me else ''}, " + (
                   f"winding down: no new copies, the {len(col.live.pos)} open ones sold "

@@ -331,6 +331,30 @@ def test_out_by_a_rule_of_our_own_the_wallets_sell_is_not_ours_and_the_rule_sell
     assert LiveCfg.from_env(exiting).exit == "wallet"   # but the open copies still get out
 
 
+def test_the_pages_stop_sells_the_open_copies_and_makes_no_new_one_until_resume(tmp_path):
+    """The Live tab's STOP (2026-10-11) leaves a file next to the database; the collector checks it every second: no
+    new copy, the open ones sold at once. RESUME removes it. The page writes the file and nothing else."""
+    col, chain, cv, me, mine = held(tmp_path)
+    stop = tmp_path / "live_stop"
+    col.live.stop_file = stop
+    stop.write_text("stopped from the page")
+    col.flush()                                                       # sent from this tick ...
+    col.flush()                                                       # ... settled at the next
+    assert len(chain.sent) == 2 and sells(col) == [("sent", 1)]       # the open copy goes out at once
+    trade(col, 30, MINT2, G, True, Curve())                           # its wallet buys another coin: not copied
+    col.flush()
+    assert len(chain.sent) == 2
+    assert col.c.execute("SELECT status, err FROM lorders WHERE mint = ?", (b58(MINT2),)).fetchone() == ("skipped", "stopped from the page")
+    stop.unlink()
+    col.flush()
+    trade(col, 31, MINT3, G, True, Curve())                           # resumed: copied again
+    col.flush()
+    assert len(chain.sent) == 3
+    cfg = col.c.execute("SELECT value FROM meta WHERE key = 'live_cfg'").fetchone()[0]
+    assert '"me"' in cfg and "KEY" not in cfg.upper().replace("MAX", "")   # the page's settings: the address, never the key
+    col.c.close()
+
+
 def test_a_buy_the_feeds_thread_got_to_late_is_not_sent_though_its_slot_looks_new(tmp_path):
     """Behind a stall (a database lock), the socket's backlog is handled late, slot clock and all: only the trade's own
     block time, against the usual lag of the others, says how old it is."""
