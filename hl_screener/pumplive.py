@@ -149,6 +149,7 @@ class LiveFollow:
         self.open = {r[0]: dict(zip(cols, r)) for r in c.execute(       # sent before a restart: looked up again
             f"SELECT {', '.join(cols)} FROM lorders WHERE status = 'sent' AND mode = 'live'")}
         self.coins: dict[str, dict[str, Any]] = {}     # mint -> what its transactions need, from its newest trade
+        self.sell_rate: dict[str, float] = {}          # mint -> the fee its last sell of 0.01 SOL+ paid, as the paper keeps it
         self.token_programs: dict[str, str] = {}       # mint -> its token program, from its creation event
         self.lists: dict[bool, tuple[float, dict[str, list[str]]]] = {}
         self.balance: float | None = None
@@ -180,6 +181,8 @@ class LiveFollow:
         if not e.get("tok") or not (user in self.targets or mint in self.pos or self._busy(mint)):
             return
         self.coins[mint] = coin_of(mint, e)
+        if not e["buy"] and e["fee"] > 0 and e["sol"] >= 10**7:
+            self.sell_rate[mint] = e["fee"] / e["sol"]
         if self.rule is not None and self.rule[0] is not None and mint in self.pos:
             self._rule_hit(mint, slot)
         if user not in self.targets:
@@ -199,11 +202,14 @@ class LiveFollow:
 
     def _rule_hit(self, mint: str, slot: int) -> None:
         """Our own exit's take-profit or stop, on this trade's reserves: what the tokens would fetch after the coin's fee,
-        against what the buy spent before the transaction cost, as the paper and the sweep count it."""
-        from .pumpfun import TX_COST_SOL
+        against what the buy spent before the transaction cost, as the paper and the sweep count it. The fee is the coin's
+        last sell of 0.01 SOL or more, not its newest trade's: a dust trade's fee rounds up to a quarter of it, and that
+        alone would fire the stop (the review of 2026-10-10)."""
+        from .pumpfun import FEE, TX_COST_SOL
         tp, sl, _ = self.rule
         p = self.pos[mint]
-        worth, spent = sol_for(self.coins[mint], p["tok"]) / 1e9, p["cost"] - TX_COST_SOL
+        coin = {**self.coins[mint], "fee": self.sell_rate.get(mint, FEE)}
+        worth, spent = sol_for(coin, p["tok"]) / 1e9, p["cost"] - TX_COST_SOL
         if not (1 - sl) * spent < worth < (1 + tp) * spent:
             self._sell(mint, slot, f"{self.cfg.exit}: worth {worth:.4f} SOL for {spent:.4f}")
 

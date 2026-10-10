@@ -301,6 +301,10 @@ def test_out_by_a_rule_of_our_own_the_wallets_sell_is_not_ours_and_the_rule_sell
     """PUMP_LIVE_EXIT (2026-10-10): the copy leaves by a rule of our own, its take-profit or stop on any trade of the
     coin, or the clock; the wallet's sell, seen or found by a gap check, is not ours to follow."""
     col, chain, cv, me, mine = held(tmp_path, exit="tp100_sl50")
+    col.live.coins[b58(MINT)]["fee"] = 0.6              # a dust trade's fee, rounded up: the price has not moved
+    col.live._rule_hit(b58(MINT), 19)
+    col.flush()
+    assert len(chain.sent) == 1                         # no stop on it: the stop prices at the coin's real sells' fee
     trade(col, 20, MINT, G, False, cv, tok=10**12)      # the wallet sells: not ours
     col.rpc, col.gap_pool = Holdings({(b58(G), b58(MINT)): 0}), Now()
     col.check_gap("reconnect")                          # nor what a gap check finds it sold

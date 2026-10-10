@@ -70,7 +70,8 @@ def dossier(c, addr: str, crew: set[str], launches_of: collections.Counter) -> d
     sniped = [(cr, n) for (cr, n) in c.execute("SELECT creator, COUNT(*) FROM launches WHERE ',' || buyers || ',' LIKE ? GROUP BY creator",
                                                 (f"%,{wid},%",))]
     # what copying it made, next to what it made itself on the same coins
-    cp = c.execute("SELECT mint, side, trigger_slot, land_slot, sol, slip_bps, pnl, timed_out FROM pfills WHERE wallet = ? ORDER BY id", (addr,)).fetchall()
+    cp = c.execute("SELECT mint, side, trigger_slot, land_slot, sol, slip_bps, pnl, timed_out FROM pfills WHERE wallet = ? "
+                   "AND side IN ('buy', 'sell') ORDER BY id", (addr,)).fetchall()   # not our own exits' sales (pumpexits)
     cbuys, csells = [r for r in cp if r[1] == "buy"], [r for r in cp if r[1] == "sell"]
     same = [m for m in {r[0] for r in cbuys} if m in closed]
     return {
