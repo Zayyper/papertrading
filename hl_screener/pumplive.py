@@ -23,9 +23,10 @@ import logging
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from .pumpexits import HOLDS, TPSL, rule_spec
 from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, SLOT_S, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
                      buy_ixs, coin_of, compose, fresh_coin, own_trade, parse_global, sell_ixs, sim_error, sol_for, tokens_for)
 
@@ -71,6 +72,7 @@ class LiveCfg:
     send_urls: tuple[str, ...] = SENDERS
     sim_signer: str | None = None              # dry: simulate as this address (a funded wallet), else as the copied wallet
     max_age_s: float = MAX_AGE_S               # buys older than this when ready are not sent, nor simulated; sells always go out
+    exit: str = "wallet"                       # sold when the wallet sells, or by a rule of our own (pumpexits: hold2m, tp100_sl50...)
 
     @property
     def sends(self) -> bool:
@@ -89,8 +91,14 @@ class LiveCfg:
                   max_open=int(num("PUMP_LIVE_MAX_OPEN", 3)), day_loss_sol=num("PUMP_LIVE_DAY_LOSS_SOL", 0.5),
                   buy_slip=num("PUMP_LIVE_BUY_SLIP", 0.25), sell_slip=num("PUMP_LIVE_SELL_SLIP", 0.5),
                   rpc_url=env.get("PUMP_LIVE_RPC") or PUBLIC_RPC, send_urls=listed("PUMP_LIVE_SEND") or SENDERS,
-                  sim_signer=env.get("PUMP_LIVE_SIM_SIGNER") or None, max_age_s=num("PUMP_LIVE_MAX_AGE_S", MAX_AGE_S))
+                  sim_signer=env.get("PUMP_LIVE_SIM_SIGNER") or None, max_age_s=num("PUMP_LIVE_MAX_AGE_S", MAX_AGE_S),
+                  exit=(env.get("PUMP_LIVE_EXIT") or "wallet").strip().lower())
         buys = mode in ("dry", "live")                  # exit only sells: a bad buy setting must not keep its copies from getting out
+        if cfg.exit != "wallet" and cfg.exit not in TPSL and cfg.exit not in HOLDS:
+            if buys:
+                raise ValueError(f"PUMP_LIVE_EXIT must be wallet or one of {', '.join([*TPSL, *HOLDS])}, not {cfg.exit!r}")
+            log.warning("live: PUMP_LIVE_EXIT=%r is no exit rule: the open copies are sold as their wallets sell", cfg.exit)
+            cfg = replace(cfg, exit="wallet")
         if not 0 <= cfg.sell_slip < 1 or buys and (not 0 < cfg.stake_sol <= 5 or not 0 <= cfg.buy_slip < 1 or cfg.max_open < 1
                                                    or cfg.day_loss_sol <= 0 or not 0 < cfg.max_age_s <= 60):
             raise ValueError("PUMP_LIVE_STAKE_SOL must be in (0, 5], the slippages in [0, 1), PUMP_LIVE_MAX_OPEN at least 1, "
@@ -146,6 +154,7 @@ class LiveFollow:
         self.balance: float | None = None
         self.retries: list[tuple[float, str, int]] = []   # (not before, mint, try) of the sells to send again
         self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0, "lists": 0.0}
+        self.rule = rule_spec(cfg.exit) if cfg.exit != "wallet" else None   # (take profit, stop, seconds) of our own exit
         self.tip = 0                                   # the newest slot a trade came from: how far the chain went since a buy
         self.lag = [float("inf"), float("inf"), 0.0]   # least (now - a trade's block time) this minute and the last, since:
                                                        # the usual lag, the yardstick for a trade the feed's thread got to late
@@ -171,18 +180,32 @@ class LiveFollow:
         if not e.get("tok") or not (user in self.targets or mint in self.pos or self._busy(mint)):
             return
         self.coins[mint] = coin_of(mint, e)
+        if self.rule is not None and self.rule[0] is not None and mint in self.pos:
+            self._rule_hit(mint, slot)
         if user not in self.targets:
             return
         if e["buy"]:
             if (user, mint) not in self.copied and mint not in self.pos and not self._busy(mint):
                 self.copied.add((user, mint))
                 self._buy(user, mint, slot, e.get("ts"))
+        elif self.rule is not None:
+            return                                         # out by our own rule: the wallet's sell is not ours to follow
         elif self.pos.get(mint, {}).get("wallet") == user:
             self._sell(mint, slot, "its wallet sold")
         else:
             for o in self._orders():
                 if o["mint"] == mint and o["side"] == "buy" and o["wallet"] == user:
                     o["sell_after"] = slot                 # it sold before our buy showed up: out the moment it does
+
+    def _rule_hit(self, mint: str, slot: int) -> None:
+        """Our own exit's take-profit or stop, on this trade's reserves: what the tokens would fetch after the coin's fee,
+        against what the buy spent before the transaction cost, as the paper and the sweep count it."""
+        from .pumpfun import TX_COST_SOL
+        tp, sl, _ = self.rule
+        p = self.pos[mint]
+        worth, spent = sol_for(self.coins[mint], p["tok"]) / 1e9, p["cost"] - TX_COST_SOL
+        if not (1 - sl) * spent < worth < (1 + tp) * spent:
+            self._sell(mint, slot, f"{self.cfg.exit}: worth {worth:.4f} SOL for {spent:.4f}")
 
     def _orders(self) -> list[dict[str, Any]]:
         return [*self.open.values(), *(o for o, _ in self.jobs if o["side"] in ("buy", "sell"))]
@@ -384,7 +407,9 @@ class LiveFollow:
                 o["looking"] = True
                 self.jobs.append(({"side": "lookup", "mint": o["mint"], "id": o["id"]}, self.workers.submit(self._lookup, dict(o))))
         for m, p in list(self.pos.items()):
-            if now - p["opened"] >= MAX_HOLD_S:
+            if self.rule is not None and now - p["opened"] >= self.rule[2]:
+                self._sell(m, None, f"{self.cfg.exit}: held {self.rule[2]} s")   # on the coin's newest trade seen, quiet or not
+            elif now - p["opened"] >= MAX_HOLD_S:
                 self.coins.pop(m, None)                     # priced on the chain: its last trade seen may be hours old, or the curve's
                 self._sell(m, None, "held too long")
 

@@ -20,7 +20,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .pumpfun import (LAMPORTS, PAPER_BUY_SLOTS, PAPER_SELL_SLOTS, PAPER_STAKE_SOL, TX_COST_SOL, _fee_known, _fee_rate,
+from .pumpfun import (LAMPORTS, PAPER_BUY_SLOTS, PAPER_SELL_SLOTS, PAPER_STAKE_SOL, TX_COST_SOL, _fee_known, _fee_rate, _pct,
                       _rules_line, _rules_on, _state_before, _value, connect, copy_trade)
 
 HOLDS = {"hold10s": 10, "hold30s": 30, "hold1m": 60, "hold2m": 120, "hold5m": 300, "hold10m": 600}
@@ -31,6 +31,50 @@ WALLET_SL = 0.2                # the stop under the wallet's own exit
 MAX_HOLD_S = 1800              # a take-profit, stop or trail not hit by then sells on the clock
 MAX_SLOTS = MAX_HOLD_S * 5     # slots read after the buy, to bound the read: 30 min at 0.2 s a slot, twice the chain's pace
 MAX_POSITIONS = 1000           # a wallet's latest coins replayed, like stake_sweep
+# forward-tested on paper beside every copy from 2026-10-10: the sweep's best on 8zkgFG over 3 days (tp100_sl50 +8.8%,
+# hold2m +5.7%, both halves positive) and over all 21 followed wallets pooled (hold30s -3.9% against -5.1% selling with
+# the wallet). Picked in-sample, best of 15: only copies made after the pick say whether any of it holds.
+FORWARD = ("tp100_sl50", "hold2m", "hold30s")
+FORWARD_MIN = 5                # closed copies of a wallet, per rule, before it gets a line of its own
+
+
+def rule_spec(name: str) -> tuple[float | None, float | None, int]:
+    """(take profit, stop loss, seconds held at most) of one TPSL or HOLDS rule: what the paper's and the live copies'
+    own exits watch. KeyError for any other name."""
+    if name in TPSL:
+        return (*TPSL[name], MAX_HOLD_S)
+    return None, None, HOLDS[name]
+
+
+def forward_lines(db_path: str | Path, tx_cost_sol: float = TX_COST_SOL) -> list[str]:
+    """The paper's own exits on the copies they closed, each next to the same copies sold with their wallet: all
+    followed wallets pooled, then each with FORWARD_MIN+ closed a rule. Out-of-sample from 2026-10-10, unlike the sweep."""
+    c = connect(db_path, readonly=True)
+    try:
+        rows = c.execute("""SELECT x.wallet, substr(x.side, 3), x.sol - x.pnl - 2 * ?, x.pnl, s.pnl
+                            FROM pfills x LEFT JOIN pfills s ON s.wallet = x.wallet AND s.mint = x.mint AND s.side = 'sell'
+                            WHERE x.side LIKE 'x:%'""", (tx_cost_sol,)).fetchall()
+    finally:
+        c.close()
+    if not rows:
+        return []
+
+    def line(rs: list[tuple]) -> str:
+        out = []
+        for rule in sorted({r[1] for r in rs}, key=lambda n: FORWARD.index(n) if n in FORWARD else len(FORWARD)):
+            mine = [r for r in rs if r[1] == rule]
+            cost, both = sum(r[2] for r in mine), [r for r in mine if r[4] is not None]
+            out.append(f"{rule} {_pct(sum(r[3] for r in mine) / cost if cost else None)} n{len(mine)} won "
+                       f"{sum(r[3] > 0 for r in mine) / len(mine):.0%} (sold with the wallet "
+                       f"{_pct(sum(r[4] for r in both) / sum(r[2] for r in both) if both else None)} on {len(both)} of them)")
+        return ", ".join(out)
+
+    by: dict[str, list[tuple]] = {}
+    for r in rows:
+        by.setdefault(r[0], []).append(r)
+    return [f"exit forward all followed ({len(by)} wallets, since 2026-10-10): {line(rows)}",
+            *(f"exit forward {w}: {line(rs)}" for w, rs in sorted(by.items())
+              if len(rs) >= FORWARD_MIN * len({r[1] for r in rs}))]
 
 
 def exit_pnls(c: sqlite3.Connection, wallet: int, mint: int, fb: int, t_in: int, buy_slots: int = PAPER_BUY_SLOTS,

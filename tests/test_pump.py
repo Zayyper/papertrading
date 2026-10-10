@@ -690,6 +690,51 @@ def test_a_followed_wallets_trade_in_a_pool_we_do_not_follow_is_copied_and_the_p
     col.c.close()
 
 
+def test_each_paper_buy_is_held_again_per_exit_rule_of_our_own_and_sold_by_it(tmp_path):
+    """From 2026-10-10 each paper copy's buy is held once more per exit rule (pumpexits.FORWARD): a take-profit sells on
+    the trade that crosses it, landing like a copied sell, a hold on the clock. The copies' own numbers leave them out;
+    forward_lines sets them next to the same copies sold with their wallet."""
+    from hl_screener.pumpexits import forward_lines
+    col = Collector(tmp_path / "pump.db")
+    G, X, Y = (bytes([i]) * 32 for i in (90, 91, 92))
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, 0.5)", (b58(G),))
+    col.paper.reload()
+    mint, cv, held = bytes([93]) * 32, Curve(), {}
+
+    def trade(slot, who, buy, amount=None):
+        if buy:
+            tok = cv.buy(amount)
+            held[who] = held.get(who, 0) + tok
+            col.on_logs(slot, logs(trade_bytes(mint, who, True, amount, tok, cv.vsol, cv.vtok)))
+        else:
+            tok = held.pop(who)
+            col.on_logs(slot, logs(trade_bytes(mint, who, False, cv.sell(tok), tok, cv.vsol, cv.vtok)))
+
+    trade(100, G, True, 10**9)
+    trade(104, Y, True, 10**7)                             # the copy's buy lands: held again per rule
+    assert set(col.paper.xpos[b58(mint)]) == {(b58(G), r) for r in ("tp100_sl50", "hold2m", "hold30s")}
+    trade(110, X, True, 20 * 10**9)                        # the coin more than doubles: past tp100_sl50's take-profit
+    trade(112, Y, True, 10**7)                             # not landed yet
+    trade(113, Y, True, 10**7)                             # landed: sold at the state the trade at 112 left
+    fills = col.c.execute("SELECT side, trigger_slot, land_slot, pnl FROM pfills WHERE side LIKE 'x:%'").fetchall()
+    assert [f[:3] for f in fills] == [("x:tp100_sl50", 110, 113)] and fills[0][3] > PAPER_STAKE_SOL
+    for v in col.paper.xpos[b58(mint)].values():
+        v[2] -= 125                                        # two minutes on: both holds are due
+    col.paper.tick()
+    trade(120, Y, True, 10**7)                             # they land with the next trade 3 slots on
+    assert sorted(r[0] for r in col.c.execute("SELECT side FROM pfills WHERE side LIKE 'x:%'")) == ["x:hold2m", "x:hold30s", "x:tp100_sl50"]
+    assert b58(mint) not in col.paper.xpos and not col.c.execute("SELECT * FROM xpos").fetchall()
+    w = col.paper.summary()["wallets"][0]
+    assert (w["closed"], w["realized"]) == (0, 0.0)        # the copy itself is still open: its numbers have none of these
+    trade(130, G, False)                                   # the wallet sells: the copy too, 3 slots on
+    trade(133, Y, True, 10**7)
+    col.c.commit()
+    lines = forward_lines(tmp_path / "pump.db")
+    assert lines[0].startswith("exit forward all followed (1 wallets, since 2026-10-10): tp100_sl50 +")
+    assert "(sold with the wallet " in lines[0] and "on 1 of them)" in lines[0] and len(lines) == 1   # under FORWARD_MIN a rule
+    col.c.close()
+
+
 def test_a_wallet_we_hold_a_copy_of_is_read_past_the_cap_and_a_failed_read_checks_its_copies(tmp_path, monkeypatch):
     """A coin we hold migrated while the feed was down: its wallet's sell comes in a pool we do not follow. It must not
     be the trade the read cap turns away, and a read that fails must not leave the copy open until MAX_HOLD_S."""

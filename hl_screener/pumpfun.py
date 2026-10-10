@@ -265,6 +265,8 @@ CREATE TABLE IF NOT EXISTS pfills (id INTEGER PRIMARY KEY, wallet TEXT, mint TEX
                                    land_slot INTEGER, ts INTEGER, sol REAL, tok REAL, leader_px REAL, px REAL,
                                    slip_bps REAL, pnl REAL, timed_out INTEGER);
 CREATE TABLE IF NOT EXISTS ppos (wallet TEXT, mint TEXT, tok REAL, cost REAL, opened INTEGER, PRIMARY KEY (wallet, mint));
+-- the same buys held again, one per exit rule of our own (pumpexits.FORWARD), sold by the rule, filled as side 'x:<rule>'
+CREATE TABLE IF NOT EXISTS xpos (wallet TEXT, mint TEXT, rule TEXT, tok REAL, cost REAL, opened INTEGER, PRIMARY KEY (wallet, mint, rule));
 CREATE TABLE IF NOT EXISTS opos (wallet TEXT, mint TEXT, cost REAL, proceeds REAL, tok REAL, PRIMARY KEY (wallet, mint));
 CREATE TABLE IF NOT EXISTS psnap (ts INTEGER, wallet TEXT, copy_pnl REAL, copy_cost REAL, own_pnl REAL, own_cost REAL);
 CREATE INDEX IF NOT EXISTS ix_psnap ON psnap(wallet, ts);
@@ -332,12 +334,22 @@ class PaperFollow:
     the copy is sold when the wallet first sells, landing `sell_latency_slots` after it. Priced on the live curve
     at the wallet's own fee rate plus `tx_cost_sol` per transaction (signature, priority fee, tip): the report's
     replay rules, at the delays the live copies met rather than the replay's 2 slots.
+    Each buy is also held once more per exit rule of our own (`exits`, pumpexits.FORWARD), sold by that rule rather
+    than with the wallet: a take-profit or stop-loss watched on every trade, or the clock. Same buy, same pricing, same
+    delay to land: the exit alone differs.
     Nothing is ever sent to Solana."""
 
     def __init__(self, c: sqlite3.Connection, latency_slots: int = PAPER_BUY_SLOTS, stake_sol: float = PAPER_STAKE_SOL,
-                 tx_cost_sol: float = TX_COST_SOL, sell_latency_slots: int = PAPER_SELL_SLOTS):
-        from .pumpmature import MC_LEVELS                      # here: that module builds on this one
+                 tx_cost_sol: float = TX_COST_SOL, sell_latency_slots: int = PAPER_SELL_SLOTS, exits: tuple[str, ...] | None = None):
+        from .pumpexits import FORWARD, rule_spec              # here: those modules build on this one
+        from .pumpmature import MC_LEVELS
         self.c, self.L, self.Ls, self.stake, self.tx = c, latency_slots, sell_latency_slots, stake_sol, tx_cost_sol
+        self.exits = {name: rule_spec(name) for name in (FORWARD if exits is None else exits)}
+        self.xpos: dict[str, dict[tuple[str, str], list]] = {}  # mint -> (wallet, rule) -> [tok, cost, opened]
+        self.xpending: dict[str, list[dict[str, Any]]] = {}     # mint -> their sales on the way
+        for w, m, rule, tok, cost, opened in c.execute("SELECT wallet, mint, rule, tok, cost, opened FROM xpos"):
+            if rule in self.exits:
+                self.xpos.setdefault(m, {})[(w, rule)] = [tok, cost, opened]
         self.follow: set[str] = set()
         self.mature_only: set[str] = set()                     # followed only for buying past $100k: only those buys are copied
         self.mature_mcap = MC_LEVELS["mc100k"]
@@ -352,7 +364,7 @@ class PaperFollow:
         self.pending: dict[str, list[dict[str, Any]]] = {}
         self.curve: dict[str, tuple[int, int, float]] = {}     # mint -> reserves after its last trade, when seen
         self.tip = 0                                            # newest slot the feed has shown
-        for m in {m for (_, m) in self.pos} | self._held():    # after a restart, mark open positions at the last stored price
+        for m in {m for (_, m) in self.pos} | self._held() | set(self.xpos):   # after a restart, open positions at the last stored price
             row = c.execute("""SELECT t.vsol, t.vtok FROM trades t JOIN mints mm ON mm.id = t.mint WHERE mm.addr = ?
                                ORDER BY t.slot DESC, t.rowid DESC LIMIT 1""", (m,)).fetchone()
             if row:
@@ -402,9 +414,17 @@ class PaperFollow:
         acts = self.pending.get(mint)
         if acts:                                                # copies due: land at the state before this trade
             self._run_due(mint, acts, [slot >= a["land"] for a in acts])
+        if mint in self.xpending:                               # and our own exits' sales
+            self._run_exits(mint, [slot >= a["land"] for a in self.xpending[mint]])
         self.curve[mint] = (e["vsol"], e["vtok"], time.time())
         if not e["buy"] and e["fee"] > 0 and e["sol"] >= 10**7:
             self.sell_rate[mint] = e["fee"] / e["sol"]
+        for (w, rule), (tok, cost, _) in list(self.xpos.get(mint, {}).items()):   # our own exits' take-profits and stops
+            tp, sl, _ = self.exits[rule]
+            if tp is not None:
+                worth = (e["vsol"] - e["vsol"] * e["vtok"] / (e["vtok"] + tok)) * (1 - self.sell_rate.get(mint, FEE)) / LAMPORTS
+                if not (1 - sl) * cost < worth < (1 + tp) * cost:   # worth after the fee, before the transaction, as the sweep
+                    self._exit(mint, w, rule, slot)
         key, side = (user, mint), ("buy" if e["buy"] else "sell")
         mine = [a for a in self.pending.get(mint, ()) if a["wallet"] == user]
         following = user in self.follow
@@ -446,9 +466,30 @@ class PaperFollow:
         for a in acts[:last + 1]:
             self._execute(a, mint, timed_out)
 
+    def _exit(self, mint: str, wallet: str, rule: str, slot: int) -> None:
+        """One of our own exits is due: its sale lands `Ls` slots after `slot`, as a copied sell does. Once. A queue of
+        its own: each such sale is on a position of its own, so none waits for, or hurries, the copies' queue."""
+        if not any(a["side"] == f"x:{rule}" and a["wallet"] == wallet for a in self.xpending.get(mint, ())):
+            self.xpending.setdefault(mint, []).append({"wallet": wallet, "side": f"x:{rule}", "trigger": slot, "land": slot + self.Ls,
+                                                       "rate": self.sell_rate.get(mint, FEE), "leader_px": 0.0, "t": time.time()})
+
+    def _run_exits(self, mint: str, due: list[bool], timed_out: bool = False) -> None:
+        acts = self.xpending.pop(mint, [])
+        if rest := [a for a, d in zip(acts, due) if not d]:
+            self.xpending[mint] = rest
+        for a in (a for a, d in zip(acts, due) if d):
+            self._execute(a, mint, timed_out)
+
     def tick(self) -> None:
-        """Copies on a token that went quiet land at its current state: nothing traded since."""
+        """Our own exits whose time has come, by the clock (a hold, or a take-profit's longest wait); then sales on a
+        token that went quiet land at its current state: nothing traded since."""
         now = time.time()
+        for mint, held in list(self.xpos.items()):
+            for (w, rule), (_, _, opened) in list(held.items()):
+                if now - opened >= self.exits[rule][2]:
+                    self._exit(mint, w, rule, self.tip)
+        for mint, acts in list(self.xpending.items()):
+            self._run_exits(mint, [now - a["t"] > (a["land"] - a["trigger"]) * SLOT_S + 2 for a in acts], timed_out=True)
         for mint, acts in list(self.pending.items()):
             self._run_due(mint, acts, [now - a["t"] > (a["land"] - a["trigger"]) * SLOT_S + 2 for a in acts], timed_out=True)
 
@@ -479,6 +520,20 @@ class PaperFollow:
             slip = (px / a["leader_px"] - 1) * 1e4 if a["leader_px"] > 0 else None
             self.pos[key] = [tok, self.stake, now]
             self.c.execute("INSERT OR REPLACE INTO ppos VALUES (?,?,?,?,?)", (*key, tok, self.stake, now))
+            for rule in self.exits:                             # the same buy, held again per exit rule of our own
+                self.xpos.setdefault(mint, {})[(a["wallet"], rule)] = [tok, self.stake, now]
+                self.c.execute("INSERT OR REPLACE INTO xpos VALUES (?,?,?,?,?,?)", (a["wallet"], mint, rule, tok, self.stake, now))
+        elif a["side"].startswith("x:"):
+            rule = a["side"][2:]
+            held = self.xpos.get(mint, {}).pop((a["wallet"], rule), None)
+            if not self.xpos.get(mint):
+                self.xpos.pop(mint, None)
+            if held is None:
+                return
+            tok, cost = held[0], held[1]
+            sol = (vsol - vsol * vtok / (vtok + tok)) * (1 - a["rate"]) / LAMPORTS
+            pnl, px, slip = sol - cost - 2 * self.tx, sol * LAMPORTS / tok, None
+            self.c.execute("DELETE FROM xpos WHERE wallet = ? AND mint = ? AND rule = ?", (a["wallet"], mint, rule))
         else:
             held = self.pos.pop(key, None)
             if held is None:
@@ -493,7 +548,7 @@ class PaperFollow:
                        (*key, a["side"], a["trigger"], a["land"], now, sol, tok, a["leader_px"], px, slip, pnl, int(timed_out)))
 
     def forget(self, max_age_s: float = 6 * 3600) -> None:
-        keep = {m for (_, m) in self.pos} | set(self.pending) | self._held()
+        keep = {m for (_, m) in self.pos} | set(self.pending) | self._held() | set(self.xpos)
         cutoff = time.time() - max_age_s
         self.curve = {m: v for m, v in self.curve.items() if v[2] >= cutoff or m in keep}
 
@@ -511,7 +566,7 @@ class PaperFollow:
         for w, copied, closed, realized, wins, delay, slip, invested in self.c.execute(
                 """SELECT wallet, SUM(side = 'buy'), SUM(side = 'sell'), COALESCE(SUM(pnl), 0), SUM(pnl > 0),
                           AVG(land_slot - trigger_slot), AVG(slip_bps), SUM(CASE WHEN side = 'buy' THEN sol ELSE 0 END)
-                   FROM pfills GROUP BY wallet"""):
+                   FROM pfills WHERE side IN ('buy', 'sell') GROUP BY wallet"""):   # our own exits' sales: pumpexits.forward_lines
             if w in rows:
                 rows[w].update(copied=copied, closed=closed, realized=realized, wins=wins, delay_slots=delay, slip_bps=slip,
                                invested=invested)
@@ -529,7 +584,8 @@ class PaperFollow:
             r["own_roi"] = r["own_pnl"] / r["own_cost"] if r["own_cost"] else None
             r["win_rate"] = r["wins"] / r["closed"] if r["closed"] else None
         cols = ("wallet", "mint", "side", "trigger_slot", "land_slot", "ts", "sol", "slip_bps", "pnl", "timed_out")
-        recent = [dict(zip(cols, r)) for r in self.c.execute(f"SELECT {', '.join(cols)} FROM pfills ORDER BY id DESC LIMIT 50")]
+        recent = [dict(zip(cols, r)) for r in self.c.execute(
+            f"SELECT {', '.join(cols)} FROM pfills WHERE side IN ('buy', 'sell') ORDER BY id DESC LIMIT 50")]
         return {"at": int(time.time()), "stake_sol": self.stake, "latency_slots": self.L, "sell_latency_slots": self.Ls, "tx_cost_sol": self.tx,
                 "tx_cost_parts": {"base_fee": BASE_FEE_SOL, "priority": PRIORITY_SOL, "tip": TIP_SOL},
                 "snipers": self.sniper_cfg, "pending": sum(len(v) for v in self.pending.values()),
@@ -692,7 +748,7 @@ class Collector:
     def _pinned_pools(self) -> set[str]:
         """Pools where a copy, paper or live, is open or on its way: their leader's sell, and a sale by hand of a live
         copy, must still reach us. A live copy pins its own pool: the paper's may have closed, or never opened."""
-        open_ = {m for (_, m) in self.paper.pos} | set(self.paper.pending)
+        open_ = {m for (_, m) in self.paper.pos} | set(self.paper.pending) | set(self.paper.xpos)   # xpos: our own exits watch prices
         if self.live is not None:
             open_ |= set(self.live.pos) | {o["mint"] for o in self.live._orders()}
         return {p for p, m in self.pools.items() if m in open_}
@@ -977,8 +1033,8 @@ class Collector:
         real money first; a copy is queued once per kind of check however many drops name it, so drops every few
         minutes cannot pile reads up faster than the one reader, at one read per GAP_PACE_S, gets through them."""
         since = time.time() - GAP_LOOK_BACK_S
-        live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None else ())
-                if not p.get("stuck") and p["opened"] >= since]
+        live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None and self.live.rule is None else ())
+                if not p.get("stuck") and p["opened"] >= since]   # out by a rule of our own: the wallet's sell is not ours
         paper = [("paper", w, m) for (w, m), (_, _, opened) in self.paper.pos.items() if opened >= since]
         todo = [(kind, w, m, self.paper.own[(w, m)][2] if (w, m) in self.paper.own else 0.0)   # what we saw it buy
                 for kind, w, m in live + paper if (mints is None or m in mints) and (wallet is None or w == wallet)]
@@ -1301,8 +1357,10 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
             col.live = LiveFollow(col.c, live, keypair=load_keypair() if live.sends else None)
             who = ", ".join(sorted(live.wallets)) or "the golden wallets"
             print(f"live copies: {live.mode}{f' from {col.live.me}' if col.live.me else ''}, " + (
-                  f"winding down: no new copies, the {len(col.live.pos)} open ones sold as their wallets sell"
-                  if live.mode == "exit" else f"copying {who} with {live.stake_sol:g} SOL" + (
+                  f"winding down: no new copies, the {len(col.live.pos)} open ones sold "
+                  f"{'as their wallets sell' if live.exit == 'wallet' else 'by ' + live.exit}"
+                  if live.mode == "exit" else f"copying {who} with {live.stake_sol:g} SOL, out "
+                  f"{'with the wallet' if live.exit == 'wallet' else 'by ' + live.exit}" + (
                       f", at most {live.max_open} open, new copies stop after {live.day_loss_sol:g} SOL lost in a day"
                       if live.mode == "live" else ", simulated, nothing sent")), flush=True)
     except Exception as e:  # noqa: BLE001 - a bad setting must not stop the collector; the key never reaches the message
@@ -1384,7 +1442,9 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                     for line in paper_lines(db_path) + live_lines(db_path) + go_lines(db_path) + stake_sweep(db_path):   # forward test, live copies, the go-live rule, sizes
                         log.info("%s", line)
                     try:                                             # the same copies, sold by rules of our own
-                        from .pumpexits import exit_sweep            # here: that module builds on this one
+                        from .pumpexits import exit_sweep, forward_lines   # here: that module builds on this one
+                        for line in forward_lines(db_path):          # our own exits on paper since 10-10: out-of-sample
+                            log.info("%s", line)
                         t0 = time.monotonic()
                         for line in exit_sweep(db_path):
                             log.info("%s", line)

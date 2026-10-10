@@ -297,6 +297,36 @@ def test_a_dry_run_does_not_simulate_a_buy_that_reached_it_late(tmp_path):
     col.c.close()
 
 
+def test_out_by_a_rule_of_our_own_the_wallets_sell_is_not_ours_and_the_rule_sells(tmp_path):
+    """PUMP_LIVE_EXIT (2026-10-10): the copy leaves by a rule of our own, its take-profit or stop on any trade of the
+    coin, or the clock; the wallet's sell, seen or found by a gap check, is not ours to follow."""
+    col, chain, cv, me, mine = held(tmp_path, exit="tp100_sl50")
+    trade(col, 20, MINT, G, False, cv, tok=10**12)      # the wallet sells: not ours
+    col.rpc, col.gap_pool = Holdings({(b58(G), b58(MINT)): 0}), Now()
+    col.check_gap("reconnect")                          # nor what a gap check finds it sold
+    col.flush()
+    assert len(chain.sent) == 1                         # our buy alone
+    trade(col, 21, MINT, X, True, cv, sol=40 * 10**9)   # the coin more than doubles: the take-profit
+    col.flush()
+    assert len(chain.sent) == 2 and sells(col) == [("sent", 1)]
+    col.c.close()
+
+    (tmp_path / "hold").mkdir()
+    col, chain, cv, me, mine = held(tmp_path / "hold", exit="hold2m")
+    col.flush()
+    assert len(chain.sent) == 1                         # not two minutes yet
+    col.live.pos[b58(MINT)]["opened"] -= 121
+    col.flush()                                         # sent from this tick ...
+    col.flush()                                         # ... and settled at the next
+    assert len(chain.sent) == 2 and sells(col) == [("sent", 1)]
+    col.c.close()
+    assert LiveCfg.from_env({"PUMP_LIVE_EXIT": "hold2m"}).exit == "hold2m" and LiveCfg.from_env({}).exit == "wallet"
+    with pytest.raises(ValueError):
+        LiveCfg.from_env({"PUMP_LIVE_EXIT": "hold3m"})  # no such rule: no buys on it
+    exiting = {"PUMP_LIVE": "exit", "PUMP_LIVE_KEY": "k", "PUMP_LIVE_WALLETS": "G", "PUMP_LIVE_EXIT": "hold3m"}
+    assert LiveCfg.from_env(exiting).exit == "wallet"   # but the open copies still get out
+
+
 def test_a_buy_the_feeds_thread_got_to_late_is_not_sent_though_its_slot_looks_new(tmp_path):
     """Behind a stall (a database lock), the socket's backlog is handled late, slot clock and all: only the trade's own
     block time, against the usual lag of the others, says how old it is."""
@@ -737,6 +767,6 @@ def test_the_startup_line_says_what_the_live_copies_will_do(tmp_path, monkeypatc
     finally:
         for n, level in levels.items():
             logging.getLogger(n).setLevel(level)
-    assert first == [f"live copies: live from {kp.pubkey()}, copying {b58(G)} with 0.05 SOL, at most 1 open, new copies stop "
+    assert first == [f"live copies: live from {kp.pubkey()}, copying {b58(G)} with 0.05 SOL, out with the wallet, at most 1 open, new copies stop "
                      "after 0.5 SOL lost in a day",
                      f"live copies: exit from {kp.pubkey()}, winding down: no new copies, the 0 open ones sold as their wallets sell"]
