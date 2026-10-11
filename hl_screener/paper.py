@@ -203,6 +203,7 @@ class Leader:
     equity: float | None = None
     equity_at: int = 0
     last_fill_time: int = 0
+    of: str | None = None          # a stop account's leader: same fills, plus our own stop and weekly loss limit
 
 
 def read_leaders(path: Path) -> list[dict[str, Any]]:
@@ -233,17 +234,28 @@ def _f(x: Any) -> float | None:
 
 
 class PaperTrader:
+    """With `stop_pct`, every leader is also copied by a second account, '<address>#stop<pct>': the same fills, but a
+    position `stop_pct` under its entry at the mid is sold at the book and its coin left alone until the leader closes
+    or flips it; and once the account's fills lost `week_loss` x its base over 7 days, it opens and adds nothing more
+    until they no longer have. Both accounts side by side say what the stop and the limit change."""
     def __init__(self, api: HyperliquidAPI, cfg: Config, leaders: list[dict[str, Any]], store: Store,
-                 equity_base: float, max_leverage: float, ws_url: str = WS_URL):
+                 equity_base: float, max_leverage: float, ws_url: str = WS_URL, stop_pct: float = 0.0, week_loss: float = 0.0):
         self.api, self.cfg, self.store = api, cfg, store
         self.equity_base, self.max_leverage, self.ws_url = equity_base, max_leverage, ws_url
+        self.stop_pct, self.week_loss = stop_pct, week_loss
         self.fee_bps = cfg.taker_fee_bps + cfg.builder_fee_bps
         self.mids: dict[str, float] = {}
         self.leaders: dict[str, Leader] = {}
         self.positions: dict[str, dict[str, FPos]] = {}
         self.totals: dict[str, dict[str, float]] = {}
+        self.variant: dict[str, str] = {}              # leader -> its stop account
+        self.stopped: dict[str, set[str]] = {}          # stop account -> coins stopped out of, until the leader closes them
         self._stop = asyncio.Event()
         t = now_ms()
+        if stop_pct > 0:
+            rule = f"stop -{stop_pct:.0%}" + (f", week -{week_loss:.0%}" if week_loss > 0 else "")
+            leaders = [*leaders, *({"address": f"{L['address']}#stop{round(stop_pct * 100)}", "name": rule, "of": L["address"]}
+                                   for L in leaders)]
         for L in leaders:
             a = L["address"]
             row = store.one("SELECT * FROM leaders WHERE address=?", a)
@@ -253,7 +265,10 @@ class PaperTrader:
                 row = store.one("SELECT * FROM leaders WHERE address=?", a)
             assert row is not None
             self.leaders[a] = Leader(address=a, name=row["name"], equity=row["leader_equity"], equity_at=row["leader_equity_at"] or 0,
-                                     last_fill_time=row["last_fill_time"] or 0)
+                                     last_fill_time=row["last_fill_time"] or 0, of=L.get("of"))
+            if L.get("of"):
+                self.variant[L["of"]] = a
+                self.stopped[a] = set(store.get_meta(f"stopped {a}", []))
             self.totals[a] = {"realized": row["realized"] or 0.0, "fees": row["fees"] or 0.0, "funding": row["funding"] or 0.0}
             self.positions[a] = {p["coin"]: FPos(p["size"], p["entry_px"], p["opened_at"]) for p in store.rows("SELECT * FROM positions WHERE address=?", a)}
         store.set_meta("config", {"equity_base": equity_base, "max_leverage": max_leverage, "fee_bps": self.fee_bps, "leaders": list(self.leaders)})
@@ -297,66 +312,120 @@ class PaperTrader:
         own_liq = bool(liq) and str((liq or {}).get("liquidatedUser", "")).lower() == addr
         self.store.exec("INSERT INTO leader_fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tid, addr, t, coin, side, px, sz, start,
                         f.get("dir"), _f(f.get("closedPnl")) or 0.0, _f(f.get("fee")) or 0.0, int(own_liq), now_ms(), int(late))
-        L = self.leaders[addr]
-        L.last_fill_time = max(L.last_fill_time, t)
-        if coin.startswith("@") or "/" in coin:
-            self._save_totals(addr)
-            return  # spot
         if own_liq:
             self.store.event("warn", f"{short(addr)} was LIQUIDATED on {coin} (leader fill {tid})")
-        if not L.equity or L.equity <= 0:
-            self.store.event("warn", f"{short(addr)}: no leader equity yet, fill on {coin} not followed")
-            self._save_totals(addr)
+        books: dict[str, Any] = {}                  # one book per fill: both accounts are priced at the same moment
+        for key in filter(None, (addr, self.variant.get(addr))):
+            await self._follow(key, addr, f, tid, late, books)
+
+    async def _follow(self, key: str, addr: str, f: dict[str, Any], tid: str, late: bool, books: dict[str, Any]) -> None:
+        """Account `key` follows leader `addr`'s fill."""
+        coin, t = str(f.get("coin", "")), int(f["time"])
+        px, sz, side = float(f["px"]), abs(float(f["sz"])), str(f.get("side", "B"))
+        start = float(f.get("startPosition", 0.0))
+        L, lead = self.leaders[key], self.leaders[addr]
+        L.last_fill_time = max(L.last_fill_time, t)
+        if coin.startswith("@") or "/" in coin:
+            self._save_totals(key)
+            return  # spot
+        if not lead.equity or lead.equity <= 0:
+            if key == addr:
+                self.store.event("warn", f"{short(addr)}: no leader equity yet, fill on {coin} not followed")
+            self._save_totals(key)
             return
         delta = sz if side == "B" else -sz
-        ratio = self.equity_base / L.equity
-        pos = self.positions[addr].get(coin)
+        if coin in self.stopped.get(key, ()):
+            if abs(start + delta) > EPS and (start + delta) * start > 0:
+                self._save_totals(key)
+                return                              # still the position we were stopped out of
+            self._stopped(key, coin, False)         # closed or flipped by the leader: followed again from here
+        ratio = self.equity_base / lead.equity
+        pos = self.positions[key].get(coin)
         f_size = pos.size if pos else 0.0
         cap_size = self.max_leverage * self.equity_base / px
         acts = plan_follow(start, delta, f_size, ratio, cap_size)
+        if L.of and any(a in ("open", "add") for a, _ in acts) and (lost := self._week_lost(key)) >= self.week_loss * self.equity_base > 0:
+            self.store.event("info", f"{short(key)}: lost ${lost:,.0f} over 7 days, not adding to {coin}")
+            acts = [(a, s) for a, s in acts if a not in ("open", "add")]
         if not acts:
-            self._save_totals(addr)
+            self._save_totals(key)
             return
+        if coin not in books:
+            books[coin] = await self._book(coin, px)
+        for action, size in acts:
+            self._fill(key, coin, action, size, books[coin], px, t, tid, late)
+        self._save_totals(key)
+
+    async def _book(self, coin: str, px: float) -> dict[str, Any]:
         try:
-            book = await asyncio.to_thread(self.api.l2_book, coin)
+            return await asyncio.to_thread(self.api.l2_book, coin)
         except Exception as e:  # noqa: BLE001
             self.store.event("error", f"l2Book {coin} failed ({e}); pricing at leader px + 10 bps")
-            book = {"levels": [[{"px": px * (1 - 1e-3), "sz": 1e12}], [{"px": px * (1 + 1e-3), "sz": 1e12}]]}
+            return {"levels": [[{"px": px * (1 - 1e-3), "sz": 1e12}], [{"px": px * (1 + 1e-3), "sz": 1e12}]]}
+
+    def _fill(self, key: str, coin: str, action: str, size: float, book: dict[str, Any], px: float, t: int,
+              tid: str | None, late: bool) -> None:
+        """One paper order of account `key`, taking `size` coins from `book`; `px` and `t` are what it follows (the
+        leader's fill, or the mid that set off our stop)."""
         detected = now_ms()
-        for action, size in acts:
-            side_f = "B" if size > 0 else "A"
-            fill_px, used, unfilled = walk_book(book, side_f, abs(size))
-            if fill_px != fill_px:
-                fill_px = self.mids.get(coin, px)
-            notional = abs(size) * fill_px
-            fee = notional * self.fee_bps / 1e4
-            realized = 0.0
-            pos = self.positions[addr].get(coin)
-            if action in ("open", "add"):
-                if pos is None or abs(pos.size) <= EPS:
-                    self.positions[addr][coin] = FPos(size, fill_px, detected)
-                else:
-                    new_size = pos.size + size
-                    pos.entry_px = (pos.entry_px * abs(pos.size) + fill_px * abs(size)) / abs(new_size)
-                    pos.size = new_size
+        side_f = "B" if size > 0 else "A"
+        fill_px, used, unfilled = walk_book(book, side_f, abs(size))
+        if fill_px != fill_px:
+            fill_px = self.mids.get(coin, px)
+        notional = abs(size) * fill_px
+        fee = notional * self.fee_bps / 1e4
+        realized = 0.0
+        pos = self.positions[key].get(coin)
+        if action in ("open", "add"):
+            if pos is None or abs(pos.size) <= EPS:
+                self.positions[key][coin] = FPos(size, fill_px, detected)
             else:
-                assert pos is not None
-                direction = 1.0 if pos.size > 0 else -1.0
-                realized = (fill_px - pos.entry_px) * abs(size) * direction
-                pos.size += size
-            self.totals[addr]["realized"] += realized
-            self.totals[addr]["fees"] += fee
-            self.store.exec("INSERT INTO paper_fills(address, tid, time, coin, action, side, size, leader_px, fill_px, notional, slippage_bps, latency_ms, fee, realized, levels_used, unfilled, late) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", addr, tid, detected, coin, action, side_f, size, px, fill_px, notional,
-                            slippage_bps(px, fill_px, side_f), detected - t, fee, realized, used, unfilled, int(late))
-            self._save_position(addr, coin)
-            log.info("%s %s %s %.6g %s @ %.6g (leader %.6g, %+.1f bps, %d ms%s) realized %+.2f fee %.2f",
-                     short(addr), action, coin, size, side_f, fill_px, px, slippage_bps(px, fill_px, side_f), detected - t, " LATE" if late else "", realized, fee)
-        self._save_totals(addr)
+                new_size = pos.size + size
+                pos.entry_px = (pos.entry_px * abs(pos.size) + fill_px * abs(size)) / abs(new_size)
+                pos.size = new_size
+        else:
+            assert pos is not None
+            direction = 1.0 if pos.size > 0 else -1.0
+            realized = (fill_px - pos.entry_px) * abs(size) * direction
+            pos.size += size
+        self.totals[key]["realized"] += realized
+        self.totals[key]["fees"] += fee
+        self.store.exec("INSERT INTO paper_fills(address, tid, time, coin, action, side, size, leader_px, fill_px, notional, slippage_bps, latency_ms, fee, realized, levels_used, unfilled, late) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", key, tid, detected, coin, action, side_f, size, px, fill_px, notional,
+                        slippage_bps(px, fill_px, side_f), detected - t, fee, realized, used, unfilled, int(late))
+        self._save_position(key, coin)
+        log.info("%s %s %s %.6g %s @ %.6g (leader %.6g, %+.1f bps, %d ms%s) realized %+.2f fee %.2f",
+                 short(key), action, coin, size, side_f, fill_px, px, slippage_bps(px, fill_px, side_f), detected - t, " LATE" if late else "", realized, fee)
+
+    def _week_lost(self, key: str) -> float:
+        """What account `key`'s fills lost over the last 7 days, fees in (0 when they made money)."""
+        r = self.store.one("SELECT COALESCE(SUM(realized - fee), 0) pnl FROM paper_fills WHERE address=? AND time >= ?",
+                           key, now_ms() - 7 * 86_400_000)
+        return max(0.0, -(r or {}).get("pnl", 0.0))
+
+    def _stopped(self, key: str, coin: str, on: bool) -> None:
+        (self.stopped[key].add if on else self.stopped[key].discard)(coin)
+        self.store.set_meta(f"stopped {key}", sorted(self.stopped[key]))
+
+    async def check_stops(self) -> None:
+        """The stop accounts' own stop, on the mids: a position `stop_pct` under its entry is sold at the book."""
+        for key, L in self.leaders.items():
+            if not L.of:
+                continue
+            for coin, p in list(self.positions[key].items()):
+                mark = self.mids.get(coin)
+                if mark is None or (p.entry_px - mark) / p.entry_px * (1 if p.size > 0 else -1) < self.stop_pct:
+                    continue
+                self._fill(key, coin, "stop", -p.size, await self._book(coin, mark), mark, now_ms(), None, False)
+                self._stopped(key, coin, True)
+                self._save_totals(key)
+                self.store.event("info", f"{short(key)}: stopped out of {coin} at {mark:.6g}, {self.stop_pct:.0%} under its entry {p.entry_px:.6g}")
 
     # ---- periodic work --------------------------------------------------------
     async def refresh_leader_equity(self) -> None:
         for addr, L in self.leaders.items():
+            if L.of:
+                continue
             try:
                 st = await asyncio.to_thread(self.api.clearinghouse_state, addr)
                 v = _f((st.get("marginSummary") or {}).get("accountValue"))
@@ -365,6 +434,11 @@ class PaperTrader:
                     self.store.exec("UPDATE leaders SET leader_equity=?, leader_equity_at=?, leader_equity_start=COALESCE(leader_equity_start, ?) WHERE address=?", v, L.equity_at, v, addr)
             except Exception as e:  # noqa: BLE001
                 self.store.event("warn", f"clearinghouseState {short(addr)} failed: {e}")
+        for key, L in self.leaders.items():          # a stop account copies its leader's: sizes are scaled by it
+            if L.of and self.leaders[L.of].equity is not None:
+                L.equity, L.equity_at = self.leaders[L.of].equity, self.leaders[L.of].equity_at
+                self.store.exec("UPDATE leaders SET leader_equity=?, leader_equity_at=?, leader_equity_start=COALESCE(leader_equity_start, ?) WHERE address=?",
+                                L.equity, L.equity_at, L.equity, key)
 
     async def refresh_mids(self) -> None:
         try:
@@ -402,7 +476,7 @@ class PaperTrader:
     async def reconcile(self) -> None:
         """After a (re)connect: fetch fills we may have missed and process them as late."""
         for addr, L in self.leaders.items():
-            if L.last_fill_time <= 0:
+            if L.last_fill_time <= 0 or L.of:          # a stop account follows its leader's fills, late ones too
                 continue
             try:
                 fills = await asyncio.to_thread(self.api.fills_since, addr, L.last_fill_time + 1)
@@ -450,6 +524,7 @@ class PaperTrader:
                 await self.refresh_mids()
                 await self.apply_funding()
                 next_funding += 3600
+            await self.check_stops()
             await asyncio.sleep(5)
 
     async def ws_loop(self) -> None:
@@ -459,7 +534,7 @@ class PaperTrader:
         while not self._stop.is_set():
             try:
                 async with websockets.connect(self.ws_url, ping_interval=None, max_size=2**24) as ws:
-                    for addr in self.leaders:
+                    for addr in self.leaders.keys() - self.variant.values():
                         await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFills", "user": addr}}))
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
                     self.store.event("info", "websocket connected" if first else "websocket reconnected")
@@ -509,7 +584,8 @@ class PaperTrader:
 
 
 def short(a: str) -> str:
-    return a[:6] + "…" + a[-4:]
+    a, _, rule = a.partition("#")
+    return a[:6] + "…" + a[-4:] + (f" #{rule}" if rule else "")
 
 
 # ---------------------------------------------------------------------------
@@ -587,9 +663,11 @@ def serve(api: HyperliquidAPI, cfg: Config, leaders_path: Path, db_path: Path, e
         return 2
     store = Store(db_path)
     store.set_meta("leaders_file", Path(leaders_path).as_posix())
-    trader = PaperTrader(api, cfg, leaders, store, equity_base, max_leverage)
+    trader = PaperTrader(api, cfg, leaders, store, equity_base, max_leverage, stop_pct=cfg.paper_stop_pct, week_loss=cfg.paper_week_loss)
     logging.getLogger(__name__).setLevel(logging.INFO)  # fills are printed even without -v
-    print(f"paper trader: {len(leaders)} leaders from {leaders_path}, ${equity_base:,.0f} each, max {max_leverage}x, db {db_path}. Ctrl+C to stop.", flush=True)
+    print(f"paper trader: {len(leaders)} leaders from {leaders_path}, ${equity_base:,.0f} each, max {max_leverage}x, db {db_path}"
+          + (f"; each also copied with a stop at -{cfg.paper_stop_pct:.0%} and new copies paused after -{cfg.paper_week_loss:.0%} in 7 days"
+             if cfg.paper_stop_pct > 0 else "") + ". Ctrl+C to stop.", flush=True)
 
     async def main() -> None:
         loop = asyncio.get_running_loop()

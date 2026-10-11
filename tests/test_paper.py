@@ -1,6 +1,6 @@
 import asyncio
 
-from hl_screener.paper import PaperTrader, Store, plan_follow, read_leaders, slippage_bps, status, walk_book
+from hl_screener.paper import PaperTrader, Store, plan_follow, read_leaders, short, slippage_bps, status, walk_book
 from hl_screener.config import Config
 
 
@@ -114,3 +114,35 @@ def test_read_leaders_from_shortlist_and_plain_list(tmp_path):
     txt = tmp_path / "addr.txt"
     txt.write_text("0x" + "C" * 40 + "\n0x" + "c" * 40 + "\n", encoding="utf-8")
     assert [x["address"] for x in read_leaders(txt)] == ["0x" + "c" * 40]
+
+
+def test_the_stop_account_stops_out_waits_for_the_leader_to_close_and_pauses_after_its_weekly_loss(tmp_path):
+    store = Store(tmp_path / "p.db")
+    addr = "0x" + "a" * 40
+    api = FakeLiveAPI()
+    trader = PaperTrader(api, Config(), [{"address": addr}], store, equity_base=1000.0, max_leverage=10.0,
+                         stop_pct=0.05, week_loss=0.005)                       # a $5 weekly limit: one stop hits it
+    stop = addr + "#stop5"
+    assert trader.leaders[stop].of == addr and short(stop) == "0xaaaa…aaaa #stop5"
+    asyncio.run(trader.refresh_leader_equity())
+    assert trader.leaders[stop].equity == 10000                                # sized by its leader's equity
+    fill = lambda tid, sz, side, start: asyncio.run(trader.on_fill(addr, {"tid": tid, "time": tid * 1000, "coin": "ETH", "px": "100",   # noqa: E731
+                                                                          "sz": str(sz), "side": side, "startPosition": str(start)}, False))
+    fill(1, 10, "B", 0)                                                         # both accounts buy 1 ETH at 100.1
+    assert trader.positions[addr]["ETH"].size == trader.positions[stop]["ETH"].size == 1.0
+    trader.mids["ETH"] = 95.2                                                   # 4.9 % under the entry: held
+    asyncio.run(trader.check_stops())
+    assert "ETH" in trader.positions[stop]
+    trader.mids["ETH"], api.book = 94.0, {"levels": [[{"px": "93.9", "sz": "100"}], [{"px": "94.1", "sz": "100"}]]}
+    asyncio.run(trader.check_stops())                                           # 6.1 % under: sold at the bid
+    assert "ETH" not in trader.positions[stop] and "ETH" in trader.positions[addr]
+    assert abs(trader.totals[stop]["realized"] - (93.9 - 100.1)) < 1e-9 and store.get_meta(f"stopped {stop}") == ["ETH"]
+    fill(2, 10, "B", 10)                                                        # the leader adds: only the plain copy does
+    assert trader.positions[addr]["ETH"].size == 2.0 and "ETH" not in trader.positions[stop]
+    fill(3, 20, "A", 20)                                                        # the leader closes: the coin is free again
+    assert "ETH" not in trader.positions[addr] and trader.stopped[stop] == set()
+    fill(4, 10, "B", 0)                                                         # a new position, but the stop lost $6.3 > $5
+    assert "ETH" in trader.positions[addr] and "ETH" not in trader.positions[stop]
+    assert store.one("SELECT COUNT(*) n FROM events WHERE message LIKE '%over 7 days, not adding to ETH'")["n"] == 1
+    assert [r["action"] for r in store.rows("SELECT action FROM paper_fills WHERE address=? ORDER BY id", stop)] == ["open", "stop"]
+    store.close()

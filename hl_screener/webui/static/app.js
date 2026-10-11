@@ -35,7 +35,7 @@
   const fmtDate = (ms) => isNum(ms) ? new Date(ms).toISOString().slice(0, 10) : "";
   const signCls = (x) => isNum(x) ? (x > 0 ? "pos" : x < 0 ? "neg" : "") : "";
   const pct = (x, nd = 1) => `<span class="${signCls(x)}">${fmtPct(x, nd)}</span>`;
-  const shortAddr = (a) => a ? a.slice(0, 6) + "…" + a.slice(-4) : "";
+  const shortAddr = (a) => { const [x, rule] = String(a || "").split("#"); return x ? x.slice(0, 6) + "…" + x.slice(-4) + (rule ? " #" + rule : "") : ""; };
   const elapsed = (s) => { s = Math.max(0, Math.floor(s)); const m = Math.floor(s / 60), h = Math.floor(m / 60); return h ? `${h}h ${m % 60}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
   const parseNum = (s) => { const v = parseFloat(String(s).replace(/,/g, "")); return Number.isFinite(v) ? v : null; };
 
@@ -739,7 +739,7 @@
     const wSlip = L.filter((l) => isNum(l.avg_slippage_bps) && l.n_paper_fills), slip = wSlip.length ? wSlip.reduce((a, l) => a + l.avg_slippage_bps * l.n_paper_fills, 0) / wSlip.reduce((a, l) => a + l.n_paper_fills, 0) : NaN;
     const wMod = L.filter((l) => isNum(l.model_penalty_bps)), model = wMod.length ? wMod.reduce((a, l) => a + l.model_penalty_bps, 0) / wMod.length : NaN;
     const wLat = L.filter((l) => isNum(l.avg_latency_ms) && l.n_paper_fills), lat = wLat.length ? wLat.reduce((a, l) => a + l.avg_latency_ms * l.n_paper_fills, 0) / wLat.reduce((a, l) => a + l.n_paper_fills, 0) : NaN;
-    $("#paper-tiles").innerHTML = tile("Leaders", fmtInt(L.length), `${L.reduce((a, l) => a + (l.positions || []).length, 0)} open positions`) +
+    $("#paper-tiles").innerHTML = tile("Leaders", fmtInt(L.filter((l) => !String(l.address).includes("#")).length), `${L.reduce((a, l) => a + (l.positions || []).length, 0)} open positions`) +
       tile("All accounts", fmtUsd(equity), base ? `<span class="${signCls(equity - base)}">${fmtPct(equity / base - 1)}</span> on ${fmtUsd(base)}` : "") +
       tile("Follower fills", fmtInt(fills), `${L.reduce((a, l) => a + (l.n_late || 0), 0)} late · ${L.reduce((a, l) => a + (l.n_thin_book || 0), 0)} beyond the book`) +
       tile("Slippage, measured", isNum(slip) ? fmtNum(slip, 1) + " bps" : "n/a", isNum(model) ? `model assumed ${fmtNum(model, 1)} bps` : "") +

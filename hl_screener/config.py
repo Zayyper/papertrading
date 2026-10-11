@@ -48,6 +48,8 @@ class Config:
     builder_fee_bps: float = 0.0               # 0 when trading direct; set >0 to model a platform cut
     follower_equity_usd: float = 1_000.0
     follower_max_leverage: float = 10.0        # hard cap on follower notional / equity
+    paper_stop_pct: float = 0.05               # paper: each leader also copied with this stop under the entry (0: not)
+    paper_week_loss: float = 0.10              # ...and no new copies once it lost this x the base over 7 days (0: never)
     apply_funding: bool = True
 
     # ---- liquidity tiers (dayNtlVlm thresholds, USD) ----------------------
