@@ -69,6 +69,9 @@ LOW_DISK_KEEP_S = 36 * 3600    # not less than 31 h: mature coins are settled ~3
 DISK_WARN_GB = 6.0             # below this much, the log warns once an hour, while there is still time to act
 GAP_PACE_S = 0.5               # between two reads after a feed gap (a sold copy costs a few more, paced too): the public RPC
                                # allows 40 per 10 s per method and 100 per 10 s in all, shared with the live copies' calls
+GAP_TRIES = 3                  # reads of a wallet a gap check makes before its copy stays open until the next check
+GAP_BACKOFF_S = 5.0            # the pause after a refused read: the public RPC counts its limits over 10 s (2026-10-11:
+                               # 4-11 of each drop's 8-21 reads were refused, HTTP 429, and those copies stayed open)
 GAP_LOOK_BACK_S = 3 * 86_400   # copies opened longer ago are not checked: a wallet that never sells a dead coin would be read on every reconnect
 GAP_KEPT = 0.99                # a leader holding less than this share of the tokens we saw it buy sold while we were blind
 POOL_READS = 10                # pools read at once for followed wallets' trades in pools we do not follow (see _found): a bot
@@ -1095,16 +1098,19 @@ class Collector:
     def _gap_job(self, why: str) -> None:
         """On the worker thread: each wallet's balance of the coin, one read every GAP_PACE_S, real money first, and for
         a paper copy whose wallet sold, the coin as the chain has it now, to price the exit (a few more reads, rare; a
-        live sell reads it itself). It touches the RPC and the queues only. A wallet that cannot be read keeps its copy."""
-        failed, n = [], 0
+        live sell reads it itself). It touches the RPC and the queues only. A refused read goes to the back of its queue
+        after a GAP_BACKOFF_S pause, up to GAP_TRIES reads; a wallet still unread keeps its copy until the next check."""
+        failed, n, tries = {}, 0, {}                      # failed: (kind, wallet, mint) -> the last refusal
         while True:
             try:
-                _, every, _, (kind, wallet, mint, bought) = self.gap_first.get_nowait()
+                _, every, _, t = self.gap_first.get_nowait()
             except queue.Empty:
                 break
+            kind, wallet, mint, bought = t
             with self.gap_lock:
                 self.gap_queued.discard((kind, wallet, mint, every))
-            n += 1
+            n += (kind, wallet, mint) not in tries
+            tries[kind, wallet, mint] = tries.get((kind, wallet, mint), 0) + 1
             if self.halt.wait(GAP_PACE_S):
                 return                                            # the collector is stopping
             try:
@@ -1112,15 +1118,23 @@ class Collector:
                                                                      {"encoding": "jsonParsed", "commitment": "confirmed"}])["value"]
                 held = sum(int(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) for a in accounts)
             except Exception as e:  # noqa: BLE001 - one unreadable wallet must not end the check
-                failed.append(f"{type(e).__name__}: {e}")
+                if tries[kind, wallet, mint] >= GAP_TRIES:
+                    failed[kind, wallet, mint] = f"{type(e).__name__}: {e}"
+                    continue
+                with self.gap_lock:                               # again later, unless a newer check queued it already
+                    if (kind, wallet, mint, every) not in self.gap_queued:
+                        self.gap_queued.add((kind, wallet, mint, every))
+                        self.gap_first.put((kind != "live", every, next(self.gap_seq), t))
+                if self.halt.wait(GAP_BACKOFF_S):
+                    return
                 continue
             if held == 0 or held < GAP_KEPT * bought:
                 if kind == "paper" and self.halt.wait(GAP_PACE_S):
                     return
                 self.gap_out.put((kind, wallet, mint, self._coin_now(mint) if kind == "paper" else None))
         if failed:
-            log.warning("gap check after the %s: %d of %d wallets could not be read (%s): their copies stay open",
-                        why, len(failed), n, _no_key(failed[0])[:200])
+            log.warning("gap check after the %s: %d of %d wallets could not be read in %d tries (%s): their copies stay open",
+                        why, len(failed), n, GAP_TRIES, _no_key(next(iter(failed.values())))[:200])
 
     def _coin_now(self, mint: str) -> dict[str, Any] | None:
         """On the worker thread: the coin's curve or pool as the chain has it now, or None when it cannot be read."""

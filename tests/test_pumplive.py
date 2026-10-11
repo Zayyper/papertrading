@@ -392,6 +392,7 @@ def copied(tmp_path, monkeypatch):
     """The wallet's buy of MINT, copied on paper and live, both open; gap checks run at once, without pauses."""
     from hl_screener import pumpfun
     monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0)
+    monkeypatch.setattr(pumpfun, "GAP_BACKOFF_S", 0)
     kp = Keypair()
     me = bytes(kp.pubkey())
     col, chain = setup(tmp_path, "live", wallets=frozenset({b58(G)}), keypair=kp)
@@ -445,6 +446,26 @@ def test_a_paper_copy_of_a_coin_without_a_price_is_not_sold_by_a_gap_check(tmp_p
     col.c.close()
 
 
+def test_a_read_the_rpc_refuses_is_made_again_and_a_wallet_that_sold_meanwhile_closes_its_copies(tmp_path, monkeypatch, caplog):
+    col, chain, bought = copied(tmp_path, monkeypatch)
+    rpc = Holdings({(b58(G), b58(MINT)): 0})                        # sold while we were blind...
+    refused, call = set(), rpc.call
+
+    def once_refused(method, params, url=None):                     # ...and the first read of each copy is refused
+        key = (params[0], params[1]["mint"])
+        if key not in refused:
+            refused.add(key)
+            raise RuntimeError("getTokenAccountsByOwner: HTTP 429")
+        return call(method, params, url)
+    rpc.call = once_refused
+    col.rpc = rpc
+    col.check_gap("pool feed drop", {b58(MINT)})
+    col.flush()
+    assert len(chain.sent) == 2 and b58(MINT) in col.paper.pending  # the live copy's sell is out, the paper's on its way
+    assert col.stats["gap_sold"] == 2 and rpc.asked == [(b58(G), b58(MINT))] * 2 and "could not be read" not in caplog.text
+    col.c.close()
+
+
 def test_a_wallet_still_holding_after_a_gap_keeps_its_copies_and_so_does_one_the_rpc_will_not_read(tmp_path, monkeypatch, caplog):
     col, chain, bought = copied(tmp_path, monkeypatch)
     col.rpc = Holdings({(b58(G), b58(MINT)): bought})               # every token it bought, still there
@@ -455,7 +476,8 @@ def test_a_wallet_still_holding_after_a_gap_keeps_its_copies_and_so_does_one_the
     assert len(chain.sent) == 1 and not col.paper.pending
     assert (b58(G), b58(MINT)) in col.paper.pos and b58(MINT) in col.live.pos
     assert (col.stats["gap_checks"], col.stats["gap_sold"]) == (2, 0)
-    assert "2 of 2 wallets could not be read (RuntimeError: getTokenAccountsByOwner: HTTP 429): their copies stay open" in caplog.text
+    assert "2 of 2 wallets could not be read in 3 tries (RuntimeError: getTokenAccountsByOwner: HTTP 429): their copies stay open" in caplog.text
+    assert len(col.rpc.asked) == 6                                  # each refused twice more, after a pause
     col.paper.pos[(b58(G), b58(MINT))][2] -= GAP_LOOK_BACK_S        # both copies opened over three days ago: left alone,
     col.live.pos[b58(MINT)]["opened"] -= GAP_LOOK_BACK_S            # not read again on every reconnect
     col.rpc = Holdings({})
