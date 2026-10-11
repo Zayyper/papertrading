@@ -21,8 +21,9 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 POOL_PER_CONN = 95              # subscription attempts a connection may make: the public RPC closes it at the 101st
-POOL_CONNS = 8                  # connections for pools, on top of the pump.fun one: the public RPC allows 10 websockets per IP
-                                # (x-ratelimit pubsub-limit, 2026-09-26), so a restart's overlap with the old container goes over
+POOL_CONNS = 7                  # connections for pools, on top of the pump.fun one and the live wallets' own: the public RPC
+                                # allows 10 websockets per IP (x-ratelimit pubsub-limit, 2026-09-26), so a restart's overlap with
+                                # the old container goes over
 POOL_IDLE_S = 3600              # a pool that has not traded for this long is dropped at the next retirement
 SUB_PER_S = 8.0                 # subscribe requests a second over all connections (the public RPC: 100 per 10 s per IP)
 WORKED_S = 30                   # a connection that lived this long was let in and fed us: the server closed it (every 1-5 min
@@ -41,8 +42,9 @@ class _Conn:
 
 class PoolFeed:
     def __init__(self, url: str, on_logs: Callable[[int, list[str], str | None], None],
-                 pinned: Callable[[], set[str]] = set, on_back: Callable[[str], None] = lambda pool: None) -> None:
-        self.url, self.on_logs, self.pinned, self.on_back = url, on_logs, pinned, on_back
+                 pinned: Callable[[], set[str]] = set, on_back: Callable[[str], None] = lambda pool: None,
+                 name: str = "pool feed") -> None:
+        self.url, self.on_logs, self.pinned, self.on_back, self.name = url, on_logs, pinned, on_back, name
         self.seen: dict[str, float] = {}      # pool -> when it last traded, or was added
         self.blind: set[str] = set()          # pools with a copy open whose connection ended, until subscribed again
         self.conns: list[_Conn] = []
@@ -150,7 +152,7 @@ class PoolFeed:
         lived = time.time() - c.opened
         self.fails = 0 if lived >= WORKED_S else self.fails + 1
         self.wait_until = time.time() + min(2.0 * 2 ** self.fails, 60.0)
-        log.warning("pool feed connection with %d pools ended after %.0fs (%s)", len(c.pools), lived, why)
+        log.warning("%s connection with %d pools ended after %.0fs (%s)", self.name, len(c.pools), lived, why)
 
     async def _send(self, c: _Conn, ws) -> None:
         n = 0

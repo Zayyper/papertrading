@@ -1226,6 +1226,12 @@ class Collector:
         gap_from = None
         seen = (self.stats["trades"], self.stats["mints"], self.stats["parse_errors"])
         pools = asyncio.create_task(self.pool_feed.run(stop))   # beside the pump.fun feed, on the public RPC
+        # the live copies' leaders also on a connection of their own, a few subscriptions: the busy ones drop in bursts
+        # (2026-10-11 13:45-13:47: the pump.fun feed twice, 7 pool connections; a 3gHrfi buy reached us 6.3 s late)
+        live_wallets = set(self.live.targets) if self.live is not None else set()
+        from .pumppools import PoolFeed
+        lifeline = PoolFeed(self.ws_url, self.on_logs, pinned=lambda: live_wallets, on_back=self._back, name="live wallets feed")
+        wallets = asyncio.create_task(lifeline.run(stop)) if live_wallets else asyncio.create_task(stop.wait())
         writes = asyncio.create_task(self._flush_loop(stop))
         self.check_gap("restart")                               # the copies loaded from the database: were they sold meanwhile?
         while not stop.is_set():
@@ -1301,8 +1307,9 @@ class Collector:
                     pass
         self.halt.set()                                          # the gap worker stops reading: its findings wait for the next start
         pools.cancel()
+        wallets.cancel()
         writes.cancel()
-        await asyncio.gather(pools, writes, return_exceptions=True)   # the pools' sockets close properly too (PoolFeed.run)
+        await asyncio.gather(pools, wallets, writes, return_exceptions=True)   # their sockets close properly too (PoolFeed.run)
         self.flush()
         log.info("stopped: the feeds are closed and what they brought is written")
 

@@ -459,3 +459,34 @@ def test_the_collector_logs_the_live_copies_and_reads_gaps_on_the_public_rpc_wha
     finally:
         for n, level in levels.items():
             logging.getLogger(n).setLevel(level)
+
+
+def test_the_live_wallets_get_a_connection_of_their_own(tmp_path, monkeypatch):
+    sent: list[list[dict]] = []                                       # what each connection was asked, in order
+
+    class Recording(Silent):
+        def __init__(self):
+            super().__init__([])
+            self.mine = []
+            sent.append(self.mine)
+
+        async def send(self, msg):
+            self.mine.append(json.loads(msg))
+
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace(connect=lambda *a, **k: Recording()))
+    col = Collector(tmp_path / "pump.db")
+    col.check_gap = lambda *a, **k: None
+    col.live = types.SimpleNamespace(targets={"LeaderWallet111"}, pos={}, rule=None, coins={}, _orders=lambda: [],
+                                     _busy=lambda m: False, tick=lambda *a, **k: None)
+
+    async def main():
+        stop = asyncio.Event()
+        task = asyncio.create_task(col.run(stop))
+        await asyncio.sleep(0.5)
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(main())
+    subs = [[m["params"][0]["mentions"] for m in c if m.get("method") == "logsSubscribe" and "mentions" in m["params"][0]] for c in sent]
+    assert subs.count([["LeaderWallet111"]]) == 2                     # on the pool feed, and on a connection of its own
+    col.c.close()
