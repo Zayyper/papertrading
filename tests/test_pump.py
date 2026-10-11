@@ -790,6 +790,7 @@ def test_a_wallet_we_hold_a_copy_of_is_read_past_the_cap_and_a_failed_read_check
     from hl_screener import pumpfun
     monkeypatch.setattr(pumpfun, "POOL_READS", 0)          # the cap reached
     monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0.01)
+    monkeypatch.setattr(pumpfun, "GAP_READ_S", 0.01)
     col = Collector(tmp_path / "pump.db")
     W, V, pool = bytes([66]) * 32, bytes([67]) * 32, bytes([68]) * 32
     for w in (W, V):
@@ -829,6 +830,7 @@ def test_a_pool_migrated_while_the_feed_was_down_is_read_through_a_lagging_node_
             return a
 
     monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0.01)
+    monkeypatch.setattr(pumpfun, "GAP_READ_S", 0.01)
     col = Collector(tmp_path / "pump.db")
     W, dev, mint, unknown = bytes([61]) * 32, bytes([62]) * 32, bytes([63]) * 32, bytes([65]) * 32
     pool = canonical_pool(b58(mint))

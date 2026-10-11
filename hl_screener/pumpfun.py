@@ -67,11 +67,14 @@ MIN_FREE_GB = 1.0              # below this much free disk, trades are not store
 LOW_DISK_GB = 3.0              # below this much, prune down to LOW_DISK_KEEP_S of history instead of the full retention
 LOW_DISK_KEEP_S = 36 * 3600    # not less than 31 h: mature coins are settled ~30.5 h after creation (pumpmature.LOOK_AT_S)
 DISK_WARN_GB = 6.0             # below this much, the log warns once an hour, while there is still time to act
-GAP_PACE_S = 0.5               # between two reads after a feed gap (a sold copy costs a few more, paced too): the public RPC
-                               # allows 40 per 10 s per method and 100 per 10 s in all, shared with the live copies' calls
+GAP_PACE_S = 0.5               # between two account reads (a pool's coin, a sold copy's coin): the public RPC allows 50
+                               # getAccountInfo per 10 s, shared with the live copies' calls
+GAP_READ_S = 1.25              # between two of a gap check's wallet reads: the public RPC allows 10 getTokenAccountsByOwner
+                               # per 10 s per IP, sliding, and counts the refused ones too (x-ratelimit-method-*, 2026-10-11):
+                               # at one every 0.5 s the rest of each check was refused
 GAP_TRIES = 3                  # reads of a wallet a gap check makes before its copy stays open until the next check
-GAP_BACKOFF_S = 5.0            # the pause after a refused read: the public RPC counts its limits over 10 s (2026-10-11:
-                               # 4-11 of each drop's 8-21 reads were refused, HTTP 429, and those copies stayed open)
+GAP_BACKOFF_S = 10.0           # the pause after a refused read: the whole window (2026-10-11: 4-11 of each drop's 8-21
+                               # reads were refused, HTTP 429, and those copies stayed open)
 GAP_LOOK_BACK_S = 3 * 86_400   # copies opened longer ago are not checked: a wallet that never sells a dead coin would be read on every reconnect
 GAP_KEPT = 0.99                # a leader holding less than this share of the tokens we saw it buy sold while we were blind
 POOL_READS = 10                # pools read at once for followed wallets' trades in pools we do not follow (see _found): a bot
@@ -1070,7 +1073,7 @@ class Collector:
         A connection's drop names its coins (`mints`, and its `wallet` if it was a followed wallet's): their few copies are
         read ahead of the rest of a check already running, which takes minutes with hundreds of copies open. One queue,
         real money first; a copy is queued once per kind of check however many drops name it, so drops every few
-        minutes cannot pile reads up faster than the one reader, at one read per GAP_PACE_S, gets through them."""
+        minutes cannot pile reads up faster than the one reader, at one read per GAP_READ_S, gets through them."""
         since = time.time() - GAP_LOOK_BACK_S
         live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None and self.live.rule is None else ())
                 if not p.get("stuck") and p["opened"] >= since]   # out by a rule of our own: the wallet's sell is not ours
@@ -1096,7 +1099,7 @@ class Collector:
                 f" ({len(todo) - fresh} already waiting)" if fresh < len(todo) else "")
 
     def _gap_job(self, why: str) -> None:
-        """On the worker thread: each wallet's balance of the coin, one read every GAP_PACE_S, real money first, and for
+        """On the worker thread: each wallet's balance of the coin, one read every GAP_READ_S, real money first, and for
         a paper copy whose wallet sold, the coin as the chain has it now, to price the exit (a few more reads, rare; a
         live sell reads it itself). It touches the RPC and the queues only. A refused read goes to the back of its queue
         after a GAP_BACKOFF_S pause, up to GAP_TRIES reads; a wallet still unread keeps its copy until the next check."""
@@ -1111,7 +1114,7 @@ class Collector:
                 self.gap_queued.discard((kind, wallet, mint, every))
             n += (kind, wallet, mint) not in tries
             tries[kind, wallet, mint] = tries.get((kind, wallet, mint), 0) + 1
-            if self.halt.wait(GAP_PACE_S):
+            if self.halt.wait(GAP_READ_S):
                 return                                            # the collector is stopping
             try:
                 accounts = self.rpc.call("getTokenAccountsByOwner", [wallet, {"mint": mint},

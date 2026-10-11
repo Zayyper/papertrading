@@ -392,6 +392,7 @@ def copied(tmp_path, monkeypatch):
     """The wallet's buy of MINT, copied on paper and live, both open; gap checks run at once, without pauses."""
     from hl_screener import pumpfun
     monkeypatch.setattr(pumpfun, "GAP_PACE_S", 0)
+    monkeypatch.setattr(pumpfun, "GAP_READ_S", 0)
     monkeypatch.setattr(pumpfun, "GAP_BACKOFF_S", 0)
     kp = Keypair()
     me = bytes(kp.pubkey())
