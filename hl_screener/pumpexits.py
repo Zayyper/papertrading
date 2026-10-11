@@ -124,6 +124,10 @@ def exit_pnls(c: sqlite3.Connection, wallet: int, mint: int, fb: int, t_in: int,
         out[name] = net(next((i for i, w in enumerate(worth) if not (1 - sl) * stake_sol < w < (1 + tp) * stake_sol), end))
     for name, (drop, arm) in TRAILS.items():
         out[name] = net(_trail(worth, _value(entry, tokens, fee0), drop, arm, stake_sol, end))
+    # out after 2 min, or on the wallet's own sell when that comes first: a leader's flip in seconds was a dump twice
+    # live on 2026-10-11 (89zSQJFG -62 %, 4ero3KHv -51 %), held through by hold2m
+    fs_ts = c.execute("SELECT MIN(ts) FROM trades WHERE wallet=? AND mint=? AND buy=0 AND slot=?", (wallet, mint, fs)).fetchone()[0] if fs is not None else None
+    out["hold2m_or_wallet"] = out["wallet"] if fs_ts is not None and fs_ts <= t_in + HOLDS["hold2m"] else out["hold2m"]
     stop = next((i for i, w in enumerate(worth) if w <= (1 - WALLET_SL) * stake_sol and (fs is None or slots[i] < fs)), None)
     # ponytail: the stop is watched for MAX_HOLD_S only; a wallet that holds longer keeps its own exit past that
     out[f"wallet_sl{round(WALLET_SL * 100)}"] = net(stop) if stop is not None else out["wallet"]

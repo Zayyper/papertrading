@@ -104,3 +104,17 @@ def test_a_buy_back_into_a_coin_sold_out_of_is_a_reentry_an_add_is_not(tmp_path)
     c.close()
     lines = exit_sweep(tmp_path / "pump.db", reentry=True)
     assert lines[0].startswith("reentry sweep all followed (2 copies of 1 wallets") and lines[1].startswith("reentry sweep Wfollowed (2 copies): ")
+
+
+def test_hold2m_or_wallet_leaves_with_a_wallet_that_sells_within_2_min_and_on_the_clock_otherwise(tmp_path):
+    c, _, _ = coins(tmp_path)                                         # both wallets sell within 40 s
+    late = Coin(c, 3, T0 + 500)
+    late.to(0, 31, W)
+    late.to(60, 33)
+    late.to(200, 30, W)                                               # this one sells after 200 s
+    c.commit()
+    for mint, t_in in ((1, T0), (2, T0 + 100)):
+        p = exit_pnls(c, W, mint, 1000, t_in)
+        assert p["hold2m_or_wallet"] == p["wallet"]
+    p = exit_pnls(c, W, 3, 1000, T0 + 500)
+    assert p["hold2m_or_wallet"] == p["hold2m"] != p["wallet"]
