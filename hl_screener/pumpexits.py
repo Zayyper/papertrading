@@ -36,6 +36,7 @@ MAX_POSITIONS = 1000           # a wallet's latest coins replayed, like stake_sw
 # the wallet). Picked in-sample, best of 15: only copies made after the pick say whether any of it holds.
 FORWARD = ("tp100_sl50", "hold2m", "hold30s")
 FORWARD_MIN = 5                # closed copies of a wallet, per rule, before it gets a line of its own
+REENTRY_LEFT = 0.01            # a wallet left with at most this share of the most it held of a coin has sold out of it
 
 
 def rule_spec(name: str) -> tuple[float | None, float | None, int]:
@@ -140,34 +141,56 @@ def _trail(worth: list[float], start: float, drop: float, arm: float | None, sta
     return end
 
 
+def reentries(c: sqlite3.Connection, wallet: int, max_positions: int = MAX_POSITIONS) -> list[tuple[int, int, int]]:
+    """(mint, slot, ts) of `wallet`'s buys back into a coin it had sold out of (REENTRY_LEFT), latest first: the buys
+    the copies skip today, which take only a wallet's first buy of each coin. Only on the coins whose first stored trade
+    of the wallet is a buy (bought before the stored trades start, its position is unknown) and that it did not make."""
+    out, mint, known, held, peak = [], None, False, 0, 0
+    for m, slot, ts, buy, tok in c.execute("""SELECT t.mint, t.slot, t.ts, t.buy, t.tok FROM trades t JOIN mints m ON m.id = t.mint
+                                             WHERE t.wallet = ? AND m.creator != t.wallet ORDER BY t.mint, t.slot, t.rowid""", (wallet,)):
+        if m != mint:
+            mint, known, held, peak = m, bool(buy), 0, 0
+        if not known:
+            continue
+        if buy and peak and held <= REENTRY_LEFT * peak:
+            out.append((m, slot, ts))
+            peak = 0                                       # a new position: sold out of once it falls under its own top
+        held += tok if buy else -tok
+        peak = max(peak, held)
+    return sorted(out, key=lambda r: r[1], reverse=True)[:max_positions]
+
+
 def exit_sweep(db_path: str | Path, buy_slots: int = PAPER_BUY_SLOTS, sell_slots: int = PAPER_SELL_SLOTS,
-               stake_sol: float = PAPER_STAKE_SOL, tx_cost_sol: float = TX_COST_SOL, max_positions: int = MAX_POSITIONS) -> list[str]:
+               stake_sol: float = PAPER_STAKE_SOL, tx_cost_sol: float = TX_COST_SOL, max_positions: int = MAX_POSITIONS,
+               reentry: bool = False) -> list[str]:
     """Every exit rule on the copies of each wallet the paper copies on every first buy (golden, and today's top
     snipers; not those followed only for buying past $100k, whose copies start there), then all of them pooled,
-    best rule first."""
+    best rule first. With `reentry`, on its buys back into coins it had sold out of instead (reentries)."""
     c = connect(db_path, readonly=True)
     try:
         t0, t1 = c.execute("SELECT MIN(ts), MAX(ts) FROM mints").fetchone()
         if t0 is None:
             return []
-        mid, out, pooled = (t0 + t1) / 2, [], []
+        mid, out, pooled, name = (t0 + t1) / 2, [], [], "reentry sweep" if reentry else "exit sweep"
         line = lambda rows: _rules_line(_rules_on(rows, stake_sol, tx_cost_sol, mid, lambda r: r["pnl"]), detail=True)   # noqa: E731
         wallets = c.execute("""SELECT f.wallet, w.id FROM follow f JOIN wallets w ON w.addr = f.wallet
                                WHERE f.golden_ever = 1 OR f.sniper_now = 1 ORDER BY f.wallet""").fetchall()
         for addr, wid in wallets:
             rows = []
-            # t.ts is the first buy's own: SQLite takes a bare column from the row MIN() picked
-            for mint, fb, t_in, mts in c.execute("""SELECT t.mint, MIN(t.slot), t.ts, m.ts FROM trades t JOIN mints m ON m.id = t.mint
-                                                   WHERE t.wallet = ? AND t.buy = 1 AND m.creator != t.wallet
-                                                   GROUP BY t.mint ORDER BY 2 DESC LIMIT ?""", (wid, max_positions)).fetchall():
+            # t.ts is the first buy's own: SQLite takes a bare column from the row MIN() picked; a re-entry is halved by its own time
+            entries = [(m, s, t, t) for m, s, t in reentries(c, wid, max_positions)] if reentry else c.execute(
+                """SELECT t.mint, MIN(t.slot), t.ts, m.ts FROM trades t JOIN mints m ON m.id = t.mint
+                   WHERE t.wallet = ? AND t.buy = 1 AND m.creator != t.wallet
+                   GROUP BY t.mint ORDER BY 2 DESC LIMIT ?""", (wid, max_positions)).fetchall()
+            for mint, fb, t_in, ts in entries:
                 pnl = exit_pnls(c, wid, mint, fb, t_in, buy_slots, sell_slots, stake_sol, tx_cost_sol)
                 if pnl:
-                    rows.append({"ts": mts, "pnl": pnl})
+                    rows.append({"ts": ts, "pnl": pnl})
             if rows:
-                out.append(f"exit sweep {addr} ({len(rows)} copies): {line(rows)}")
+                out.append(f"{name} {addr} ({len(rows)} copies): {line(rows)}")
                 pooled += rows
         if pooled:
-            out.insert(0, f"exit sweep all followed ({len(pooled)} copies of {len(out)} wallets, {stake_sol:g} SOL in "
+            out.insert(0, f"{name} all followed ({len(pooled)} copies of {len(out)} wallets, {stake_sol:g} SOL in "
                           f"{buy_slots} slots after the buy, out {sell_slots} after the trigger): {line(pooled)}")
         return out
     finally:

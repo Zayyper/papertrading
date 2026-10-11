@@ -1494,7 +1494,7 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
                         for line in forward_lines(db_path):          # our own exits on paper since 10-10: out-of-sample
                             log.info("%s", line)
                         t0 = time.monotonic()
-                        for line in exit_sweep(db_path):
+                        for line in exit_sweep(db_path) + exit_sweep(db_path, reentry=True):   # first buys, then buys back in
                             log.info("%s", line)
                         log.info("exit sweep took %.1f s", time.monotonic() - t0)   # on the maintenance thread, unmeasured on the server yet
                     except Exception:  # noqa: BLE001

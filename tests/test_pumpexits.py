@@ -1,4 +1,4 @@
-from hl_screener.pumpexits import MAX_POSITIONS, exit_pnls, exit_sweep
+from hl_screener.pumpexits import MAX_POSITIONS, exit_pnls, exit_sweep, reentries
 from hl_screener.pumpfun import FEE, PAPER_STAKE_SOL, TX_COST_SOL, connect, copy_sim, copy_trade
 
 SOL = 10**9
@@ -77,3 +77,30 @@ def test_the_sweep_logs_each_followed_wallet_and_all_pooled_best_rule_first(tmp_
     assert lines[1].startswith("exit sweep Wfollowed (2 copies): ") and " won " in lines[1] and "wallet_sl20" in lines[1]
     rois = [float(r.split(" ")[1].rstrip("%")) for r in lines[1].split(": ", 1)[1].split(", ")]
     assert rois == sorted(rois, reverse=True)
+
+
+def test_a_buy_back_into_a_coin_sold_out_of_is_a_reentry_an_add_is_not(tmp_path):
+    c = connect(tmp_path / "pump.db")
+    c.executemany("INSERT INTO wallets(id, addr) VALUES (?, ?)", [(W, "Wfollowed"), (X, "Xothers"), (D, "Dmaker")])
+    for mint, maker in ((1, D), (2, D), (3, W)):
+        c.execute("INSERT INTO mints(id, addr, slot, ts, creator) VALUES (?, ?, 1000, ?, ?)", (mint, f"mint{mint}", T0, maker))
+
+    def trade(mint, slot, buy, tok, who=W):
+        c.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (slot, T0 + (slot - 1000) * 2 // 5, mint, who, buy, SOL, tok, SOL // 100, 30 * SOL, 1_073_000_000 * 10**6))
+
+    # coin 1: bought, sold down to 40 (the next buy adds), sold down to 1 of its top 100 (1 %: the next buy is back in),
+    # sold out again, back in again; the others' trades in between change nothing
+    for slot, buy, tok in ((1000, 1, 100), (1050, 0, 60), (1100, 1, 50), (1200, 0, 89), (1300, 1, 70), (1400, 0, 71), (1500, 1, 10)):
+        trade(1, slot, buy, tok)
+        trade(1, slot + 1, 1 - buy, 5, X)
+    for slot, buy in ((1000, 0), (1100, 1)):      # coin 2: sold first, bought before the stored trades: position unknown
+        trade(2, slot, buy, 50)
+    for slot, buy in ((1000, 1), (1100, 0), (1200, 1)):   # coin 3: its own coin
+        trade(3, slot, buy, 50)
+    c.execute("INSERT INTO follow(wallet, added_at, golden_now, golden_ever) VALUES ('Wfollowed', 0, 1, 1)")
+    c.commit()
+    assert reentries(c, W) == [(1, 1500, T0 + 200), (1, 1300, T0 + 120)]
+    c.close()
+    lines = exit_sweep(tmp_path / "pump.db", reentry=True)
+    assert lines[0].startswith("reentry sweep all followed (2 copies of 1 wallets") and lines[1].startswith("reentry sweep Wfollowed (2 copies): ")
