@@ -42,6 +42,9 @@ FILE_KINDS = {
 }
 TRADE_COLUMNS = ("address", "window", "coin", "open_time", "close_time", "direction", "follower_notional",
                  "penalty_bps_entry", "gross_pnl", "fees", "funding", "net_pnl", "leader_net_pnl")
+LOG_TAIL_BYTES = 8_000_000      # read from the end of the pump log: the whole of one file (pumpfun.LOG_FILE_BYTES)
+LOG_LINES_MAX = 5000
+API_KEY_RE = re.compile(r"(api[-_]?key=)[^&\s\"']+", re.I)   # a keyed RPC URL in a log line: never shown
 MIME = {
     ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
     ".js": "application/javascript; charset=utf-8", ".json": "application/json; charset=utf-8",
@@ -164,6 +167,22 @@ class App:
             return out
         finally:
             c.close()
+
+    def pump_log(self, lines: int = 300, grep: str = "") -> str:
+        """The newest `lines` lines of the pump collector's own log file (pumpfun.collect writes it beside its
+        database), only those containing `grep` when given, any API key blanked. Coolify's log view stopped loading
+        that container's log on 2026-10-11: the reports, the sweeps and the live copies' skip reasons are here."""
+        from ..pumpfun import LOG_FILE
+        cfg, _ = self.cfg()
+        f = self.root / cfg.data_dir / "pump" / LOG_FILE
+        if not f.exists():
+            return f"no {LOG_FILE} yet: the collector writes it from its next start\n"
+        cut = max(0, f.stat().st_size - LOG_TAIL_BYTES)
+        with open(f, "rb") as fh:
+            fh.seek(cut)
+            text = fh.read().decode("utf-8", "replace")
+        rows = [r for r in text.splitlines()[1 if cut else 0:] if grep.lower() in r.lower()]   # a line cut by the seek: left out
+        return "\n".join(API_KEY_RE.sub(r"\1***", r) for r in rows[-lines:]) + "\n"
 
     # ---- live copies (pumplive): what the wallet does, and the STOP button -------------------------------------
     def live_stop_file(self) -> Path:
@@ -559,6 +578,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(app.pump_view())
         if path == "/api/pump/paper":
             return self._json(app.pump_view(("paper",), series=True))
+        if path == "/api/pump/log":                    # plain text: open it in the browser, ?grep=sweep&lines=100
+            try:
+                lines = min(LOG_LINES_MAX, max(1, int(q.get("lines", ["300"])[0] or 300)))
+            except ValueError:
+                lines = 300
+            return self._send(200, app.pump_log(lines, q.get("grep", [""])[0][:200]).encode("utf-8"), MIME[".txt"])
         if path == "/api/live":
             try:
                 hours = min(24 * 30, max(1, float(q.get("hours", ["48"])[0] or 48)))

@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any
 
-from .pumpexits import HOLDS, TPSL, rule_spec
+from .pumpexits import HOLDS, OR_WALLET, TPSL, rule_spec
 from .pumptx import (AMM_GLOBAL_CONFIG, AMM_LISTS, PUBLIC_RPC, PUMP_GLOBAL, PUMP_LISTS, SENDER_MAX_TIP, Lag, SLOT_S, TIP_ACCOUNTS, TIP_LAMPORTS, Refused, Rpc,
                      buy_ixs, coin_of, compose, fresh_coin, own_trade, parse_global, sell_ixs, sim_error, sol_for, tokens_for)
 
@@ -97,9 +97,11 @@ class LiveCfg:
                   sim_signer=env.get("PUMP_LIVE_SIM_SIGNER") or None, max_age_s=num("PUMP_LIVE_MAX_AGE_S", MAX_AGE_S),
                   exit=(env.get("PUMP_LIVE_EXIT") or "wallet").strip().lower())
         buys = mode in ("dry", "live")                  # exit only sells: a bad buy setting must not keep its copies from getting out
-        if cfg.exit != "wallet" and cfg.exit not in TPSL and cfg.exit not in HOLDS:
+        base = cfg.exit.removesuffix(OR_WALLET)
+        if cfg.exit != "wallet" and base not in TPSL and base not in HOLDS:
             if buys:
-                raise ValueError(f"PUMP_LIVE_EXIT must be wallet or one of {', '.join([*TPSL, *HOLDS])}, not {cfg.exit!r}")
+                raise ValueError(f"PUMP_LIVE_EXIT must be wallet or one of {', '.join([*TPSL, *HOLDS])}, alone or followed by "
+                                 f"{OR_WALLET} (out on the wallet's sell too, when it comes first), not {cfg.exit!r}")
             log.warning("live: PUMP_LIVE_EXIT=%r is no exit rule: the open copies are sold as their wallets sell", cfg.exit)
             cfg = replace(cfg, exit="wallet")
         if not 0 <= cfg.sell_slip < 1 or buys and (not 0 < cfg.stake_sol <= 5 or not 0 <= cfg.buy_slip < 1 or cfg.max_open < 1
@@ -160,6 +162,8 @@ class LiveFollow:
         self.retries: list[tuple[float, str, int]] = []   # (not before, mint, try) of the sells to send again
         self.at = {"targets": 0.0, "balance": 0.0, "hash": 0.0, "lists": 0.0}
         self.rule = rule_spec(cfg.exit) if cfg.exit != "wallet" else None   # (take profit, stop, seconds) of our own exit
+        self.with_wallet = self.rule is None or cfg.exit.endswith(OR_WALLET)  # its wallet's sell sells the copy too
+        # (2026-10-11 live: 3gHrfi's sells within seconds were dumps hold2m held through; out with it cut the day's loss)
         self.tip = 0                                   # the newest slot a trade came from: how far the chain went since a buy
         self.lag = Lag()                               # how late the feed's thread got to a trade, by its block time
         # the page's STOP (2026-10-11): while this file exists no copy is made and the open ones are sold at once; the
@@ -197,7 +201,7 @@ class LiveFollow:
             if (user, mint) not in self.copied and mint not in self.pos and not self._busy(mint):
                 self.copied.add((user, mint))
                 self._buy(user, mint, slot, e.get("ts"))
-        elif self.rule is not None:
+        elif not self.with_wallet:
             return                                         # out by our own rule: the wallet's sell is not ours to follow
         elif self.pos.get(mint, {}).get("wallet") == user:
             self._sell(mint, slot, "its wallet sold")

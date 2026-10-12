@@ -56,3 +56,20 @@ def test_the_live_tab_reads_the_wallet_and_stop_resume_write_only_the_flag(tmp_p
         assert call(base + "/api/live/resume", "POST") == (200, {"ok": True, "stopped": False}) and not flag.exists()
     finally:
         httpd.shutdown()
+
+
+def test_the_pump_log_is_served_as_text_its_tail_filtered_and_its_keys_blanked(tmp_path, monkeypatch):
+    httpd, base = serve(tmp_path, monkeypatch)
+    try:
+        get = lambda q: urllib.request.urlopen(base + "/api/pump/log" + q, timeout=5).read().decode()   # noqa: E731
+        assert get("").startswith("no pump.log yet")
+        lines = [f"2026-10-12 00:00:{i:02d},000 INFO hl_screener.pumpfun: report line {i}" for i in range(10)]
+        lines += ["2026-10-12 00:01:00,000 INFO hl_screener.pumpexits: exit sweep 3gHrfi (75 copies): hold2m +16.0%",
+                  "2026-10-12 00:01:01,000 WARNING hl_screener.pumpfun: feed error on wss://rpc.example/?api-key=SECRET123&x=1"]
+        (tmp_path / "data" / "pump" / "pump.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert get("?grep=SWEEP").splitlines() == [lines[10]]           # case-insensitive filter
+        tail = get("?lines=2").splitlines()
+        assert tail[0] == lines[10] and "SECRET123" not in tail[1] and "api-key=***" in tail[1]
+        assert len(get("?lines=bad").splitlines()) == 12                # a bad count falls back to 300
+    finally:
+        httpd.shutdown()

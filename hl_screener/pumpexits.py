@@ -39,9 +39,13 @@ FORWARD_MIN = 5                # closed copies of a wallet, per rule, before it 
 REENTRY_LEFT = 0.01            # a wallet left with at most this share of the most it held of a coin has sold out of it
 
 
+OR_WALLET = "_or_wallet"       # a rule's name with this after it also leaves when the wallet sells, if that comes first
+
+
 def rule_spec(name: str) -> tuple[float | None, float | None, int]:
-    """(take profit, stop loss, seconds held at most) of one TPSL or HOLDS rule: what the paper's and the live copies'
-    own exits watch. KeyError for any other name."""
+    """(take profit, stop loss, seconds held at most) of one TPSL or HOLDS rule, or of one with OR_WALLET after it:
+    what the paper's and the live copies' own exits watch. KeyError for any other name."""
+    name = name.removesuffix(OR_WALLET)
     if name in TPSL:
         return (*TPSL[name], MAX_HOLD_S)
     return None, None, HOLDS[name]

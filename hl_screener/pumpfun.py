@@ -72,6 +72,8 @@ GAP_PACE_S = 0.5               # between two account reads (a pool's coin, a sol
 GAP_READ_S = 1.25              # between two of a gap check's wallet reads: the public RPC allows 10 getTokenAccountsByOwner
                                # per 10 s per IP, sliding, and counts the refused ones too (x-ratelimit-method-*, 2026-10-11):
                                # at one every 0.5 s the rest of each check was refused
+LOG_FILE = "pump.log"          # the collector's log, beside its database (collect), served by the page (webui /api/pump/log)
+LOG_FILE_BYTES = 8_000_000     # rolled over at this size, one old file kept: a day of the report's lines and more
 GAP_TRIES = 3                  # reads of a wallet a gap check makes before its copy stays open until the next check
 GAP_BACKOFF_S = 10.0           # the pause after a refused read: the whole window (2026-10-11: 4-11 of each drop's 8-21
                                # reads were refused, HTTP 429, and those copies stayed open)
@@ -1075,8 +1077,8 @@ class Collector:
         real money first; a copy is queued once per kind of check however many drops name it, so drops every few
         minutes cannot pile reads up faster than the one reader, at one read per GAP_READ_S, gets through them."""
         since = time.time() - GAP_LOOK_BACK_S
-        live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None and self.live.rule is None else ())
-                if not p.get("stuck") and p["opened"] >= since]   # out by a rule of our own: the wallet's sell is not ours
+        live = [("live", p["wallet"], m) for m, p in (self.live.pos.items() if self.live is not None and self.live.with_wallet else ())
+                if not p.get("stuck") and p["opened"] >= since]   # out by a rule of our own alone: the wallet's sell is not ours
         paper = [("paper", w, m) for (w, m), (_, _, opened) in self.paper.pos.items() if opened >= since]
         todo = [(kind, w, m, self.paper.own[(w, m)][2] if (w, m) in self.paper.own else 0.0)   # what we saw it buy
                 for kind, w, m in live + paper if (mints is None or m in mints) and (wallet is None or w == wallet)]
@@ -1416,6 +1418,12 @@ def collect(db_path: str | Path, ws_url: str, retention_days: float, report_ever
             fallback_url: str | None = None, sniper_every_s: float = SNIPER_EVERY_S, sniper_top: int = SNIPER_TOP) -> int:
     logging.getLogger(__name__).setLevel(logging.INFO)
     logging.getLogger("hl_screener.pumplive").setLevel(logging.INFO)    # the live copies' sent, bought, sold and skipped lines
+    # the log also in a file beside the database, which the page serves (/api/pump/log): Coolify's log view stopped
+    # loading this container's on 2026-10-11, and with it the reports, the sweeps and the live copies' skip reasons
+    from logging.handlers import RotatingFileHandler
+    to_file = RotatingFileHandler(Path(db_path).parent / LOG_FILE, maxBytes=LOG_FILE_BYTES, backupCount=1, encoding="utf-8")
+    to_file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger("hl_screener").addHandler(to_file)
     # the gap checks read about twice a second: on the public RPC, not on PUMP_LIVE_RPC, where a keyed free plan's
     # credits would last days and the live copies' own reads would be refused with them
     col = Collector(db_path, ws_url, retention_days, fallback_url, rpc_url=os.environ.get("PUMP_GAP_RPC") or PUBLIC_RPC)

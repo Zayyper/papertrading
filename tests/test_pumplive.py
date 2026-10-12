@@ -331,6 +331,36 @@ def test_out_by_a_rule_of_our_own_the_wallets_sell_is_not_ours_and_the_rule_sell
     assert LiveCfg.from_env(exiting).exit == "wallet"   # but the open copies still get out
 
 
+def test_hold2m_or_wallet_leaves_with_the_wallet_when_it_sells_first_and_on_the_clock_otherwise(tmp_path):
+    """PUMP_LIVE_EXIT=hold2m_or_wallet (2026-10-12): 3gHrfi's sells within seconds were dumps hold2m held through."""
+    col, chain, cv, me, mine = held(tmp_path, exit="hold2m_or_wallet")
+    assert col.live.rule == (None, None, 120) and col.live.with_wallet
+    trade(col, 20, MINT, G, False, cv, tok=10**12)      # the wallet sells within the 2 minutes: so do we
+    col.flush()
+    col.flush()
+    assert len(chain.sent) == 2 and sells(col) == [("sent", 1)]
+    col.c.close()
+
+    (tmp_path / "gap").mkdir()                          # a sell we did not see, found by a gap check: out too
+    col, chain, cv, me, mine = held(tmp_path / "gap", exit="hold2m_or_wallet")
+    col.rpc, col.gap_pool = Holdings({(b58(G), b58(MINT)): 0}), Now()
+    col.check_gap("reconnect")
+    col.flush()
+    assert len(chain.sent) == 2
+    col.c.close()
+
+    (tmp_path / "clock").mkdir()                        # a wallet that holds: out on the clock
+    col, chain, cv, me, mine = held(tmp_path / "clock", exit="hold2m_or_wallet")
+    col.live.pos[b58(MINT)]["opened"] -= 121
+    col.flush()
+    col.flush()
+    assert len(chain.sent) == 2 and sells(col) == [("sent", 1)]
+    col.c.close()
+    assert LiveCfg.from_env({"PUMP_LIVE_EXIT": "hold2m_or_wallet"}).exit == "hold2m_or_wallet"
+    with pytest.raises(ValueError):
+        LiveCfg.from_env({"PUMP_LIVE_EXIT": "hold3m_or_wallet"})
+
+
 def test_the_pages_stop_sells_the_open_copies_and_makes_no_new_one_until_resume(tmp_path):
     """The Live tab's STOP (2026-10-11) leaves a file next to the database; the collector checks it every second: no
     new copy, the open ones sold at once. RESUME removes it. The page writes the file and nothing else."""
