@@ -239,6 +239,73 @@ def test_paper_follow_copies_like_the_replay_and_lands_quiet_tokens(tmp_path):
     col.c.close()
 
 
+def test_a_paper_copy_is_never_priced_better_than_the_trade_it_copies(tmp_path, caplog):
+    """2026-10-12: 7FPqg7Mp's paper copies made +378 % while the wallet lost 1.9 % on the same coins: reserves that
+    cannot be the coin's state then. A copy buys after the buy it copies and sells after the sale: a price over
+    PAPER_PX_SANITY times better than that trade's own is that trade's instead, and the log says what set the reserves."""
+    from hl_screener.pumpfun import PAPER_PX_SANITY
+    col = Collector(tmp_path / "pump.db")
+    G, X = bytes([80]) * 32, bytes([81]) * 32
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, 0.5)", (b58(G),))
+    col.paper.reload()
+    mint, cv, held = bytes([9]) * 32, Curve(), {}
+
+    def trade(slot, who, buy, amount):
+        if buy:
+            tok = cv.buy(amount)
+            held[who] = held.get(who, 0) + tok
+            b = trade_bytes(mint, who, True, amount, tok, cv.vsol, cv.vtok)
+        else:
+            tok = held.pop(who)
+            b = trade_bytes(mint, who, False, cv.sell(tok), tok, cv.vsol, cv.vtok)
+        col.on_logs(slot, logs(b))
+        return tok
+
+    caplog.set_level("WARNING", logger="hl_screener.pumpfun")
+    bought = trade(100, G, True, 10**9)
+    leader_buy_px = col.paper.pending[b58(mint)][0]["leader_px"]
+    vsol, vtok, _ = col.paper.curve[b58(mint)]
+    col.paper.curve[b58(mint)] = (vsol // 50, vtok, time.time())   # reserves 50x too cheap when the copy lands
+    trade(104, X, True, 10**8)
+    (tok, px), = col.c.execute("SELECT tok, px FROM pfills WHERE side = 'buy'").fetchall()
+    assert abs(px - leader_buy_px) < 1e-6 * leader_buy_px              # priced at the leader's own buy
+    assert "priced at that trade's own price instead" in caplog.text and f"a buy of 1.0000 SOL by {b58(G)} at slot 100" in caplog.text
+    trade(120, G, False, None)                                         # the wallet sells
+    leader_sell_px = col.paper.pending[b58(mint)][0]["leader_px"]
+    vsol, vtok, _ = col.paper.curve[b58(mint)]
+    col.paper.curve[b58(mint)] = (vsol * 50, vtok, time.time())        # reserves 50x too dear when the copy sells
+    trade(124, X, False, None)
+    (sold, sell_px), = col.c.execute("SELECT sol, px FROM pfills WHERE side = 'sell'").fetchall()
+    assert abs(sell_px - leader_sell_px) < 1e-6 * leader_sell_px and sell_px < leader_buy_px * PAPER_PX_SANITY
+    assert caplog.text.count("priced at that trade's own price instead") == 2
+    col.c.close()
+
+
+def test_copies_stored_before_the_price_guard_that_it_would_have_caught_are_set_aside(tmp_path, caplog):
+    from hl_screener.pumpfun import PaperFollow, connect
+    c = connect(tmp_path / "pump.db")
+    row = "INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, ts, sol, tok, leader_px, px, pnl) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+    c.executemany(row, [("W", "BAD", "buy", 1, 5, 0, 0.25, 9e12, 1000.0, 27.0, None),          # 37x cheaper than its leader
+                        ("W", "BAD", "x:hold2m", 9, 12, 0, 50.0, 9e12, 0.0, 5000.0, 49.7),     # and what its tokens fetched
+                        ("W", "OK", "buy", 1, 5, 0, 0.25, 2.4e8, 1000.0, 1040.0, None),
+                        ("W", "OK", "sell", 9, 12, 0, 0.24, 2.4e8, 1010.0, 1000.0, -0.01),
+                        ("W", "DEAR", "buy", 1, 5, 0, 0.25, 2.4e8, 1000.0, 1040.0, None),
+                        ("W", "DEAR", "sell", 9, 12, 0, 2.4, 2.4e8, 1000.0, 10000.0, 2.15)])  # sold 10x over its leader
+    c.execute("INSERT INTO ppos VALUES ('W', 'BAD', 9e12, 0.25, 0)")
+    c.execute("INSERT INTO xpos VALUES ('W', 'BAD', 'tp100_sl50', 9e12, 0.25, 0)")
+    c.commit()
+    caplog.set_level("WARNING", logger="hl_screener.pumpfun")
+    pf = PaperFollow(c)
+    sides = dict(((m, s0), 1) for m, s0 in c.execute("SELECT mint, side FROM pfills"))
+    assert set(sides) == {("BAD", "bad:buy"), ("BAD", "bad:x:hold2m"), ("OK", "buy"), ("OK", "sell"), ("DEAR", "bad:buy"), ("DEAR", "bad:sell")}
+    assert not c.execute("SELECT 1 FROM ppos WHERE mint = 'BAD'").fetchone() and not pf.xpos and not pf.pos
+    assert {("W", "BAD"), ("W", "DEAR"), ("W", "OK")} <= pf.copied                # tried all the same: never a first buy again
+    assert "2 copies priced far better than the trades they copied" in caplog.text
+    PaperFollow(c)                                                                   # a second start finds nothing more
+    assert caplog.text.count("priced far better") == 1
+    c.close()
+
+
 def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     col = Collector(tmp_path / "pump.db")
     G, X, old, new = (bytes([i]) * 32 for i in (90, 91, 11, 12))

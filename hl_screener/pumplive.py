@@ -148,7 +148,7 @@ class LiveFollow:
         self.copied = set(c.execute("SELECT wallet, mint FROM lorders WHERE side = 'buy' AND mode = ?", (cfg.mode,)))
         if cfg.sends:            # a coin the dry run or the paper already copied of that wallet: its next buy is an add, no first buy
             self.copied |= set(c.execute("SELECT wallet, mint FROM lorders WHERE side = 'buy' UNION "
-                                         "SELECT wallet, mint FROM pfills WHERE side IN ('buy', 'skip', 'fail')"))
+                                         "SELECT wallet, mint FROM pfills WHERE side IN ('buy', 'skip', 'fail', 'bad:buy')"))
         self.pos = {m: {"wallet": w, "tok": tok, "cost": cost, "opened": opened, "stuck": stuck} for m, w, tok, cost, opened, stuck
                     in c.execute("SELECT mint, wallet, tok, cost, opened, stuck FROM lpos")}
         cols = ("id", "wallet", "mint", "side", "venue", "trigger_slot", "seen", "done", "sig", "tries")

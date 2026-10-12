@@ -73,6 +73,7 @@ GAP_READ_S = 1.25              # between two of a gap check's wallet reads: the 
                                # per 10 s per IP, sliding, and counts the refused ones too (x-ratelimit-method-*, 2026-10-11):
                                # at one every 0.5 s the rest of each check was refused
 BACKUP_FEED = True             # pump.fun's logs on a second connection as well (Collector.run): one drop is no longer blind
+PAPER_PX_SANITY = 2.0          # a paper fill priced over 2x better than the trade it copies is priced at that trade instead
 LOG_FILE = "pump.log"          # the collector's log, beside its database (collect), served by the page (webui /api/pump/log)
 LOG_FILE_BYTES = 8_000_000     # rolled over at this size, one old file kept: a day of the report's lines and more
 GAP_TRIES = 3                  # reads of a wallet a gap check makes before its copy stays open until the next check
@@ -378,6 +379,7 @@ class PaperFollow:
         if abs(costs[-1][1] - self.tx) > 1e-12:                 # counted at the cost of its day (pumpexits, live_lines)
             set_meta(c, "tx_costs", costs + [[int(time.time()), self.tx]])
         self.exits = {name: rule_spec(name) for name in (FORWARD if exits is None else exits)}
+        self._quarantine()
         self.xpos: dict[str, dict[tuple[str, str], list]] = {}  # mint -> (wallet, rule) -> [tok, cost, opened]
         self.xpending: dict[str, list[dict[str, Any]]] = {}     # mint -> their sales on the way
         for w, m, rule, tok, cost, opened in c.execute("SELECT wallet, mint, rule, tok, cost, opened FROM xpos"):
@@ -393,9 +395,10 @@ class PaperFollow:
         self.own = {(w, m): [cost, proceeds, tok] for w, m, cost, proceeds, tok in c.execute("SELECT wallet, mint, cost, proceeds, tok FROM opos")}
         self.reload()
         self.pos = {(w, m): [tok, cost, opened] for w, m, tok, cost, opened in c.execute("SELECT wallet, mint, tok, cost, opened FROM ppos")}
-        self.copied = set(c.execute("SELECT DISTINCT wallet, mint FROM pfills WHERE side IN ('buy', 'skip', 'fail')"))   # tried once
+        self.copied = set(c.execute("SELECT DISTINCT wallet, mint FROM pfills WHERE side IN ('buy', 'skip', 'fail', 'bad:buy')"))   # tried once
         self.pending: dict[str, list[dict[str, Any]]] = {}
         self.curve: dict[str, tuple[int, int, float]] = {}     # mint -> reserves after its last trade, when seen
+        self.curve_src: dict[str, str] = {}                     # mint -> what set them: a trade, or a gap check's read
         self.tip = 0                                            # newest slot the feed has shown
         for m in {m for (_, m) in self.pos} | self._held() | set(self.xpos):   # after a restart, open positions at the last stored price
             row = c.execute("""SELECT t.vsol, t.vtok FROM trades t JOIN mints mm ON mm.id = t.mint WHERE mm.addr = ?
@@ -451,6 +454,7 @@ class PaperFollow:
         if mint in self.xpending:                               # and our own exits' sales
             self._run_exits(mint, [slot >= a["land"] for a in self.xpending[mint]])
         self.curve[mint] = (e["vsol"], e["vtok"], time.time())
+        self.curve_src[mint] = f"{'a buy' if e['buy'] else 'a sell'} of {e['sol'] / LAMPORTS:.4f} SOL by {user} at slot {slot}"
         if not e["buy"] and e["fee"] > 0 and e["sol"] >= 10**7:
             self.sell_rate[mint] = e["fee"] / e["sol"]
         for (w, rule), (tok, cost, _) in list(self.xpos.get(mint, {}).items()):   # our own exits' take-profits and stops
@@ -557,6 +561,9 @@ class PaperFollow:
             tok = vtok - vsol * vtok / (vsol + self.stake * LAMPORTS / (1 + a["rate"]))
             if tok <= 0:
                 return
+            if a["leader_px"] > 0 and self.stake * LAMPORTS / tok < a["leader_px"] / PAPER_PX_SANITY:
+                self._unreal(a, mint, st, self.stake * LAMPORTS / tok, timed_out)
+                tok = self.stake * LAMPORTS / a["leader_px"]    # a copy lands after the buy it copies: never cheaper
             if a.get("want") and tok < a["want"] * (1 - self.buy_slip):   # past the live buy's limit: that transaction fails,
                 self.c.execute("""INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, ts, tok, pnl)   -- paying its fee
                                   VALUES (?,?,?,?,?,?,?,?)""", (*key, "fail", a["trigger"], a["land"], now, tok, -(BASE_FEE_SOL + PRIORITY_SOL)))
@@ -585,12 +592,41 @@ class PaperFollow:
                 return
             tok, cost = held[0], held[1]
             sol = (vsol - vsol * vtok / (vtok + tok)) * (1 - a["rate"]) / LAMPORTS
+            if a["leader_px"] > 0 and sol * LAMPORTS / tok > a["leader_px"] * PAPER_PX_SANITY:
+                self._unreal(a, mint, st, sol * LAMPORTS / tok, timed_out)
+                sol = tok * a["leader_px"] / LAMPORTS          # a copy sells after the sale it copies: never dearer
             pnl, px = sol - cost - 2 * self.tx, sol * LAMPORTS / tok
             slip = (1 - px / a["leader_px"]) * 1e4 if a["leader_px"] > 0 else None
             self.c.execute("DELETE FROM ppos WHERE wallet = ? AND mint = ?", key)
         self.c.execute("""INSERT INTO pfills(wallet, mint, side, trigger_slot, land_slot, ts, sol, tok, leader_px, px, slip_bps, pnl, timed_out)
                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                        (*key, a["side"], a["trigger"], a["land"], now, sol, tok, a["leader_px"], px, slip, pnl, int(timed_out)))
+
+    def _quarantine(self) -> None:
+        """The copies stored before PAPER_PX_SANITY (2026-10-12) that it would have caught: a buy priced under half the
+        leader's own, or a sale over twice it. Their rows become 'bad:<side>', which every reader of the paper leaves
+        out (they all pick their sides), and their open positions are dropped, so no sale comes from their tokens. Kept,
+        not deleted: renaming the sides back restores them."""
+        bad = self.c.execute("""SELECT DISTINCT wallet, mint FROM pfills WHERE leader_px > 0 AND px > 0 AND
+                                ((side = 'buy' AND px * ? < leader_px) OR (side = 'sell' AND px > leader_px * ?))""",
+                             (PAPER_PX_SANITY, PAPER_PX_SANITY)).fetchall()
+        if not bad:
+            return
+        for sql in ("UPDATE pfills SET side = 'bad:' || side WHERE wallet = ? AND mint = ? AND side NOT LIKE 'bad:%'",
+                    "DELETE FROM ppos WHERE wallet = ? AND mint = ?", "DELETE FROM xpos WHERE wallet = ? AND mint = ?"):
+            self.c.executemany(sql, bad)
+        self.c.commit()
+        log.warning("paper: %d copies priced far better than the trades they copied (wrong reserves) set aside as 'bad:': "
+                    "left out of every result from now on", len(bad))
+
+    def _unreal(self, a: dict[str, Any], mint: str, st: tuple[int, int, float], px: float, timed_out: bool) -> None:
+        """A copy the stored reserves price far better than the trade it copies: they cannot be the coin's state then.
+        Said once each, with what set them, so the cause can be found (2026-10-12: 7FPqg7Mp's paper copies made +378 %
+        while the wallet lost 1.9 % on the same coins)."""
+        log.warning("paper %s of %s's copy of %s priced at %.3gx the trade it copies (%.4g vs %.4g lamports a token) on "
+                    "reserves %.4f SOL / %.0f tokens set by %s %.0f s before%s: priced at that trade's own price instead",
+                    a["side"], a["wallet"], mint, px / a["leader_px"], px, a["leader_px"], st[0] / LAMPORTS, st[1] / 1e6,
+                    self.curve_src.get(mint, "?"), time.time() - st[2], ", timed out on a quiet coin" if timed_out else "")
 
     def forget(self, max_age_s: float = 6 * 3600) -> None:
         keep = {m for (_, m) in self.pos} | set(self.pending) | self._held() | set(self.xpos)
@@ -1155,6 +1191,7 @@ class Collector:
         if kind == "paper":
             if coin is not None:                                  # priced at the curve now, not at the one before the gap
                 self.paper.curve[mint] = (coin["vsol"], coin["vtok"], time.time())
+                self.paper.curve_src[mint] = "the chain, read by a gap check"
             if not self.paper.sell_now(wallet, mint):
                 if (wallet, mint) in self.paper.pos and not self.paper.curve.get(mint):
                     log.info("gap check: %s sold %s, but the coin has no known price yet: the copy waits for its next trade", wallet, mint)
