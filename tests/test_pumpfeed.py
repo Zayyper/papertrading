@@ -8,6 +8,17 @@ import types
 from hl_screener.pumpfun import FALLBACK_PER_DAY, WAL_LIMIT, Collector, checkpoint, connect, get_meta, paper_lines, set_meta
 
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def one_pump_feed(monkeypatch):
+    """These tests drive the main pump.fun feed through one fake socket: the backup feed (pumpfun.BACKUP_FEED) would
+    take its messages from the same fake. Its own test turns it back on."""
+    from hl_screener import pumpfun
+    monkeypatch.setattr(pumpfun, "BACKUP_FEED", False)
+
+
 class Silent:
     """A websocket that connects and never says a word; its close takes a moment, like a closing handshake."""
     def __init__(self, events):
@@ -490,3 +501,44 @@ def test_the_live_wallets_get_a_connection_of_their_own(tmp_path, monkeypatch):
     subs = [[m["params"][0]["mentions"] for m in c if m.get("method") == "logsSubscribe" and "mentions" in m["params"][0]] for c in sent]
     assert subs.count([["LeaderWallet111"]]) == 2                     # on the pool feed, and on a connection of its own
     col.c.close()
+
+
+def test_pump_funs_logs_come_on_a_second_connection_and_a_drop_it_covered_is_no_gap(tmp_path, monkeypatch):
+    from hl_screener import pumpfun
+    from hl_screener.pumppools import PoolFeed, _Conn
+    monkeypatch.setattr(pumpfun, "BACKUP_FEED", True)
+    sent: list[list[dict]] = []
+
+    class Recording(Silent):
+        def __init__(self):
+            super().__init__([])
+            self.mine = []
+            sent.append(self.mine)
+
+        async def send(self, msg):
+            self.mine.append(json.loads(msg))
+
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace(connect=lambda *a, **k: Recording()))
+    col = Collector(tmp_path / "pump.db")
+    col.check_gap = lambda *a, **k: None
+
+    async def main():
+        stop = asyncio.Event()
+        task = asyncio.create_task(col.run(stop))
+        await asyncio.sleep(0.5)
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(main())
+    subs = [[m["params"][0]["mentions"] for m in c if m.get("method") == "logsSubscribe"] for c in sent]
+    assert subs.count([[pumpfun.PUMP_PROGRAM]]) == 2                # the main feed's and the backup's
+    col.c.close()
+
+    feed, now = PoolFeed("wss://x", lambda *a: None, pinned=lambda: {"P"}), time.time()
+    c = _Conn()
+    c.pools, c.opened, c.task = {"P"}, now - 60, types.SimpleNamespace(done=lambda: False)
+    feed.conns = [c]
+    assert feed.covered(now - 30)                                   # open and subscribed since before the gap
+    assert not feed.covered(now - 90)                               # opened after it began
+    c.subs = {1: "P"}
+    assert not feed.covered(now - 30)                               # its subscription not confirmed yet

@@ -21,7 +21,7 @@ from typing import Any, Callable
 log = logging.getLogger(__name__)
 
 POOL_PER_CONN = 95              # subscription attempts a connection may make: the public RPC closes it at the 101st
-POOL_CONNS = 7                  # connections for pools, on top of the pump.fun one and the live wallets' own: the public RPC
+POOL_CONNS = 6                  # connections for pools, on top of pump.fun's two and the live wallets' own: the public RPC
                                 # allows 10 websockets per IP (x-ratelimit pubsub-limit, 2026-09-26), so a restart's overlap with
                                 # the old container goes over
 POOL_IDLE_S = 3600              # a pool that has not traded for this long is dropped at the next retirement
@@ -58,6 +58,11 @@ class PoolFeed:
         subscribed within a second: the first minutes after a migration are the busiest."""
         self.seen[pool] = max(self.seen.get(pool, 0.0), time.time() if t is None else t)
         self.kick.set()
+
+    def covered(self, since: float) -> bool:
+        """A connection of this feed has been open, every subscription of it confirmed, since `since`: nothing it
+        carries went unseen meanwhile."""
+        return any(c.task is not None and not c.task.done() and c.opened <= since and c.pools and not c.subs for c in self.conns)
 
     def touch(self, pool: str) -> None:
         if pool in self.seen:

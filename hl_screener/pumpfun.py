@@ -72,6 +72,7 @@ GAP_PACE_S = 0.5               # between two account reads (a pool's coin, a sol
 GAP_READ_S = 1.25              # between two of a gap check's wallet reads: the public RPC allows 10 getTokenAccountsByOwner
                                # per 10 s per IP, sliding, and counts the refused ones too (x-ratelimit-method-*, 2026-10-11):
                                # at one every 0.5 s the rest of each check was refused
+BACKUP_FEED = True             # pump.fun's logs on a second connection as well (Collector.run): one drop is no longer blind
 LOG_FILE = "pump.log"          # the collector's log, beside its database (collect), served by the page (webui /api/pump/log)
 LOG_FILE_BYTES = 8_000_000     # rolled over at this size, one old file kept: a day of the report's lines and more
 GAP_TRIES = 3                  # reads of a wallet a gap check makes before its copy stays open until the next check
@@ -1234,6 +1235,10 @@ class Collector:
         from .pumppools import PoolFeed
         lifeline = PoolFeed(self.ws_url, self.on_logs, pinned=lambda: live_wallets, on_back=self._back, name="live wallets feed")
         wallets = asyncio.create_task(lifeline.run(stop)) if live_wallets else asyncio.create_task(stop.wait())
+        # pump.fun's logs on a second connection too: the public RPC closed the main one every 1-3 min on 2026-10-12, each
+        # close a few seconds blind; on_logs drops the second copy of a transaction by its signature
+        backup = PoolFeed(self.ws_url, self.on_logs, pinned=lambda: {PUMP_PROGRAM}, name="pump.fun backup feed")
+        backups = asyncio.create_task(backup.run(stop)) if BACKUP_FEED else asyncio.create_task(stop.wait())
         writes = asyncio.create_task(self._flush_loop(stop))
         self.check_gap("restart")                               # the copies loaded from the database: were they sold meanwhile?
         while not stop.is_set():
@@ -1261,9 +1266,10 @@ class Collector:
                             heard = time.time()
                             self.stats["heartbeat"] = int(heard)
                             if gap_from is not None:                   # listening again: the gap ends here, not at the connect
-                                self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + heard - gap_from, 1)
+                                if not (BACKUP_FEED and backup.covered(gap_from)):   # the backup saw it all: no gap
+                                    self.stats["gap_s"] = round(self.stats.get("gap_s", 0) + heard - gap_from, 1)
+                                    self.check_gap("reconnect")
                                 gap_from = None
-                                self.check_gap("reconnect")
                             res = msg["params"]["result"]
                             if not res["value"].get("err"):
                                 self.on_logs(res["context"]["slot"], res["value"]["logs"], res["value"].get("signature"))
@@ -1310,8 +1316,9 @@ class Collector:
         self.halt.set()                                          # the gap worker stops reading: its findings wait for the next start
         pools.cancel()
         wallets.cancel()
+        backups.cancel()
         writes.cancel()
-        await asyncio.gather(pools, wallets, writes, return_exceptions=True)   # their sockets close properly too (PoolFeed.run)
+        await asyncio.gather(pools, wallets, backups, writes, return_exceptions=True)   # their sockets close properly too (PoolFeed.run)
         self.flush()
         log.info("stopped: the feeds are closed and what they brought is written")
 
