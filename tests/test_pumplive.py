@@ -852,3 +852,18 @@ def test_the_startup_line_says_what_the_live_copies_will_do(tmp_path, monkeypatc
     assert first == [f"live copies: live from {kp.pubkey()}, copying {b58(G)} with 0.05 SOL, out with the wallet, at most 1 open, new copies stop "
                      "after 0.5 SOL lost in a day",
                      f"live copies: exit from {kp.pubkey()}, winding down: no new copies, the 0 open ones sold as their wallets sell"]
+
+
+def test_a_trade_older_than_the_coin_kept_does_not_replace_it(tmp_path):
+    """2026-10-14: the feeds deliver out of order (pump.fun's two connections, the pools', the wallets'): the live
+    copies price on the newest state of a coin, not on whichever trade arrived last."""
+    col, chain = setup(tmp_path, "dry")
+    cv = Curve()
+    trade(col, 60, MINT, G, True, cv)                   # the wallet's buy, at slot 60
+    kept = dict(col.live.coins[b58(MINT)])
+    old = Curve()                                       # a trade from slot 50, brought late, on the curve as it was then
+    trade(col, 50, MINT, X, True, old)
+    assert col.live.coin_slot[b58(MINT)] == 60 and col.live.coins[b58(MINT)] == kept
+    trade(col, 61, MINT, X, True, cv)                   # a newer one does
+    assert col.live.coin_slot[b58(MINT)] == 61 and col.live.coins[b58(MINT)]["vsol"] == cv.vsol
+    col.c.close()

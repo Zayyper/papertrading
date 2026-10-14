@@ -306,6 +306,30 @@ def test_copies_stored_before_the_price_guard_that_it_would_have_caught_are_set_
     c.close()
 
 
+def test_a_paper_copy_lands_on_the_newest_state_not_on_a_trade_brought_late(tmp_path, caplog):
+    """2026-10-14: a pool buy was priced on the curve it had completed: an older trade, delivered after, had replaced
+    the coin's state. A trade older than the state kept leaves it alone."""
+    col = Collector(tmp_path / "pump.db")
+    G, X = bytes([80]) * 32, bytes([81]) * 32
+    col.c.execute("INSERT INTO follow(wallet, added_at, golden_now, report_copy_roi) VALUES (?, 0, 1, 0.5)", (b58(G),))
+    col.paper.reload()
+    mint, cv, old = bytes([9]) * 32, Curve(), Curve()
+    tok = cv.buy(10**9)
+    col.on_logs(100, logs(trade_bytes(mint, G, True, 10**9, tok, cv.vsol, cv.vtok)))     # the wallet buys at slot 100
+    kept = col.paper.curve[b58(mint)][:2]
+    late = old.buy(10**7)                                                                # a slot-90 trade, brought late
+    col.on_logs(90, logs(trade_bytes(mint, X, True, 10**7, late, old.vsol, old.vtok)))
+    assert col.paper.curve[b58(mint)][:2] == kept and col.paper.curve_slot[b58(mint)] == 100
+    caplog.set_level("WARNING", logger="hl_screener.pumpfun")
+    t2 = cv.buy(10**8)
+    col.on_logs(104, logs(trade_bytes(mint, X, True, 10**8, t2, cv.vsol, cv.vtok)))     # due: lands on slot 100's state
+    (tok_paper,), = col.c.execute("SELECT tok FROM pfills WHERE side = 'buy'").fetchall()
+    vsol, vtok = kept
+    assert abs(tok_paper - (vtok - vsol * vtok / (vsol + PAPER_STAKE_SOL * 1e9 / (1 + FEE)))) < 1e-3 * tok_paper
+    assert "the trade it copies" not in caplog.text
+    col.c.close()
+
+
 def test_followed_wallet_own_trades_since_following_and_chart_points(tmp_path):
     col = Collector(tmp_path / "pump.db")
     G, X, old, new = (bytes([i]) * 32 for i in (90, 91, 11, 12))

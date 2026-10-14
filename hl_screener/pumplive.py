@@ -155,6 +155,7 @@ class LiveFollow:
         self.open = {r[0]: dict(zip(cols, r)) for r in c.execute(       # sent before a restart: looked up again
             f"SELECT {', '.join(cols)} FROM lorders WHERE status = 'sent' AND mode = 'live'")}
         self.coins: dict[str, dict[str, Any]] = {}     # mint -> what its transactions need, from its newest trade
+        self.coin_slot: dict[str, int] = {}            # mint -> that trade's slot: the feeds deliver out of order, an older one is not kept
         self.sell_rate: dict[str, float] = {}          # mint -> the fee its last sell of 0.01 SOL+ paid, as the paper keeps it
         self.token_programs: dict[str, str] = {}       # mint -> its token program, from its creation event
         self.lists: dict[bool, tuple[float, dict[str, list[str]]]] = {}
@@ -190,10 +191,12 @@ class LiveFollow:
             return
         if not e.get("tok") or not (user in self.targets or mint in self.pos or self._busy(mint)):
             return
-        self.coins[mint] = coin_of(mint, e)
+        fresh = slot >= self.coin_slot.get(mint, 0)        # older than the coin kept: another connection brought it late
+        if fresh or mint not in self.coins:                # (none kept, after a sell priced on the chain: this one, for now)
+            self.coins[mint], self.coin_slot[mint] = coin_of(mint, e), max(slot, self.coin_slot.get(mint, 0))
         if not e["buy"] and e["fee"] > 0 and e["sol"] >= 10**7:
             self.sell_rate[mint] = e["fee"] / e["sol"]
-        if self.rule is not None and self.rule[0] is not None and mint in self.pos:
+        if fresh and self.rule is not None and self.rule[0] is not None and mint in self.pos:
             self._rule_hit(mint, slot)
         if user not in self.targets:
             return
