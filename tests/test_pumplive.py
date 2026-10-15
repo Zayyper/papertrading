@@ -863,7 +863,7 @@ def test_a_trade_older_than_the_coin_kept_does_not_replace_it(tmp_path):
     kept = dict(col.live.coins[b58(MINT)])
     old = Curve()                                       # a trade from slot 50, brought late, on the curve as it was then
     trade(col, 50, MINT, X, True, old)
-    assert col.live.coin_slot[b58(MINT)] == 60 and col.live.coins[b58(MINT)] == kept
+    assert col.live.coin_slot[b58(MINT)] == (60, 0) and col.live.coins[b58(MINT)] == kept
     trade(col, 61, MINT, X, True, cv)                   # a newer one does
-    assert col.live.coin_slot[b58(MINT)] == 61 and col.live.coins[b58(MINT)]["vsol"] == cv.vsol
+    assert col.live.coin_slot[b58(MINT)] == (61, 0) and col.live.coins[b58(MINT)]["vsol"] == cv.vsol
     col.c.close()

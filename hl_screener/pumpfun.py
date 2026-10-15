@@ -399,7 +399,7 @@ class PaperFollow:
         self.pending: dict[str, list[dict[str, Any]]] = {}
         self.curve: dict[str, tuple[int, int, float]] = {}     # mint -> reserves after its last trade, when seen
         self.curve_src: dict[str, str] = {}                     # mint -> what set them: a trade, or a gap check's read
-        self.curve_slot: dict[str, int] = {}                    # mint -> the slot they are from: an older trade does not replace them
+        self.curve_slot: dict[str, tuple[int, int]] = {}        # mint -> (slot, pool or not) they are from: an older trade does not replace them
         self.tip = 0                                            # newest slot the feed has shown
         for m in {m for (_, m) in self.pos} | self._held() | set(self.xpos):   # after a restart, open positions at the last stored price
             row = c.execute("""SELECT t.vsol, t.vtok FROM trades t JOIN mints mm ON mm.id = t.mint WHERE mm.addr = ?
@@ -456,9 +456,12 @@ class PaperFollow:
             self._run_exits(mint, [slot >= a["land"] for a in self.xpending[mint]])
         # the feeds deliver out of order (pump.fun's two connections, the pools', the wallets', a found pool's replay): a
         # trade older than the state kept is not the coin now (2026-10-14: a pool buy priced on the curve it completed)
-        fresh = slot >= self.curve_slot.get(mint, 0)
+        # ranked by slot, then pool over curve: the trade completing a curve and the pool's first ones share a slot, and
+        # the curve's last state must not replace the pool's (2026-10-15 12:05: a copy priced on 115.0054 SOL / 279.9M)
+        rank = (slot, 1 if "pool" in e else 0)
+        fresh = rank >= self.curve_slot.get(mint, (0, 0))
         if fresh or mint not in self.curve:
-            self.curve[mint], self.curve_slot[mint] = (e["vsol"], e["vtok"], time.time()), max(slot, self.curve_slot.get(mint, 0))
+            self.curve[mint], self.curve_slot[mint] = (e["vsol"], e["vtok"], time.time()), max(rank, self.curve_slot.get(mint, (0, 0)))
             self.curve_src[mint] = f"{'a buy' if e['buy'] else 'a sell'} of {e['sol'] / LAMPORTS:.4f} SOL by {user} at slot {slot}"
         if not e["buy"] and e["fee"] > 0 and e["sol"] >= 10**7:
             self.sell_rate[mint] = e["fee"] / e["sol"]
@@ -1199,7 +1202,7 @@ class Collector:
             if coin is not None:                                  # priced at the curve now, not at the one before the gap
                 self.paper.curve[mint] = (coin["vsol"], coin["vtok"], time.time())
                 self.paper.curve_src[mint] = "the chain, read by a gap check"
-                self.paper.curve_slot[mint] = self.paper.tip      # the coin now: no trade the feed brings late replaces it
+                self.paper.curve_slot[mint] = (self.paper.tip, 1 if coin.get("pool") else 0)   # the coin now: no late trade replaces it
             if not self.paper.sell_now(wallet, mint):
                 if (wallet, mint) in self.paper.pos and not self.paper.curve.get(mint):
                     log.info("gap check: %s sold %s, but the coin has no known price yet: the copy waits for its next trade", wallet, mint)

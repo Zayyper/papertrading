@@ -319,7 +319,7 @@ def test_a_paper_copy_lands_on_the_newest_state_not_on_a_trade_brought_late(tmp_
     kept = col.paper.curve[b58(mint)][:2]
     late = old.buy(10**7)                                                                # a slot-90 trade, brought late
     col.on_logs(90, logs(trade_bytes(mint, X, True, 10**7, late, old.vsol, old.vtok)))
-    assert col.paper.curve[b58(mint)][:2] == kept and col.paper.curve_slot[b58(mint)] == 100
+    assert col.paper.curve[b58(mint)][:2] == kept and col.paper.curve_slot[b58(mint)] == (100, 0)
     caplog.set_level("WARNING", logger="hl_screener.pumpfun")
     t2 = cv.buy(10**8)
     col.on_logs(104, logs(trade_bytes(mint, X, True, 10**8, t2, cv.vsol, cv.vtok)))     # due: lands on slot 100's state
@@ -327,6 +327,21 @@ def test_a_paper_copy_lands_on_the_newest_state_not_on_a_trade_brought_late(tmp_
     vsol, vtok = kept
     assert abs(tok_paper - (vtok - vsol * vtok / (vsol + PAPER_STAKE_SOL * 1e9 / (1 + FEE)))) < 1e-3 * tok_paper
     assert "the trade it copies" not in caplog.text
+    col.c.close()
+
+
+def test_a_curves_last_trade_does_not_replace_its_pools_state_from_the_same_slot(tmp_path):
+    """2026-10-15 12:05: the trade completing a curve and the pool's first trades share a slot; whichever arrived last
+    set the coin's state, and a copy of a pool buy was priced on the completed curve (115.0054 SOL / 279.9M tokens)."""
+    col = Collector(tmp_path / "pump.db")
+    pf, m = col.paper, "MINT"
+    pool = {"buy": True, "sol": 10**9, "tok": 10**12, "fee": 10**7, "vsol": 90 * 10**9, "vtok": 200 * 10**12, "pool": b"P" * 32}
+    curve = {"buy": True, "sol": 85 * 10**9, "tok": 10**14, "fee": 10**9, "vsol": 115 * 10**9, "vtok": 279_900_000 * 10**6}
+    pf.on_trade(500, m, "X", pool)
+    pf.on_trade(500, m, "Y", curve)                      # same slot, arrived after: the curve's last state, not kept
+    assert pf.curve[m][:2] == (90 * 10**9, 200 * 10**12) and pf.curve_slot[m] == (500, 1)
+    pf.on_trade(501, m, "Z", {**pool, "vsol": 91 * 10**9})
+    assert pf.curve[m][0] == 91 * 10**9                  # a later pool trade is
     col.c.close()
 
 
